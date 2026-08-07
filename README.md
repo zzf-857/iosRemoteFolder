@@ -17,8 +17,8 @@
 
 当前正在进行：
 
-- 收敛 HTTP HEAD/Range 元数据、本地 symlink 边界、局部读取、Range 能力缓存和来源状态映射
-- 解决真实来源目录下钻与资源稳定 ID 后，再接入第一个 PDF/TXT 真实查看器
+- 主程复核来源读取契约修复；现有实现已完成主要修复，但仍需补齐 HTTP 206 响应完整性校验、枚举阶段 scheme 校验和 Range 能力缓存身份边界
+- 通过来源基础验收后，先解决真实来源目录下钻与资源稳定 ID，再接入第一个 PDF/TXT 真实查看器
 
 尚未完成：
 
@@ -46,4 +46,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地 commit。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；来源读取契约修复仍未最终验收。
