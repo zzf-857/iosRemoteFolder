@@ -1,6 +1,9 @@
 import Foundation
 
 /// HTTP/HTTPS 直链资源描述：一个来源由一组预先配置的直链组成。
+///
+/// Scheme 契约：`url` 只允许 `http` 与 `https`；其他 scheme 会在 adapter
+/// 边界被拒绝并映射为 `ResourceSourceError.invalidReference`。
 struct HTTPResourceDescriptor: Hashable, Sendable {
     /// 来源内的逻辑路径，作为 `ResourceItem.path`。
     var path: String
@@ -8,7 +11,7 @@ struct HTTPResourceDescriptor: Hashable, Sendable {
     var name: String
     /// 资源类型。
     var kind: ResourceKind
-    /// 直链 URL。
+    /// 直链 URL，只允许 http/https scheme。
     var url: URL
     /// 需要附加的请求头（可含鉴权头；禁止写入日志或持久化模型）。
     var headers: [String: String]
@@ -30,25 +33,36 @@ struct HTTPResourceDescriptor: Hashable, Sendable {
 
 /// HTTP/HTTPS 直链来源 adapter。
 ///
-/// 能力边界：支持连接探测（HEAD）、HEAD 元数据（405/501 时降级为 Range GET 探测）、
-/// GET 数据读取和可选 Range。服务器未确认支持 Range 前不声称 `rangeRead`；
-/// 服务器忽略 Range 头返回全量 200 时，在本地切片降级，不伪造 206。
+/// 能力边界：支持连接探测（HEAD，405/501 时降级为 1 字节 Range GET）、
+/// HEAD 元数据（206 探测时从 `Content-Range` 解析总长度）、GET 数据读取
+/// 和可选 Range。服务器未确认支持 Range 前不声称 `rangeRead`；Range 能力
+/// 一旦由响应证据确认就按资源缓存复用，避免重复探测。
+/// 服务器忽略 Range 头返回全量 200 时，用可取消的流式读取只消费请求区间，
+/// 并在超过大小预算时返回可行动错误，不把整文件载入内存。
 struct HTTPSourceAdapter: ResourceSourceAdapter {
+    /// 200 全量回退时允许消费的最大字节数；超过即返回 `responseTooLarge`。
+    static let defaultMaxRangeFallbackBytes: Int64 = 50 * 1024 * 1024
+
     let source: ResourceSource
     let descriptors: [HTTPResourceDescriptor]
 
     private let session: URLSession
     private let timeout: TimeInterval
+    private let maxRangeFallbackBytes: Int64
+    /// 已验证的 Range 能力缓存：只有服务端响应证据才能写入。
+    private let verifiedRangeCapability = VerifiedRangeCapability()
 
     init(
         source: ResourceSource,
         descriptors: [HTTPResourceDescriptor],
         session: URLSession? = nil,
-        timeout: TimeInterval = 15
+        timeout: TimeInterval = 15,
+        maxRangeFallbackBytes: Int64 = HTTPSourceAdapter.defaultMaxRangeFallbackBytes
     ) {
         self.source = source
         self.descriptors = descriptors
         self.timeout = timeout
+        self.maxRangeFallbackBytes = maxRangeFallbackBytes
         if let session {
             self.session = session
         } else {
@@ -61,7 +75,18 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     func connect() async throws {
         // 没有配置直链时无需网络探测，直接视为可连接。
         guard let probe = descriptors.first else { return }
-        _ = try await performRequest(method: "HEAD", descriptor: probe, headers: [:])
+        let descriptor = try validated(probe)
+        do {
+            _ = try await probeResponse(method: "HEAD", descriptor: descriptor)
+        } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
+            // 服务器不支持 HEAD：降级为 1 字节 Range GET 探测。
+            // 探测只看状态与响应头，不消费响应体。
+            _ = try await probeResponse(
+                method: "GET",
+                descriptor: descriptor,
+                headers: ["Range": "bytes=0-0"]
+            )
+        }
     }
 
     func listResources() async throws -> [ResourceItem] {
@@ -81,12 +106,13 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
         let descriptor = try descriptor(for: item)
+        // Range 能力只来自已验证的服务端证据；未确认前保持不支持。
         return .remoteHTTP(
             .init(
                 url: descriptor.url,
                 method: "GET",
                 headers: descriptor.headers,
-                supportsRange: false
+                supportsRange: verifiedRangeCapability.supportsRange(for: descriptor.path)
             )
         )
     }
@@ -94,37 +120,45 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
         let descriptor = try descriptor(for: item)
         do {
-            let (_, response) = try await performRequest(method: "HEAD", descriptor: descriptor, headers: [:])
-            return Self.metadata(from: response)
+            let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
+            let metadata = Self.headMetadata(from: response)
+            verifiedRangeCapability.set(metadata.acceptsRanges, for: descriptor.path)
+            return metadata
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
             // 服务器不支持 HEAD：用 1 字节 Range GET 探测，同时确认 Range 支持。
-            let (_, response) = try await performRequest(
+            let response = try await probeResponse(
                 method: "GET",
                 descriptor: descriptor,
                 headers: ["Range": "bytes=0-0"]
             )
-            var metadata = Self.metadata(from: response)
+            var metadata = Self.partialGetMetadata(from: response)
             metadata.acceptsRanges = response.statusCode == 206
+            verifiedRangeCapability.set(metadata.acceptsRanges, for: descriptor.path)
             return metadata
         }
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         let descriptor = try descriptor(for: item)
-        var headers: [String: String] = [:]
-        if let range {
-            headers["Range"] = range.httpHeaderValue
-        }
-        let (data, response) = try await performRequest(method: "GET", descriptor: descriptor, headers: headers)
-        guard let range else { return data }
-        if response.statusCode == 206 {
+        guard let range else {
+            // 完整读取保留既有行为与错误映射。
+            let (data, _) = try await performRequest(method: "GET", descriptor: descriptor, headers: [:])
             return data
         }
-        // 明确降级：服务器忽略了 Range 头并返回全量内容，在本地截取请求区间。
-        guard let clamped = range.clamped(toTotalLength: Int64(data.count)) else {
-            return Data()
+
+        let (response, bytes) = try await performStreamingRequest(
+            method: "GET",
+            descriptor: descriptor,
+            headers: ["Range": range.httpHeaderValue]
+        )
+        if response.statusCode == 206 {
+            verifiedRangeCapability.set(true, for: descriptor.path)
+            return try await collect(bytes, limit: range.length)
         }
-        return data.subdata(in: Int(clamped.lowerBound)..<Int(clamped.upperBound + 1))
+        // 明确降级：服务器忽略了 Range 头并返回全量 200。
+        // 只流式消费请求区间，不把完整响应载入内存。
+        verifiedRangeCapability.set(false, for: descriptor.path)
+        return try await sliceFromStream(bytes, range: range)
     }
 
     // MARK: - Private
@@ -134,14 +168,23 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
               let descriptor = descriptors.first(where: { $0.path == item.path }) else {
             throw ResourceSourceError.invalidReference
         }
+        return try validated(descriptor)
+    }
+
+    /// 只允许 http/https scheme；其他 scheme 一律视为无效引用。
+    private func validated(_ descriptor: HTTPResourceDescriptor) throws -> HTTPResourceDescriptor {
+        guard let scheme = descriptor.url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            throw ResourceSourceError.invalidReference
+        }
         return descriptor
     }
 
-    private func performRequest(
+    private func makeRequest(
         method: String,
         descriptor: HTTPResourceDescriptor,
         headers: [String: String]
-    ) async throws -> (Data, HTTPURLResponse) {
+    ) -> URLRequest {
         var request = URLRequest(url: descriptor.url, timeoutInterval: timeout)
         request.httpMethod = method
         for (field, value) in descriptor.headers {
@@ -150,7 +193,16 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         for (field, value) in headers {
             request.setValue(value, forHTTPHeaderField: field)
         }
+        return request
+    }
 
+    /// 完整下载路径：保留给不带区间的 GET 读取。
+    private func performRequest(
+        method: String,
+        descriptor: HTTPResourceDescriptor,
+        headers: [String: String]
+    ) async throws -> (Data, HTTPURLResponse) {
+        let request = makeRequest(method: method, descriptor: descriptor, headers: headers)
         let data: Data
         let response: URLResponse
         do {
@@ -167,25 +219,136 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return (data, httpResponse)
     }
 
-    private static func metadata(from response: HTTPURLResponse) -> ResourceMetadata {
-        let byteSize = response.expectedContentLength >= 0 ? Int64(response.expectedContentLength) : nil
-        var acceptsRanges = false
-        var modifiedAt: Date?
-        for (rawField, rawValue) in response.allHeaderFields {
-            guard let field = rawField as? String, let value = rawValue as? String else { continue }
-            if field.caseInsensitiveCompare("Accept-Ranges") == .orderedSame {
-                acceptsRanges = value.caseInsensitiveCompare("bytes") == .orderedSame
-            }
-            if field.caseInsensitiveCompare("Last-Modified") == .orderedSame {
-                modifiedAt = parseHTTPDate(value)
-            }
+    /// 流式请求：校验状态后返回响应与可取消的字节流，不预载响应体。
+    private func performStreamingRequest(
+        method: String,
+        descriptor: HTTPResourceDescriptor,
+        headers: [String: String]
+    ) async throws -> (HTTPURLResponse, URLSession.AsyncBytes) {
+        let request = makeRequest(method: method, descriptor: descriptor, headers: headers)
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            throw ResourceSourceError.mapping(error)
         }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            bytes.task.cancel()
+            throw ResourceSourceError.unavailable
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            bytes.task.cancel()
+            throw ResourceSourceError.http(statusCode: httpResponse.statusCode)
+        }
+        return (httpResponse, bytes)
+    }
+
+    /// 探测请求：只消费状态与响应头，立即取消任务释放连接，避免拉取全量内容。
+    private func probeResponse(
+        method: String,
+        descriptor: HTTPResourceDescriptor,
+        headers: [String: String] = [:]
+    ) async throws -> HTTPURLResponse {
+        let (response, bytes) = try await performStreamingRequest(
+            method: method,
+            descriptor: descriptor,
+            headers: headers
+        )
+        bytes.task.cancel()
+        return response
+    }
+
+    /// 收集 206 分片内容；分片本身很小，仍按区间长度设上限。
+    private func collect(_ bytes: URLSession.AsyncBytes, limit: Int64) async throws -> Data {
+        var collected = Data()
+        do {
+            for try await byte in bytes {
+                collected.append(byte)
+                if Int64(collected.count) >= limit { break }
+            }
+        } catch {
+            bytes.task.cancel()
+            throw ResourceSourceError.mapping(error)
+        }
+        bytes.task.cancel()
+        return collected
+    }
+
+    /// 服务器忽略 Range 时的流式切片：跳过区间前的字节，只收集请求区间，
+    /// 总消费量超过预算即返回可行动错误；支持任务取消。
+    private func sliceFromStream(_ bytes: URLSession.AsyncBytes, range: ResourceByteRange) async throws -> Data {
+        var skipped: Int64 = 0
+        var collected = Data()
+        do {
+            for try await byte in bytes {
+                if skipped < range.lowerBound {
+                    skipped += 1
+                    if skipped > maxRangeFallbackBytes {
+                        throw ResourceSourceError.responseTooLarge
+                    }
+                    continue
+                }
+                collected.append(byte)
+                if Int64(collected.count) >= range.length { break }
+                if skipped + Int64(collected.count) > maxRangeFallbackBytes {
+                    throw ResourceSourceError.responseTooLarge
+                }
+            }
+        } catch let error as ResourceSourceError {
+            bytes.task.cancel()
+            throw error
+        } catch {
+            bytes.task.cancel()
+            throw ResourceSourceError.mapping(error)
+        }
+        bytes.task.cancel()
+        return collected
+    }
+
+    /// HEAD 元数据：`Content-Length` 即完整大小；只在 `Accept-Ranges: bytes` 时声称 Range 支持。
+    private static func headMetadata(from response: HTTPURLResponse) -> ResourceMetadata {
+        let byteSize = response.expectedContentLength >= 0 ? Int64(response.expectedContentLength) : nil
+        let acceptsRanges = headerValue("Accept-Ranges", in: response)
+            .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
         return ResourceMetadata(
             byteSize: byteSize,
             contentType: response.mimeType,
-            modifiedAt: modifiedAt,
+            modifiedAt: headerValue("Last-Modified", in: response).flatMap(parseHTTPDate),
             acceptsRanges: acceptsRanges
         )
+    }
+
+    /// 206 探测元数据：`Content-Length` 是分片大小而非文件总大小；
+    /// 总大小只从 `Content-Range` 解析，无法确认时保持 nil，不猜测。
+    private static func partialGetMetadata(from response: HTTPURLResponse) -> ResourceMetadata {
+        ResourceMetadata(
+            byteSize: contentRangeTotalLength(from: response),
+            contentType: response.mimeType,
+            modifiedAt: headerValue("Last-Modified", in: response).flatMap(parseHTTPDate),
+            acceptsRanges: false
+        )
+    }
+
+    /// 解析 `Content-Range: bytes <start>-<end>/<total>` 中的总长度；`*` 视为未知。
+    private static func contentRangeTotalLength(from response: HTTPURLResponse) -> Int64? {
+        guard let value = headerValue("Content-Range", in: response),
+              let slashIndex = value.lastIndex(of: "/") else {
+            return nil
+        }
+        let total = value[value.index(after: slashIndex)...].trimmingCharacters(in: .whitespaces)
+        guard total != "*" else { return nil }
+        return Int64(total)
+    }
+
+    private static func headerValue(_ name: String, in response: HTTPURLResponse) -> String? {
+        for (rawField, rawValue) in response.allHeaderFields {
+            guard let field = rawField as? String, let value = rawValue as? String else { continue }
+            if field.caseInsensitiveCompare(name) == .orderedSame {
+                return value
+            }
+        }
+        return nil
     }
 
     private static func parseHTTPDate(_ value: String) -> Date? {
@@ -194,5 +357,23 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         return formatter.date(from: value)
+    }
+
+    /// 已验证 Range 能力缓存：线程安全，只在拿到服务端响应证据后写入。
+    private final class VerifiedRangeCapability: @unchecked Sendable {
+        private let lock = NSLock()
+        private var supportByPath: [String: Bool] = [:]
+
+        func set(_ supportsRange: Bool, for path: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            supportByPath[path] = supportsRange
+        }
+
+        func supportsRange(for path: String) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return supportByPath[path] ?? false
+        }
     }
 }

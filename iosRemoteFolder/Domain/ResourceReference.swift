@@ -29,6 +29,10 @@ enum ResourceReference: Hashable, Sendable {
     }
 
     /// 远端 HTTP/HTTPS 引用描述。
+    ///
+    /// Scheme 契约：只允许 `http` 与 `https`。`file`、`data` 等其他 scheme
+    /// 必须在 adapter 边界拒绝，并映射为 `ResourceSourceError.invalidReference`；
+    /// 引用本身不承载非法 scheme 的合法性。
     struct RemoteHTTP: Hashable, Sendable {
         /// 资源的最终直链 URL。
         var url: URL

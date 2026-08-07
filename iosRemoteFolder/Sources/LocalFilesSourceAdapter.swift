@@ -9,10 +9,14 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     let source: ResourceSource
     /// 来源根目录；所有列举与读取都被约束在这个目录内。
     let rootURL: URL
+    /// 符号链接解析后的真实根路径，作为读取边界校验的事实基准。
+    private let resolvedRootURL: URL
 
     init(source: ResourceSource, rootURL: URL) {
         self.source = source
-        self.rootURL = rootURL.standardizedFileURL
+        let standardized = rootURL.standardizedFileURL
+        self.rootURL = standardized
+        self.resolvedRootURL = standardized.resolvingSymlinksInPath()
     }
 
     func connect() async throws {
@@ -80,22 +84,55 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         let url = try resolvedURL(for: item)
-        let data: Data
+        guard let range else {
+            // 完整读取保持既有行为与错误映射。
+            do {
+                return try Data(contentsOf: url)
+            } catch {
+                throw ResourceSourceError.mapping(error)
+            }
+        }
+        return try readRange(range, of: url)
+    }
+
+    /// 区间读取：只 seek/read 请求的字节窗口，不把整个文件载入内存。
+    private func readRange(_ range: ResourceByteRange, of url: URL) throws -> Data {
+        let handle: FileHandle
         do {
-            data = try Data(contentsOf: url)
+            handle = try FileHandle(forReadingFrom: url)
         } catch {
             throw ResourceSourceError.mapping(error)
         }
-        guard let range else { return data }
-        guard let clamped = range.clamped(toTotalLength: Int64(data.count)) else {
-            return Data()
+        defer { try? handle.close() }
+        do {
+            let fileSize = Int64(try handle.seekToEnd())
+            // 空文件或区间完全越界：明确返回空数据，而不是报错。
+            guard let clamped = range.clamped(toTotalLength: fileSize) else {
+                return Data()
+            }
+            try handle.seek(toOffset: UInt64(clamped.lowerBound))
+            var remaining = clamped.length
+            var data = Data()
+            while remaining > 0 {
+                let chunkSize = Int(min(remaining, 65_536))
+                // read(upToCount:) 返回 nil 表示已到达 EOF。
+                guard let chunk = try handle.read(upToCount: chunkSize) else { break }
+                if chunk.isEmpty { break }
+                data.append(chunk)
+                remaining -= Int64(chunk.count)
+            }
+            return data
+        } catch {
+            throw ResourceSourceError.mapping(error)
         }
-        return data.subdata(in: Int(clamped.lowerBound)..<Int(clamped.upperBound + 1))
     }
 
     // MARK: - Private
 
     /// 把资源路径安全解析为磁盘 URL；任何穿越根目录的路径都会被拒绝。
+    ///
+    /// 双重边界校验：先用规范化路径拦截 `..` 穿越，再解析符号链接，
+    /// 用真实路径对照解析后的根目录，拦截指向 root 外部的符号链接。
     private func resolvedURL(for item: ResourceItem) throws -> URL {
         var relative = item.path
         while relative.hasPrefix("/") {
@@ -110,7 +147,13 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         guard candidate.path == rootURL.path || candidate.path.hasPrefix(rootURL.path + "/") else {
             throw ResourceSourceError.invalidReference
         }
-        return candidate
+        let resolvedCandidate = candidate.resolvingSymlinksInPath()
+        let resolvedRoot = resolvedRootURL
+        guard resolvedCandidate.path == resolvedRoot.path
+            || resolvedCandidate.path.hasPrefix(resolvedRoot.path + "/") else {
+            throw ResourceSourceError.invalidReference
+        }
+        return resolvedCandidate
     }
 
     private func makeItem(from url: URL) -> ResourceItem {

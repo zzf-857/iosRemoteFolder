@@ -68,6 +68,8 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
     case invalidReference
     /// 来源不支持请求的能力。
     case capabilityUnavailable
+    /// 服务器未支持区间读取，且全量响应超出安全预算；为避免整文件进内存而中止读取。
+    case responseTooLarge
     /// 来源失效或其他暂时无法归类的失败。
     case unavailable
 
@@ -82,6 +84,7 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
         case .networkUnavailable: "无法连接到来源，请检查网络或地址"
         case .invalidReference: "资源引用无效"
         case .capabilityUnavailable: "此来源不支持当前操作"
+        case .responseTooLarge: "服务器未支持分段读取，响应内容超出安全上限。请改用完整下载，或联系服务端开启 Range 支持"
         case .unavailable: "来源暂时不可用"
         }
     }

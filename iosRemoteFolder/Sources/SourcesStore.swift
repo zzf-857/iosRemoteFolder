@@ -6,6 +6,10 @@ import Observation
 /// 架构边界：UI 只依赖本仓库暴露的 `entries` 与 `connect` 等方法，
 /// 不直接调用 URLSession 或 FileManager；adapter 抛出的错误统一映射为
 /// `ResourceSourceError` 后进入 `ResourceSourceState.failed`。
+///
+/// 双状态规则（D-026）：`ResourceSourceState` 是本仓库的唯一事实源；
+/// `ResourceSource.SourceStatus` 只是兼容旧展示的派生投影，只能由本仓库
+/// 通过 `transition` 单向写入，adapter 与 UI 都不允许独立维护第三套状态。
 @MainActor
 @Observable
 final class SourcesStore {
@@ -21,6 +25,9 @@ final class SourcesStore {
 
     @ObservationIgnored private var adapters: [UUID: any ResourceSourceAdapter] = [:]
     @ObservationIgnored private var connectionTasks: [UUID: Task<Void, Never>] = [:]
+    /// 连接代数：每次发起连接递增；过期任务的任何状态写入都会被忽略，
+    /// 保证被取消或被替换的连接任务不会覆盖新状态。
+    @ObservationIgnored private var connectionGenerations: [UUID: Int] = [:]
 
     init(sources: [ResourceSource], adapterFor: (ResourceSource) -> (any ResourceSourceAdapter)?) {
         for source in sources {
@@ -76,28 +83,33 @@ final class SourcesStore {
     }
 
     /// 连接（或重试）指定来源；重复调用会取消上一次未完成的连接任务。
+    ///
+    /// 生命周期：开始时同步进入 connecting；成功进入 ready；失败进入
+    /// failed（保留可行动错误）；任务被取消时回到 disconnected，
+    /// 不会永久停留在 connecting。
     func connect(_ sourceID: UUID) {
         guard let adapter = adapters[sourceID] else { return }
         connectionTasks[sourceID]?.cancel()
-        update(sourceID) { entry in
-            entry.state = .connecting
-        }
+        let generation = nextGeneration(for: sourceID)
+        transition(sourceID, to: .connecting)
         let task = Task {
             do {
                 try await adapter.connect()
                 let resources = try await adapter.listResources()
                 try Task.checkCancellation()
-                update(sourceID) { entry in
-                    entry.state = .ready
-                    entry.source.status = .connected
+                guard self.isCurrentGeneration(sourceID, generation) else { return }
+                self.transition(sourceID, to: .ready)
+                self.update(sourceID) { entry in
                     entry.source.itemCountDescription = "\(resources.count) 个资源"
                 }
             } catch {
-                guard !Task.isCancelled else { return }
+                guard self.isCurrentGeneration(sourceID, generation) else { return }
                 let mapped = ResourceSourceError.mapping(error)
-                update(sourceID) { entry in
-                    entry.state = .failed(mapped)
-                    entry.source.status = .needsAttention
+                if Task.isCancelled || error is CancellationError || mapped == .cancelled {
+                    // 取消不是失败：回到未连接，保持状态一致且可重新发起。
+                    self.transition(sourceID, to: .disconnected)
+                } else {
+                    self.transition(sourceID, to: .failed(mapped))
                 }
             }
         }
@@ -110,8 +122,54 @@ final class SourcesStore {
     }
 
     func cancelAllConnections() {
+        for sourceID in connectionTasks.keys {
+            _ = nextGeneration(for: sourceID)
+        }
         connectionTasks.values.forEach { $0.cancel() }
         connectionTasks.removeAll()
+        // 被取消的连接不允许停留在 connecting：同步回到未连接。
+        let connectingIDs = entries.filter { entry in
+            if case .connecting = entry.state { return true }
+            return false
+        }.map(\.id)
+        for sourceID in connectingIDs {
+            transition(sourceID, to: .disconnected)
+        }
+    }
+
+    // MARK: - Private
+
+    /// 状态写入的唯一入口：`ResourceSourceState` 是唯一事实源，
+    /// `SourceStatus` 作为兼容投影同步更新。
+    private func transition(_ sourceID: UUID, to state: ResourceSourceState) {
+        update(sourceID) { entry in
+            entry.state = state
+            entry.source.status = Self.projectedStatus(for: state)
+        }
+    }
+
+    /// `ResourceSourceState` 到旧 `SourceStatus` 的单向投影；不新增第三套状态。
+    private static func projectedStatus(for state: ResourceSourceState) -> ResourceSource.SourceStatus {
+        switch state {
+        case .disconnected:
+            return .disconnected
+        case .connecting:
+            return .connecting
+        case .ready:
+            return .connected
+        case .failed:
+            return .needsAttention
+        }
+    }
+
+    private func nextGeneration(for sourceID: UUID) -> Int {
+        let generation = (connectionGenerations[sourceID] ?? 0) + 1
+        connectionGenerations[sourceID] = generation
+        return generation
+    }
+
+    private func isCurrentGeneration(_ sourceID: UUID, _ generation: Int) -> Bool {
+        connectionGenerations[sourceID] == generation
     }
 
     private func update(_ sourceID: UUID, _ mutation: (inout Entry) -> Void) {
