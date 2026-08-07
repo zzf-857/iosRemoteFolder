@@ -90,14 +90,15 @@ struct ResourceSource: Identifiable, Hashable, Sendable {
     let name: String
     let kind: SourceKind
     let endpoint: String
-    let status: SourceStatus
-    let itemCountDescription: String
+    var status: SourceStatus
+    var itemCountDescription: String
 
     enum SourceKind: String, Hashable, Sendable {
         case alist
         case webdav
         case local
         case lan
+        case http
 
         var title: String {
             switch self {
@@ -105,6 +106,7 @@ struct ResourceSource: Identifiable, Hashable, Sendable {
             case .webdav: "WebDAV"
             case .local: "本地文件"
             case .lan: "局域网"
+            case .http: "HTTP 直链"
             }
         }
 
@@ -114,12 +116,15 @@ struct ResourceSource: Identifiable, Hashable, Sendable {
             case .webdav: "cloud"
             case .local: "internaldrive"
             case .lan: "wifi"
+            case .http: "link"
             }
         }
     }
 
     enum SourceStatus: String, Hashable, Sendable {
         case connected
+        case connecting
+        case disconnected
         case indexing
         case needsAttention
         case localOnly
@@ -127,6 +132,8 @@ struct ResourceSource: Identifiable, Hashable, Sendable {
         var title: String {
             switch self {
             case .connected: "已连接"
+            case .connecting: "连接中"
+            case .disconnected: "未连接"
             case .indexing: "索引中"
             case .needsAttention: "需要处理"
             case .localOnly: "仅本地"
@@ -143,5 +150,19 @@ enum ResourceAccent: String, Hashable, Sendable {
     case purple
 
     var colorName: String { rawValue }
+
+    /// 按资源类型推导默认强调色，与 SampleData 的视觉语言保持一致。
+    static func recommended(for kind: ResourceKind) -> ResourceAccent {
+        switch kind {
+        case .folder: .teal
+        case .pdf: .orange
+        case .markdown: .teal
+        case .text: .blue
+        case .image: .blue
+        case .video: .purple
+        case .audio: .pink
+        case .unknown: .blue
+        }
+    }
 }
 

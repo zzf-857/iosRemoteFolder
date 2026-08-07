@@ -4,6 +4,7 @@ enum SampleData {
     static let personalSourceID = UUID(uuidString: "A0000000-0000-4000-8000-000000000001")!
     static let workSourceID = UUID(uuidString: "A0000000-0000-4000-8000-000000000002")!
     static let localSourceID = UUID(uuidString: "A0000000-0000-4000-8000-000000000003")!
+    static let httpSourceID = UUID(uuidString: "A0000000-0000-4000-8000-000000000004")!
 
     static let sources: [ResourceSource] = [
         ResourceSource(
@@ -26,9 +27,17 @@ enum SampleData {
             id: localSourceID,
             name: "本地导入",
             kind: .local,
-            endpoint: "此设备",
+            endpoint: "此设备 · 应用文稿目录",
             status: .localOnly,
             itemCountDescription: "36 个资源"
+        ),
+        ResourceSource(
+            id: httpSourceID,
+            name: "局域网直链示例",
+            kind: .http,
+            endpoint: "http://127.0.0.1:48080",
+            status: .disconnected,
+            itemCountDescription: "未连接"
         )
     ]
 
