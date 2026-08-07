@@ -33,10 +33,12 @@ struct HTTPResourceDescriptor: Hashable, Sendable {
 
 /// HTTP/HTTPS 直链来源 adapter。
 ///
-/// 能力边界：支持连接探测（HEAD，405/501 时降级为 1 字节 Range GET）、
-/// HEAD 元数据（206 探测时从 `Content-Range` 解析总长度）、GET 数据读取
-/// 和可选 Range。服务器未确认支持 Range 前不声称 `rangeRead`；Range 能力
-/// 一旦由响应证据确认就按资源缓存复用，避免重复探测。
+/// 能力边界：支持连接探测（HEAD，405/501 时降级为 1 字节 Range GET，并把
+/// 有效证据回写能力缓存）、HEAD 元数据（206 探测时从 `Content-Range` 解析
+/// 总长度）、GET 数据读取和可选 Range。服务器未确认支持 Range 前不声称
+/// `rangeRead`；Range 能力按“逻辑路径 + 直链 URL”缓存已验证证据。
+/// 206 分片必须通过 `Content-Range` 单位/起止/总长度与响应体长度校验才会
+/// 交给查看器；枚举阶段会拒绝包含非 http/https scheme 的来源。
 /// 服务器忽略 Range 头返回全量 200 时，用可取消的流式读取只消费请求区间，
 /// 并在超过大小预算时返回可行动错误，不把整文件载入内存。
 struct HTTPSourceAdapter: ResourceSourceAdapter {
@@ -76,21 +78,34 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         // 没有配置直链时无需网络探测，直接视为可连接。
         guard let probe = descriptors.first else { return }
         let descriptor = try validated(probe)
+        let key = capabilityKey(for: descriptor)
         do {
-            _ = try await probeResponse(method: "HEAD", descriptor: descriptor)
+            let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
+            // HEAD 成功时，Accept-Ranges: bytes 是有效 Range 证据，回写能力缓存。
+            if Self.acceptsByteRanges(response) {
+                verifiedRangeCapability.set(true, for: key)
+            }
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
             // 服务器不支持 HEAD：降级为 1 字节 Range GET 探测。
             // 探测只看状态与响应头，不消费响应体。
-            _ = try await probeResponse(
+            let response = try await probeResponse(
                 method: "GET",
                 descriptor: descriptor,
                 headers: ["Range": "bytes=0-0"]
             )
+            // 206 表示服务端确认支持 Range；200 表示服务器忽略了 Range。
+            // 两者都是明确证据，必须回写能力缓存，避免后续重复探测或虚假声明。
+            verifiedRangeCapability.set(response.statusCode == 206, for: key)
         }
     }
 
     func listResources() async throws -> [ResourceItem] {
-        descriptors.map { descriptor in
+        // 枚举前校验所有 descriptor：任何一个非法 scheme 都整体拒绝，
+        // 避免把无效来源暴露给下游，直到引用或读取时才失败。
+        for descriptor in descriptors {
+            _ = try validated(descriptor)
+        }
+        return descriptors.map { descriptor in
             ResourceItem(
                 name: descriptor.name,
                 kind: descriptor.kind,
@@ -112,17 +127,18 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 url: descriptor.url,
                 method: "GET",
                 headers: descriptor.headers,
-                supportsRange: verifiedRangeCapability.supportsRange(for: descriptor.path)
+                supportsRange: verifiedRangeCapability.supportsRange(for: capabilityKey(for: descriptor))
             )
         )
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
         let descriptor = try descriptor(for: item)
+        let key = capabilityKey(for: descriptor)
         do {
             let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
             let metadata = Self.headMetadata(from: response)
-            verifiedRangeCapability.set(metadata.acceptsRanges, for: descriptor.path)
+            verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
             return metadata
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
             // 服务器不支持 HEAD：用 1 字节 Range GET 探测，同时确认 Range 支持。
@@ -133,7 +149,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             )
             var metadata = Self.partialGetMetadata(from: response)
             metadata.acceptsRanges = response.statusCode == 206
-            verifiedRangeCapability.set(metadata.acceptsRanges, for: descriptor.path)
+            verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
             return metadata
         }
     }
@@ -146,19 +162,25 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             return data
         }
 
+        let key = capabilityKey(for: descriptor)
         let (response, bytes) = try await performStreamingRequest(
             method: "GET",
             descriptor: descriptor,
             headers: ["Range": range.httpHeaderValue]
         )
-        if response.statusCode == 206 {
-            verifiedRangeCapability.set(true, for: descriptor.path)
-            return try await collect(bytes, limit: range.length)
+        switch response.statusCode {
+        case 206:
+            return try await validatedPartialData(from: bytes, response: response, requested: range, key: key)
+        case 200:
+            // 明确降级：只有 200 才视为服务器忽略 Range 的全量回退。
+            // 只流式消费请求区间，不把完整响应载入内存。
+            verifiedRangeCapability.set(false, for: key)
+            return try await sliceFromStream(bytes, range: range)
+        default:
+            // 其余 2xx（201/203/204…）不是区间请求的合法应答，不得伪装成正常分片。
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
         }
-        // 明确降级：服务器忽略了 Range 头并返回全量 200。
-        // 只流式消费请求区间，不把完整响应载入内存。
-        verifiedRangeCapability.set(false, for: descriptor.path)
-        return try await sliceFromStream(bytes, range: range)
     }
 
     // MARK: - Private
@@ -178,6 +200,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             throw ResourceSourceError.invalidReference
         }
         return descriptor
+    }
+
+    /// 构造 Range 能力缓存键：逻辑路径与直链 URL 缺一不可。
+    private func capabilityKey(for descriptor: HTTPResourceDescriptor) -> CapabilityKey {
+        CapabilityKey(path: descriptor.path, url: descriptor.url)
     }
 
     private func makeRequest(
@@ -275,6 +302,49 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return collected
     }
 
+    /// 校验并读取 206 分片：`Content-Range` 的 bytes 单位、起止位置、总长度
+    /// 与响应体实际长度必须全部一致；短响应、非法 `Content-Range` 或长度不符
+    /// 都会抛错，绝不把不可信的分片交给查看器。
+    private func validatedPartialData(
+        from bytes: URLSession.AsyncBytes,
+        response: HTTPURLResponse,
+        requested: ResourceByteRange,
+        key: CapabilityKey
+    ) async throws -> Data {
+        guard let contentRange = Self.parseContentRange(from: response) else {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        // 起止必须合法，且与请求区间对齐；否则分片偏移不可信。
+        guard contentRange.first >= 0,
+              contentRange.last >= contentRange.first,
+              contentRange.first == requested.lowerBound,
+              contentRange.last <= requested.upperBound else {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        // 排除理论极端情况（last 为 Int64.max 且 first 为 0）导致的区间长度溢出。
+        guard contentRange.last < Int64.max || contentRange.first > 0 else {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        // 声明了总长度时，终点必须落在总长度内。
+        if let total = contentRange.total, total <= contentRange.last {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        let expectedLength = contentRange.last - contentRange.first + 1
+        // 多读一字节用于发现超出声明长度的响应。
+        let limit = expectedLength == Int64.max ? expectedLength : expectedLength + 1
+        let collected = try await collect(bytes, limit: limit)
+        guard Int64(collected.count) == expectedLength else {
+            // 短响应（不足）或超出 Content-Range 声明，均视为违约。
+            throw ResourceSourceError.invalidResponse
+        }
+        verifiedRangeCapability.set(true, for: key)
+        return collected
+    }
+
     /// 服务器忽略 Range 时的流式切片：跳过区间前的字节，只收集请求区间，
     /// 总消费量超过预算即返回可行动错误；支持任务取消。
     private func sliceFromStream(_ bytes: URLSession.AsyncBytes, range: ResourceByteRange) async throws -> Data {
@@ -309,13 +379,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     /// HEAD 元数据：`Content-Length` 即完整大小；只在 `Accept-Ranges: bytes` 时声称 Range 支持。
     private static func headMetadata(from response: HTTPURLResponse) -> ResourceMetadata {
         let byteSize = response.expectedContentLength >= 0 ? Int64(response.expectedContentLength) : nil
-        let acceptsRanges = headerValue("Accept-Ranges", in: response)
-            .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
         return ResourceMetadata(
             byteSize: byteSize,
             contentType: response.mimeType,
             modifiedAt: headerValue("Last-Modified", in: response).flatMap(parseHTTPDate),
-            acceptsRanges: acceptsRanges
+            acceptsRanges: acceptsByteRanges(response)
         )
     }
 
@@ -330,15 +398,51 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         )
     }
 
-    /// 解析 `Content-Range: bytes <start>-<end>/<total>` 中的总长度；`*` 视为未知。
-    private static func contentRangeTotalLength(from response: HTTPURLResponse) -> Int64? {
-        guard let value = headerValue("Content-Range", in: response),
-              let slashIndex = value.lastIndex(of: "/") else {
+    /// 解析后的 `Content-Range`：仅在格式完全合法时返回，绝不猜测。
+    private struct ParsedContentRange {
+        let first: Int64
+        let last: Int64
+        /// 总长度；`*` 表示服务端未声明。
+        let total: Int64?
+    }
+
+    /// 严格解析 `Content-Range: bytes <first>-<last>/<total|*>`。
+    /// 校验 bytes 单位；单位不符、缺少起止或总长度非法时返回 nil。
+    private static func parseContentRange(from response: HTTPURLResponse) -> ParsedContentRange? {
+        guard let value = headerValue("Content-Range", in: response) else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard let spaceIndex = trimmed.firstIndex(of: " ") else { return nil }
+        let unit = trimmed[..<spaceIndex].trimmingCharacters(in: .whitespaces)
+        // 只接受 bytes 单位。
+        guard unit.caseInsensitiveCompare("bytes") == .orderedSame else { return nil }
+        let rest = trimmed[trimmed.index(after: spaceIndex)...].trimmingCharacters(in: .whitespaces)
+        guard let slashIndex = rest.firstIndex(of: "/") else { return nil }
+        let rangePart = rest[..<slashIndex].trimmingCharacters(in: .whitespaces)
+        let totalPart = rest[rest.index(after: slashIndex)...].trimmingCharacters(in: .whitespaces)
+        guard let dashIndex = rangePart.firstIndex(of: "-") else { return nil }
+        let firstText = rangePart[..<dashIndex].trimmingCharacters(in: .whitespaces)
+        let lastText = rangePart[rangePart.index(after: dashIndex)...].trimmingCharacters(in: .whitespaces)
+        guard let first = Int64(firstText), let last = Int64(lastText) else { return nil }
+        let total: Int64?
+        if totalPart == "*" {
+            total = nil
+        } else if let parsedTotal = Int64(totalPart) {
+            total = parsedTotal
+        } else {
             return nil
         }
-        let total = value[value.index(after: slashIndex)...].trimmingCharacters(in: .whitespaces)
-        guard total != "*" else { return nil }
-        return Int64(total)
+        return ParsedContentRange(first: first, last: last, total: total)
+    }
+
+    /// 解析 `Content-Range` 的总长度；`*` 或格式非法时视为未知，返回 nil。
+    private static func contentRangeTotalLength(from response: HTTPURLResponse) -> Int64? {
+        parseContentRange(from: response)?.total
+    }
+
+    /// 响应是否声明 `Accept-Ranges: bytes`。
+    private static func acceptsByteRanges(_ response: HTTPURLResponse) -> Bool {
+        headerValue("Accept-Ranges", in: response)
+            .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
     }
 
     private static func headerValue(_ name: String, in response: HTTPURLResponse) -> String? {
@@ -359,21 +463,28 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return formatter.date(from: value)
     }
 
+    /// Range 能力缓存键：逻辑路径 + 直链 URL 共同确定一个资源的 Range 能力，
+    /// 避免重复路径、或路径不变但 URL 变化时串用能力证据。
+    private struct CapabilityKey: Hashable {
+        let path: String
+        let url: URL
+    }
+
     /// 已验证 Range 能力缓存：线程安全，只在拿到服务端响应证据后写入。
     private final class VerifiedRangeCapability: @unchecked Sendable {
         private let lock = NSLock()
-        private var supportByPath: [String: Bool] = [:]
+        private var supportByKey: [CapabilityKey: Bool] = [:]
 
-        func set(_ supportsRange: Bool, for path: String) {
+        func set(_ supportsRange: Bool, for key: CapabilityKey) {
             lock.lock()
             defer { lock.unlock() }
-            supportByPath[path] = supportsRange
+            supportByKey[key] = supportsRange
         }
 
-        func supportsRange(for path: String) -> Bool {
+        func supportsRange(for key: CapabilityKey) -> Bool {
             lock.lock()
             defer { lock.unlock() }
-            return supportByPath[path] ?? false
+            return supportByKey[key] ?? false
         }
     }
 }
