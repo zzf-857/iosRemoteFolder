@@ -1,0 +1,297 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B00000000000000000000001 /* iosRemoteFolderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000001 /* iosRemoteFolderApp.swift */; };
+		B00000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000002 /* AppModel.swift */; };
+		B00000000000000000000003 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000003 /* RootView.swift */; };
+		B00000000000000000000004 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000004 /* HomeView.swift */; };
+		B00000000000000000000005 /* BrowseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000005 /* BrowseView.swift */; };
+		B00000000000000000000006 /* SourcesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000006 /* SourcesView.swift */; };
+		B00000000000000000000007 /* OfflineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000007 /* OfflineView.swift */; };
+		B00000000000000000000008 /* ResourceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000008 /* ResourceModels.swift */; };
+		B00000000000000000000009 /* SampleData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000009 /* SampleData.swift */; };
+		B00000000000000000000010 /* ResourceSourceAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000010 /* ResourceSourceAdapter.swift */; };
+		B00000000000000000000011 /* ResourceIndexStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000011 /* ResourceIndexStore.swift */; };
+		B00000000000000000000012 /* CacheCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000012 /* CacheCoordinator.swift */; };
+		B00000000000000000000013 /* PlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000013 /* PlayerEngine.swift */; };
+		B00000000000000000000014 /* ViewerRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000014 /* ViewerRegistry.swift */; };
+		B00000000000000000000015 /* ViewerHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000015 /* ViewerHost.swift */; };
+		B00000000000000000000016 /* AppTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000016 /* AppTheme.swift */; };
+		B00000000000000000000017 /* ResourceCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000017 /* ResourceCardView.swift */; };
+		B00000000000000000000018 /* ResourceRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000018 /* ResourceRowView.swift */; };
+		B00000000000000000000019 /* SourceRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000019 /* SourceRowView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		C00000000000000000000001 /* iosRemoteFolderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iosRemoteFolderApp.swift; sourceTree = "<group>"; };
+		C00000000000000000000002 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		C00000000000000000000003 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		C00000000000000000000004 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		C00000000000000000000005 /* BrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowseView.swift; sourceTree = "<group>"; };
+		C00000000000000000000006 /* SourcesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourcesView.swift; sourceTree = "<group>"; };
+		C00000000000000000000007 /* OfflineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineView.swift; sourceTree = "<group>"; };
+		C00000000000000000000008 /* ResourceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceModels.swift; sourceTree = "<group>"; };
+		C00000000000000000000009 /* SampleData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleData.swift; sourceTree = "<group>"; };
+		C00000000000000000000010 /* ResourceSourceAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceSourceAdapter.swift; sourceTree = "<group>"; };
+		C00000000000000000000011 /* ResourceIndexStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceIndexStore.swift; sourceTree = "<group>"; };
+		C00000000000000000000012 /* CacheCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheCoordinator.swift; sourceTree = "<group>"; };
+		C00000000000000000000013 /* PlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerEngine.swift; sourceTree = "<group>"; };
+		C00000000000000000000014 /* ViewerRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerRegistry.swift; sourceTree = "<group>"; };
+		C00000000000000000000015 /* ViewerHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerHost.swift; sourceTree = "<group>"; };
+		C00000000000000000000016 /* AppTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTheme.swift; sourceTree = "<group>"; };
+		C00000000000000000000017 /* ResourceCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceCardView.swift; sourceTree = "<group>"; };
+		C00000000000000000000018 /* ResourceRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceRowView.swift; sourceTree = "<group>"; };
+		C00000000000000000000019 /* SourceRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceRowView.swift; sourceTree = "<group>"; };
+		D00000000000000000000001 /* iosRemoteFolder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosRemoteFolder.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		E00000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000002 /* iosRemoteFolder */,
+				A00000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000002 /* iosRemoteFolder */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000010 /* App */,
+				A00000000000000000000011 /* Domain */,
+				A00000000000000000000012 /* Sources */,
+				A00000000000000000000013 /* Indexing */,
+				A00000000000000000000014 /* Cache */,
+				A00000000000000000000015 /* Playback */,
+				A00000000000000000000016 /* Viewers */,
+				A00000000000000000000017 /* UI */,
+			);
+			path = iosRemoteFolder;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				D00000000000000000000001 /* iosRemoteFolder.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000010 /* App */ = {isa = PBXGroup; children = (C00000000000000000000001, C00000000000000000000002, C00000000000000000000003, C00000000000000000000004, C00000000000000000000005, C00000000000000000000006, C00000000000000000000007, ); path = App; sourceTree = "<group>"; };
+		A00000000000000000000011 /* Domain */ = {isa = PBXGroup; children = (C00000000000000000000008, C00000000000000000000009, ); path = Domain; sourceTree = "<group>"; };
+		A00000000000000000000012 /* Sources */ = {isa = PBXGroup; children = (C00000000000000000000010, ); path = Sources; sourceTree = "<group>"; };
+		A00000000000000000000013 /* Indexing */ = {isa = PBXGroup; children = (C00000000000000000000011, ); path = Indexing; sourceTree = "<group>"; };
+		A00000000000000000000014 /* Cache */ = {isa = PBXGroup; children = (C00000000000000000000012, ); path = Cache; sourceTree = "<group>"; };
+		A00000000000000000000015 /* Playback */ = {isa = PBXGroup; children = (C00000000000000000000013, ); path = Playback; sourceTree = "<group>"; };
+		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, ); path = Viewers; sourceTree = "<group>"; };
+		A00000000000000000000017 /* UI */ = {isa = PBXGroup; children = (C00000000000000000000016, C00000000000000000000017, C00000000000000000000018, C00000000000000000000019, ); path = UI; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F00000000000000000000001 /* iosRemoteFolder */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F00000000000000000000003 /* Build configuration list for PBXNativeTarget "iosRemoteFolder" */;
+			buildPhases = (
+				E00000000000000000000002 /* Sources */,
+				E00000000000000000000001 /* Frameworks */,
+				E00000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = iosRemoteFolder;
+			productName = iosRemoteFolder;
+			productReference = D00000000000000000000001 /* iosRemoteFolder.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F00000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					F00000000000000000000001 = {
+						CreatedOnToolsVersion = 26.0;
+					};
+				};
+			};
+			buildConfigurationList = F00000000000000000000004 /* Build configuration list for PBXProject "iosRemoteFolder" */;
+			compatibilityVersion = "Xcode 3.2";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000001;
+			productRefGroup = A00000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F00000000000000000000001 /* iosRemoteFolder */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		E00000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E00000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B00000000000000000000001 /* iosRemoteFolderApp.swift in Sources */,
+				B00000000000000000000002 /* AppModel.swift in Sources */,
+				B00000000000000000000003 /* RootView.swift in Sources */,
+				B00000000000000000000004 /* HomeView.swift in Sources */,
+				B00000000000000000000005 /* BrowseView.swift in Sources */,
+				B00000000000000000000006 /* SourcesView.swift in Sources */,
+				B00000000000000000000007 /* OfflineView.swift in Sources */,
+				B00000000000000000000008 /* ResourceModels.swift in Sources */,
+				B00000000000000000000009 /* SampleData.swift in Sources */,
+				B00000000000000000000010 /* ResourceSourceAdapter.swift in Sources */,
+				B00000000000000000000011 /* ResourceIndexStore.swift in Sources */,
+				B00000000000000000000012 /* CacheCoordinator.swift in Sources */,
+				B00000000000000000000013 /* PlayerEngine.swift in Sources */,
+				B00000000000000000000014 /* ViewerRegistry.swift in Sources */,
+				B00000000000000000000015 /* ViewerHost.swift in Sources */,
+				B00000000000000000000016 /* AppTheme.swift in Sources */,
+				B00000000000000000000017 /* ResourceCardView.swift in Sources */,
+				B00000000000000000000018 /* ResourceRowView.swift in Sources */,
+				B00000000000000000000019 /* SourceRowView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F10000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "资源台";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks");
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.zzf857.iosRemoteFolder;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F10000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "资源台";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks");
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.zzf857.iosRemoteFolder;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		F10000000000000000000003 /* Project Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGAIN;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+			};
+			name = Debug;
+		};
+		F10000000000000000000004 /* Project Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGAIN;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F00000000000000000000003 /* Build configuration list for PBXNativeTarget "iosRemoteFolder" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000001 /* Debug */,
+				F10000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F00000000000000000000004 /* Build configuration list for PBXProject "iosRemoteFolder" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000003 /* Project Debug */,
+				F10000000000000000000004 /* Project Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F00000000000000000000002 /* Project object */;
+}
