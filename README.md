@@ -11,14 +11,15 @@
 - `ResourceSource`、`ResourceItem`、`ResourceReference`、`ResourceCapability` 统一领域模型
 - `ResourceSourceAdapter` 协议 v2：连接、列举、引用、元数据、读取和统一错误映射
 - 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
+- HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
 - Sources 页面连接中、失败、重试状态
 - 49 个 Swift Testing fixture 测试和托管测试 target
 - PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口与假数据流程
 
 当前正在进行：
 
-- 主程复核来源读取契约修复；现有实现已完成主要修复，但仍需补齐 HTTP 206 响应完整性校验、枚举阶段 scheme 校验和 Range 能力缓存身份边界
-- 通过来源基础验收后，先解决真实来源目录下钻与资源稳定 ID，再接入第一个 PDF/TXT 真实查看器
+- 实现 D-024 真实来源浏览垂直切片：规范化目录路径、稳定资源 ID、SourcesStore 真实资源列表和 Browse 根目录/子目录下钻
+- 来源读取契约已由主程验收通过：`dbf31da` 实现、`32b04bb` 测试基线；49/49 测试、Debug 构建和模拟器启动通过
 
 尚未完成：
 
@@ -46,4 +47,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；来源读取契约修复仍未最终验收。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；来源读取契约已验收通过，真实目录浏览仍未完成。
