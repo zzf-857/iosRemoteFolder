@@ -81,10 +81,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         let key = capabilityKey(for: descriptor)
         do {
             let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
-            // HEAD 成功时，Accept-Ranges: bytes 是有效 Range 证据，回写能力缓存。
-            if Self.acceptsByteRanges(response) {
-                verifiedRangeCapability.set(true, for: key)
-            }
+            // HEAD 成功时，Accept-Ranges: bytes 是唯一有效证据；缺失或其他值
+            // 明确写入 false，避免陈旧的 true 证据残留在缓存中。
+            verifiedRangeCapability.set(Self.acceptsByteRanges(response), for: key)
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
             // 服务器不支持 HEAD：降级为 1 字节 Range GET 探测。
             // 探测只看状态与响应头，不消费响应体。
@@ -93,9 +92,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 descriptor: descriptor,
                 headers: ["Range": "bytes=0-0"]
             )
-            // 206 表示服务端确认支持 Range；200 表示服务器忽略了 Range。
-            // 两者都是明确证据，必须回写能力缓存，避免后续重复探测或虚假声明。
-            verifiedRangeCapability.set(response.statusCode == 206, for: key)
+            // 与 fetchMetadata 共用同一证据规则：只有 Content-Range 完整校验通过的
+            // 206 才算有效证据；malformed 206 一律不得缓存为支持 Range。
+            verifiedRangeCapability.set(Self.verifiedRangeProbeEvidence(from: response), for: key)
         }
     }
 
@@ -148,7 +147,8 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 headers: ["Range": "bytes=0-0"]
             )
             var metadata = Self.partialGetMetadata(from: response)
-            metadata.acceptsRanges = response.statusCode == 206
+            // 与 connect() 共用同一证据规则：malformed 206 不声明也不缓存 Range 支持。
+            metadata.acceptsRanges = Self.verifiedRangeProbeEvidence(from: response)
             verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
             return metadata
         }
@@ -345,25 +345,25 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return collected
     }
 
-    /// 服务器忽略 Range 时的流式切片：跳过区间前的字节，只收集请求区间，
-    /// 总消费量超过预算即返回可行动错误；支持任务取消。
+    /// 服务器忽略 Range 时的流式切片：跳过区间前的字节，只收集请求区间。
+    /// 预算检查在消费每个字节之前进行，总消费量（跳过 + 收集）永不超出上限；
+    /// `lowerBound + length` 恰好跨过预算时只会抛错，不可能返回超预算数据。
+    /// 支持任务取消。
     private func sliceFromStream(_ bytes: URLSession.AsyncBytes, range: ResourceByteRange) async throws -> Data {
         var skipped: Int64 = 0
         var collected = Data()
         do {
             for try await byte in bytes {
+                // 先校验预算再消费，跳过与收集共用同一不变量。
+                if skipped + Int64(collected.count) + 1 > maxRangeFallbackBytes {
+                    throw ResourceSourceError.responseTooLarge
+                }
                 if skipped < range.lowerBound {
                     skipped += 1
-                    if skipped > maxRangeFallbackBytes {
-                        throw ResourceSourceError.responseTooLarge
-                    }
                     continue
                 }
                 collected.append(byte)
                 if Int64(collected.count) >= range.length { break }
-                if skipped + Int64(collected.count) > maxRangeFallbackBytes {
-                    throw ResourceSourceError.responseTooLarge
-                }
             }
         } catch let error as ResourceSourceError {
             bytes.task.cancel()
@@ -443,6 +443,31 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     private static func acceptsByteRanges(_ response: HTTPURLResponse) -> Bool {
         headerValue("Accept-Ranges", in: response)
             .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
+    }
+
+    /// HEAD 405/501 降级探测的统一证据规则，`connect()` 与 `fetchMetadata()` 共用。
+    ///
+    /// 只有同时满足以下条件的 206 才确认 Range 支持：
+    /// - `Content-Range` 为合法的 `bytes 0-0/<total|*>`，与探测区间 `bytes=0-0` 对齐；
+    /// - 声明总长度时必须覆盖终点（total > last）；
+    /// - 响应携带 `Content-Length` 时必须等于探测分片大小，缺失则不猜测。
+    /// malformed 206 不是有效证据，绝不能据此把能力缓存为支持 Range。
+    private static func verifiedRangeProbeEvidence(from response: HTTPURLResponse) -> Bool {
+        guard response.statusCode == 206,
+              let contentRange = parseContentRange(from: response),
+              contentRange.first == 0,
+              contentRange.last == 0 else {
+            return false
+        }
+        if let total = contentRange.total, total <= contentRange.last {
+            return false
+        }
+        let fragmentLength = contentRange.last - contentRange.first + 1
+        if response.expectedContentLength >= 0,
+           response.expectedContentLength != fragmentLength {
+            return false
+        }
+        return true
     }
 
     private static func headerValue(_ name: String, in response: HTTPURLResponse) -> String? {
