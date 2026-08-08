@@ -51,8 +51,24 @@ struct ResourceCapability: OptionSet, Hashable, Sendable {
     static let search = Self(rawValue: 1 << 6)
 }
 
+/// 资源的稳定身份：由来源 ID 与规范化逻辑路径确定性派生，
+/// 不依赖展示名称、绝对文件 URL、请求 URL 或随机 UUID。
+/// 同一来源同一路径跨列举、导航与重启保持一致；用于 SwiftUI 导航、
+/// 缓存键与未来的索引/进度恢复。
+struct ResourceIdentity: Hashable, Sendable {
+    let sourceID: UUID
+    let logicalPath: String
+
+    /// 兼容占位：仅在未显式提供身份的构造（测试桩、旧假数据）中使用，
+    /// 不参与真实来源的稳定寻址。
+    static let placeholder = ResourceIdentity(
+        sourceID: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+        logicalPath: ""
+    )
+}
+
 struct ResourceItem: Identifiable, Hashable, Sendable {
-    let id: UUID
+    let id: ResourceIdentity
     let name: String
     let kind: ResourceKind
     let sourceID: UUID
@@ -63,7 +79,7 @@ struct ResourceItem: Identifiable, Hashable, Sendable {
     let accent: ResourceAccent
 
     init(
-        id: UUID = UUID(),
+        id: ResourceIdentity = .placeholder,
         name: String,
         kind: ResourceKind,
         sourceID: UUID,

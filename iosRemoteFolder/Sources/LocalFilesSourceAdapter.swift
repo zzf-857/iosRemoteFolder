@@ -34,10 +34,15 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func listResources() async throws -> [ResourceItem] {
+        try await listResources(at: .root)
+    }
+
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        let baseURL = try resolvedURL(forPath: path, isDirectory: true)
         let urls: [URL]
         do {
             urls = try FileManager.default.contentsOfDirectory(
-                at: rootURL,
+                at: baseURL,
                 includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey],
                 options: [.skipsHiddenFiles]
             )
@@ -48,7 +53,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         }
 
         return urls
-            .map { itemURL in makeItem(from: itemURL) }
+            .map { makeItem(from: $0, parentPath: path) }
             .sorted { lhs, rhs in
                 if lhs.kind == .folder && rhs.kind != .folder { return true }
                 if lhs.kind != .folder && rhs.kind == .folder { return false }
@@ -57,7 +62,8 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
-        let url = try resolvedURL(for: item)
+        let itemPath = try resourcePath(from: item)
+        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ResourceSourceError.notFound
         }
@@ -65,7 +71,8 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
-        let url = try resolvedURL(for: item)
+        let itemPath = try resourcePath(from: item)
+        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -83,7 +90,8 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        let url = try resolvedURL(for: item)
+        let itemPath = try resourcePath(from: item)
+        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         guard let range else {
             // 完整读取保持既有行为与错误映射。
             do {
@@ -133,21 +141,21 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     ///
     /// 双重边界校验：先用规范化路径拦截 `..` 穿越，再解析符号链接，
     /// 用真实路径对照解析后的根目录，拦截指向 root 外部的符号链接。
-    private func resolvedURL(for item: ResourceItem) throws -> URL {
-        var relative = item.path
-        while relative.hasPrefix("/") {
-            relative.removeFirst()
+    private func resolvedURL(forPath path: ResourcePath, isDirectory: Bool) throws -> URL {
+        let relative = path.relativeString
+        let candidate: URL
+        if relative.isEmpty {
+            candidate = rootURL
+        } else {
+            // 用 fileURLWithPath 解析嵌套相对段；appendingPathComponent 会把含
+            // 斜杠的相对串当作单个组件名，故此处直接拼接为完整路径字符串。
+            candidate = URL(fileURLWithPath: rootURL.path + "/" + relative, isDirectory: isDirectory)
         }
-        guard !relative.isEmpty else {
+        let standardized = candidate.standardizedFileURL
+        guard standardized.path == rootURL.path || standardized.path.hasPrefix(rootURL.path + "/") else {
             throw ResourceSourceError.invalidReference
         }
-        let candidate = rootURL
-            .appendingPathComponent(relative)
-            .standardizedFileURL
-        guard candidate.path == rootURL.path || candidate.path.hasPrefix(rootURL.path + "/") else {
-            throw ResourceSourceError.invalidReference
-        }
-        let resolvedCandidate = candidate.resolvingSymlinksInPath()
+        let resolvedCandidate = standardized.resolvingSymlinksInPath()
         let resolvedRoot = resolvedRootURL
         guard resolvedCandidate.path == resolvedRoot.path
             || resolvedCandidate.path.hasPrefix(resolvedRoot.path + "/") else {
@@ -156,18 +164,29 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         return resolvedCandidate
     }
 
-    private func makeItem(from url: URL) -> ResourceItem {
+    /// 从 `ResourceItem.path` 解析规范化逻辑路径；`..` 或非法的逻辑路径直接报 `invalidReference`。
+    private func resourcePath(from item: ResourceItem) throws -> ResourcePath {
+        guard let path = ResourcePath(rawValue: item.path) else {
+            throw ResourceSourceError.invalidReference
+        }
+        return path
+    }
+
+    private func makeItem(from url: URL, parentPath: ResourcePath) -> ResourceItem {
         let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey])
         let isDirectory = values?.isDirectory ?? false
         let kind = isDirectory ? .folder : kind(for: url)
+        let name = url.lastPathComponent
+        let childPath = parentPath.child(name) ?? parentPath
         let capabilities: ResourceCapability = isDirectory
             ? [.list]
             : [.read, .rangeRead, .download]
         return ResourceItem(
-            name: url.lastPathComponent,
+            id: ResourceIdentity(sourceID: source.id, logicalPath: childPath.normalized),
+            name: name,
             kind: kind,
             sourceID: source.id,
-            path: url.lastPathComponent,
+            path: childPath.normalized,
             sizeDescription: sizeDescription(values?.fileSize, isDirectory: isDirectory),
             modifiedDescription: modifiedDescription(values?.contentModificationDate),
             capabilities: capabilities,

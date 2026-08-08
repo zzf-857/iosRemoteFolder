@@ -1,9 +1,12 @@
 import SwiftUI
 
 struct SourcesView: View {
-    @State private var store = SourcesStore.demo()
+    @Environment(AppModel.self) private var appModel
+
+    private var store: SourcesStore { appModel.sourcesStore }
 
     var body: some View {
+        @Bindable var appModel = appModel
         NavigationStack {
             List {
                 Section {

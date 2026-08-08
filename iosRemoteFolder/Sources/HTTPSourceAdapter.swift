@@ -48,6 +48,13 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     let source: ResourceSource
     let descriptors: [HTTPResourceDescriptor]
 
+    /// 规范化逻辑路径 -> descriptor 的精确映射；构建时检测重复逻辑路径与非法 scheme。
+    private let pathToDescriptor: [String: HTTPResourceDescriptor]
+    /// 是否存在规范化后重复的逻辑路径；出现时所有列举/引用/读取都必须明确报 `invalidReference`。
+    private let hasPathConflict: Bool
+    /// 是否存在非法 scheme 的 descriptor。
+    private let hasInvalidScheme: Bool
+
     private let session: URLSession
     private let timeout: TimeInterval
     private let maxRangeFallbackBytes: Int64
@@ -62,9 +69,30 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         maxRangeFallbackBytes: Int64 = HTTPSourceAdapter.defaultMaxRangeFallbackBytes
     ) {
         self.source = source
-        self.descriptors = descriptors
         self.timeout = timeout
         self.maxRangeFallbackBytes = maxRangeFallbackBytes
+
+        var map: [String: HTTPResourceDescriptor] = [:]
+        var conflict = false
+        var invalidScheme = false
+        for descriptor in descriptors {
+            if !(descriptor.url.scheme?.lowercased() == "http" || descriptor.url.scheme?.lowercased() == "https") {
+                invalidScheme = true
+            }
+            guard let normalized = ResourcePath(rawValue: descriptor.path)?.normalized else {
+                invalidScheme = true
+                continue
+            }
+            if map[normalized] != nil {
+                conflict = true
+            }
+            map[normalized] = descriptor
+        }
+        self.descriptors = descriptors
+        self.pathToDescriptor = map
+        self.hasPathConflict = conflict
+        self.hasInvalidScheme = invalidScheme
+
         if let session {
             self.session = session
         } else {
@@ -75,6 +103,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     }
 
     func connect() async throws {
+        // 配置非法（重复逻辑路径或非 http/https scheme）时整体拒绝，
+        // 避免把无效来源暴露给下游直到引用或读取时才失败。
+        guard !hasInvalidScheme, !hasPathConflict else {
+            throw ResourceSourceError.invalidReference
+        }
         // 没有配置直链时无需网络探测，直接视为可连接。
         guard let probe = descriptors.first else { return }
         let descriptor = try validated(probe)
@@ -99,13 +132,17 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     }
 
     func listResources() async throws -> [ResourceItem] {
-        // 枚举前校验所有 descriptor：任何一个非法 scheme 都整体拒绝，
-        // 避免把无效来源暴露给下游，直到引用或读取时才失败。
+        // 兼容入口：返回已配置直链平铺列表，保持既有调用方与测试契约；
+        // 真实可浏览的虚拟目录树由 `listResources(at:)` 提供。
+        guard !hasInvalidScheme, !hasPathConflict else {
+            throw ResourceSourceError.invalidReference
+        }
         for descriptor in descriptors {
             _ = try validated(descriptor)
         }
         return descriptors.map { descriptor in
             ResourceItem(
+                id: ResourceIdentity(sourceID: source.id, logicalPath: descriptor.path),
                 name: descriptor.name,
                 kind: descriptor.kind,
                 sourceID: source.id,
@@ -116,6 +153,64 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 accent: .recommended(for: descriptor.kind)
             )
         }
+    }
+
+    /// 在已配置直链上构建可浏览的虚拟目录树：进入任意目录只返回该层的直接子项
+    /// （文件或必要的虚拟文件夹），不把所有深层资源平铺在根目录。
+    /// 规范化后出现重复逻辑路径时整体拒绝（不会静默选择某一项）。
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        guard !hasInvalidScheme, !hasPathConflict else {
+            throw ResourceSourceError.invalidReference
+        }
+        var folderNames: [String: String] = [:]   // 规范化文件夹路径 -> 展示名
+        var fileItems: [ResourceItem] = []
+        for (normalized, descriptor) in pathToDescriptor {
+            guard let descriptorPath = ResourcePath(rawValue: normalized) else { continue }
+            guard descriptorPath.isUnder(path) else { continue }
+            let remaining = descriptorPath.components.dropFirst(path.components.count)
+            guard !remaining.isEmpty else { continue }
+            if remaining.count == 1 {
+                fileItems.append(makeFileItem(descriptor, path: descriptorPath))
+            } else {
+                guard let folderName = remaining.first,
+                      let folderPath = path.child(folderName) else { continue }
+                folderNames[folderPath.normalized] = folderName
+            }
+        }
+        let folders = folderNames.map { (folderPath, folderName) in
+            ResourceItem(
+                id: ResourceIdentity(sourceID: source.id, logicalPath: folderPath),
+                name: folderName,
+                kind: .folder,
+                sourceID: source.id,
+                path: folderPath,
+                sizeDescription: "文件夹",
+                modifiedDescription: "目录",
+                capabilities: [.list],
+                accent: .recommended(for: .folder)
+            )
+        }
+        let sortedFolders = folders.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        let sortedFiles = fileItems.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        return sortedFolders + sortedFiles
+    }
+
+    private func makeFileItem(_ descriptor: HTTPResourceDescriptor, path: ResourcePath) -> ResourceItem {
+        ResourceItem(
+            id: ResourceIdentity(sourceID: source.id, logicalPath: path.normalized),
+            name: descriptor.name,
+            kind: descriptor.kind,
+            sourceID: source.id,
+            path: path.normalized,
+            sizeDescription: "待探测",
+            modifiedDescription: "直链资源",
+            capabilities: [.read, .download, .directURL],
+            accent: .recommended(for: descriptor.kind)
+        )
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
@@ -186,8 +281,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     // MARK: - Private
 
     private func descriptor(for item: ResourceItem) throws -> HTTPResourceDescriptor {
-        guard item.sourceID == source.id,
-              let descriptor = descriptors.first(where: { $0.path == item.path }) else {
+        guard item.sourceID == source.id else { throw ResourceSourceError.invalidReference }
+        guard !hasInvalidScheme, !hasPathConflict else { throw ResourceSourceError.invalidReference }
+        // 用规范化逻辑路径精确寻址：重复路径在初始化阶段已成冲突并整体拒绝，
+        // 不会像 `first(where:)` 那样静默选择某一项。
+        guard let descriptor = pathToDescriptor[item.path] else {
             throw ResourceSourceError.invalidReference
         }
         return try validated(descriptor)
@@ -320,6 +418,13 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
               contentRange.last >= contentRange.first,
               contentRange.first == requested.lowerBound,
               contentRange.last <= requested.upperBound else {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        // 收紧短分片：请求未到达文件尾（响应终点早于请求终点）时，只有明确
+        // `total == last + 1` 的真实 EOF 场景才允许短分片；其余短响应一律视为违约。
+        let isShort = contentRange.last < requested.upperBound
+        if isShort, contentRange.total != contentRange.last + 1 {
             bytes.task.cancel()
             throw ResourceSourceError.invalidResponse
         }

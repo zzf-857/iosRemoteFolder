@@ -4,6 +4,7 @@ struct HomeView: View {
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
+        @Bindable var appModel = appModel
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
@@ -22,6 +23,11 @@ struct HomeView: View {
                         appModel.currentTab = .browse
                     }
                 }
+            }
+            // 整个 NavigationStack 只注册一次 ResourceItem 目的地，
+            // 消除子区段重复注册导致的运行时警告。
+            .navigationDestination(for: ResourceItem.self) { resource in
+                ResourceViewerHost(resource: resource)
             }
         }
     }
@@ -55,9 +61,6 @@ private struct ContinueSection: View {
                     }
                 }
             }
-        }
-        .navigationDestination(for: ResourceItem.self) { resource in
-            ResourceViewerHost(resource: resource)
         }
     }
 }
@@ -97,9 +100,6 @@ private struct RecentSection: View {
                 }
                 .buttonStyle(.plain)
             }
-        }
-        .navigationDestination(for: ResourceItem.self) { resource in
-            ResourceViewerHost(resource: resource)
         }
     }
 }

@@ -14,7 +14,14 @@ protocol ResourceSourceAdapter: Sendable {
     func connect() async throws
 
     /// 列举当前可见资源：本地来源为顶层目录内容，HTTP 来源为已配置直链。
+    /// 兼容入口：默认转发到根目录，保证既有调用方与测试 target 不因协议迁移失去编译入口。
     func listResources() async throws -> [ResourceItem]
+
+    /// 列举指定逻辑目录下的直接子项（文件夹与文件）。
+    /// 本地来源解析真实子目录，HTTP 来源在已配置直链上构建虚拟目录树；
+    /// 规范化后的逻辑路径必须唯一，重复路径须明确报 `invalidReference`，
+    /// 不能由 `first(where:)` 静默选择。
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem]
 
     /// 为资源生成统一引用；未知资源抛出 `ResourceSourceError.invalidReference`。
     func reference(for item: ResourceItem) async throws -> ResourceReference
@@ -165,8 +172,43 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
     }
 
     func listResources() async throws -> [ResourceItem] {
+        try await listResources(at: .root)
+    }
+
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
         try await connect()
-        return SampleData.resources.filter { $0.sourceID == source.id }
+        let all = SampleData.resources.filter { $0.sourceID == source.id }
+        guard !path.isRoot else { return all }
+        // 按规范化路径过滤：直接子文件保留，深层资源合成必要的虚拟文件夹。
+        var folderNames: [String: String] = [:]
+        var fileItems: [ResourceItem] = [:]
+        for item in all {
+            guard let itemPath = ResourcePath(rawValue: item.path), itemPath.isUnder(path) else { continue }
+            let remaining = itemPath.components.dropFirst(path.components.count)
+            if remaining.count == 1 {
+                fileItems[item.path] = item
+            } else if remaining.count > 1,
+                      let folderName = remaining.first,
+                      let folderPath = path.child(folderName) {
+                folderNames[folderPath.normalized] = folderName
+            }
+        }
+        let folders = folderNames.map { (folderPath, folderName) in
+            ResourceItem(
+                id: ResourceIdentity(sourceID: source.id, logicalPath: folderPath),
+                name: folderName,
+                kind: .folder,
+                sourceID: source.id,
+                path: folderPath,
+                sizeDescription: "文件夹",
+                modifiedDescription: "目录",
+                capabilities: [.list],
+                accent: .recommended(for: .folder)
+            )
+        }
+        let sortedFolders = folders.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let sortedFiles = fileItems.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return sortedFolders + sortedFiles
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
@@ -179,5 +221,14 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         throw ResourceSourceError.capabilityUnavailable
+    }
+}
+
+extension ResourceSourceAdapter {
+    /// 默认回退：未专门实现 `listResources(at:)` 的 adapter（例如测试桩只实现
+    /// 无参数 `listResources()`）沿用原有列举语义，避免协议迁移要求所有 conformer
+    /// 立即实现带路径列举。
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        try await listResources()
     }
 }

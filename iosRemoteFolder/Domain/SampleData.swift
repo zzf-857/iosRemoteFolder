@@ -43,6 +43,7 @@ enum SampleData {
 
     static let resources: [ResourceItem] = [
         ResourceItem(
+            id: ResourceIdentity(sourceID: personalSourceID, logicalPath: "/知识库/设计/设计系统与组件规范.pdf"),
             name: "设计系统与组件规范.pdf",
             kind: .pdf,
             sourceID: personalSourceID,
@@ -53,6 +54,7 @@ enum SampleData {
             accent: .orange
         ),
         ResourceItem(
+            id: ResourceIdentity(sourceID: workSourceID, logicalPath: "/产品/路线图.md"),
             name: "产品路线图.md",
             kind: .markdown,
             sourceID: workSourceID,
@@ -63,6 +65,7 @@ enum SampleData {
             accent: .teal
         ),
         ResourceItem(
+            id: ResourceIdentity(sourceID: workSourceID, logicalPath: "/运维/服务器部署日志.txt"),
             name: "服务器部署日志.txt",
             kind: .text,
             sourceID: workSourceID,
@@ -73,6 +76,7 @@ enum SampleData {
             accent: .blue
         ),
         ResourceItem(
+            id: ResourceIdentity(sourceID: localSourceID, logicalPath: "/照片/旅行/海边-2026-01.jpg"),
             name: "海边-2026-01.jpg",
             kind: .image,
             sourceID: localSourceID,
@@ -83,6 +87,7 @@ enum SampleData {
             accent: .blue
         ),
         ResourceItem(
+            id: ResourceIdentity(sourceID: personalSourceID, logicalPath: "/视频/学习/WWDC 设计分享.mp4"),
             name: "WWDC 设计分享.mp4",
             kind: .video,
             sourceID: personalSourceID,
@@ -93,6 +98,7 @@ enum SampleData {
             accent: .purple
         ),
         ResourceItem(
+            id: ResourceIdentity(sourceID: localSourceID, logicalPath: "/音乐/工作/深夜工作歌单.m4a"),
             name: "深夜工作歌单.m4a",
             kind: .audio,
             sourceID: localSourceID,
