@@ -22,7 +22,7 @@
 - `7ed2db7` 完成最终来源契约收口：`listResources(at:)` 是唯一必需列举入口，无参数入口只转发 `.root`；Local 三个文件入口共用真实可读普通文件校验；HTTP 身份、寻址与 Range 能力键共用 canonical path + URL。
 - 主程已迁移测试基线并补充 D-024 契约覆盖。iPhone 17 Pro / iOS 26.5 上 61/61 测试、generic iOS Simulator Debug 构建、工程列表、差异检查和普通 App 安装启动全部通过。
 - 来源读取契约（D-023）已由主程验收：`dbf31da` 实现、`32b04bb` 测试基线、`3dddb6e` 边界回归用例；HTTP 206、Range 探测、50MB 流式回退、取消语义和本地 symlink 防护在 D-024 阻塞修复中保持兼容，未削弱。
-- D-029 执行 Agent 已完成位置身份、typed metadata、内容 revision、UI Locale 格式化和 revision-aware cache key 的源码交付（`7f12b99c`，待 Codex 主程迁移测试并复核）；复核前不进入内容会话或真实查看器。
+- D-029 执行 Agent 已完成位置身份、typed metadata、内容 revision、UI Locale 格式化和 revision-aware cache key 的源码交付；最终阻塞修复已收口 formatter 编译错误与 Local 文件能力声明（基线 `c2841887`，待 Codex 主程迁移测试并复核）；复核前不进入内容会话或真实查看器。
 
 尚未完成：
 

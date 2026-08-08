@@ -11,10 +11,7 @@ enum ResourceMetadataFormatter {
             return "大小未知"
         }
 
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.locale = .current
-        return formatter.string(fromByteCount: byteSize)
+        return ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file)
     }
 
     static func modified(for metadata: ResourceMetadata) -> String {

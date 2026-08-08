@@ -228,15 +228,26 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         ])
         let isDirectory = values?.isDirectory ?? false
         let isRegularFile = values?.isRegularFile == true
-        let kind = isDirectory ? .folder : isRegularFile ? kind(for: url) : .unknown
+        let isReadable = values?.isReadable == true
+        let isReadableRegularFile = isRegularFile && isReadable
+        let kind = isDirectory ? .folder : isReadableRegularFile ? kind(for: url) : .unknown
         let name = url.lastPathComponent
         let childPath = parentPath.child(name) ?? parentPath
-        let metadata = makeMetadata(from: url, values: values, isDirectory: isDirectory)
-        var capabilities: ResourceCapability = metadata.isDirectory
-            ? [.list]
-            : [.read, .download]
-        if metadata.acceptsRanges {
-            capabilities.insert(.rangeRead)
+        let metadata = makeMetadata(
+            from: url,
+            values: values,
+            isDirectory: isDirectory,
+            isRegularFile: isRegularFile,
+            isReadable: isReadable
+        )
+        var capabilities: ResourceCapability = []
+        if isDirectory {
+            capabilities = [.list]
+        } else if isReadableRegularFile {
+            capabilities = [.read, .download]
+            if metadata.acceptsRanges {
+                capabilities.insert(.rangeRead)
+            }
         }
         return ResourceItem(
             sourceID: source.id,
@@ -264,7 +275,9 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     private func makeMetadata(
         from url: URL,
         values: URLResourceValues?,
-        isDirectory: Bool
+        isDirectory: Bool,
+        isRegularFile: Bool,
+        isReadable: Bool
     ) -> ResourceMetadata {
         guard !isDirectory else {
             return ResourceMetadata(
@@ -275,7 +288,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             )
         }
 
-        guard values?.isRegularFile == true else {
+        guard isRegularFile else {
             return ResourceMetadata(
                 modifiedAt: values?.contentModificationDate,
                 isDirectory: false,
@@ -287,8 +300,6 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         let byteSize = values?.fileSize.map { Int64($0) }
         let modifiedAt = values?.contentModificationDate
         let type = typeInfo(for: url)
-        let isReadable = values?.isReadable == true
-        let isRegularFile = values?.isRegularFile == true
         return ResourceMetadata(
             byteSize: byteSize,
             modifiedAt: modifiedAt,
