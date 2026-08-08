@@ -286,6 +286,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
             throw ResourceSourceError.invalidReference
         }
+        guard item.kind != .folder, !item.metadata.isDirectory else {
+            throw ResourceSourceError.invalidReference
+        }
         guard !hasInvalidDescriptor, !hasPathConflict else { throw ResourceSourceError.invalidReference }
         // 用规范化逻辑路径精确寻址：重复路径在初始化阶段已成冲突并整体拒绝，
         // 不会像 `first(where:)` 那样静默选择某一项。

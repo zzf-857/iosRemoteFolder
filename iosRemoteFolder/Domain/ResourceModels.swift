@@ -135,22 +135,6 @@ enum ResourceRevision: Hashable, Sendable {
         return .unknown
     }
 
-    /// Alias retained as a descriptive construction entry; it delegates to
-    /// `strongest` so evidence priority cannot diverge between call sites.
-    static func from(
-        etag: String? = nil,
-        serverVersion: String? = nil,
-        modifiedAt: Date? = nil,
-        byteSize: Int64? = nil
-    ) -> ResourceRevision {
-        strongest(
-            etag: etag,
-            serverVersion: serverVersion,
-            modifiedAt: modifiedAt,
-            byteSize: byteSize
-        )
-    }
-
     var isKnown: Bool {
         switch self {
         case .etag(let value), .serverVersion(let value):
@@ -166,6 +150,36 @@ enum ResourceRevision: Hashable, Sendable {
 
     private static func isBlank(_ value: String) -> Bool {
         value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+/// Typed facts reported by a source adapter. Presentation text is deliberately
+/// absent; the UI formats these values with the active system locale.
+struct ResourceMetadata: Hashable, Sendable {
+    var byteSize: Int64?
+    var modifiedAt: Date?
+    var mimeType: String?
+    var typeIdentifier: String?
+    var isDirectory: Bool
+    var acceptsRanges: Bool
+    var revision: ResourceRevision
+
+    init(
+        byteSize: Int64? = nil,
+        modifiedAt: Date? = nil,
+        mimeType: String? = nil,
+        typeIdentifier: String? = nil,
+        isDirectory: Bool = false,
+        acceptsRanges: Bool = false,
+        revision: ResourceRevision = .unknown
+    ) {
+        self.byteSize = byteSize
+        self.modifiedAt = modifiedAt
+        self.mimeType = mimeType
+        self.typeIdentifier = typeIdentifier
+        self.isDirectory = isDirectory
+        self.acceptsRanges = acceptsRanges
+        self.revision = revision
     }
 }
 

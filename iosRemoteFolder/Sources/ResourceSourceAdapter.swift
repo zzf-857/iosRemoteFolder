@@ -37,35 +37,6 @@ extension ResourceSourceAdapter {
     }
 }
 
-/// 资源元数据：来自本地文件属性或 HTTP HEAD 探测。
-struct ResourceMetadata: Hashable, Sendable {
-    var byteSize: Int64?
-    var modifiedAt: Date?
-    var mimeType: String?
-    var typeIdentifier: String?
-    var isDirectory: Bool
-    var acceptsRanges: Bool
-    var revision: ResourceRevision
-
-    init(
-        byteSize: Int64? = nil,
-        modifiedAt: Date? = nil,
-        mimeType: String? = nil,
-        typeIdentifier: String? = nil,
-        isDirectory: Bool = false,
-        acceptsRanges: Bool = false,
-        revision: ResourceRevision = .unknown
-    ) {
-        self.byteSize = byteSize
-        self.modifiedAt = modifiedAt
-        self.mimeType = mimeType
-        self.typeIdentifier = typeIdentifier
-        self.isDirectory = isDirectory
-        self.acceptsRanges = acceptsRanges
-        self.revision = revision
-    }
-}
-
 /// 统一的来源错误。所有 adapter 抛出的底层错误都必须映射到这里，
 /// 保证 UI、测试和日志看到的是同一套可解释、可行动的错误语义。
 enum ResourceSourceError: LocalizedError, Hashable, Sendable {

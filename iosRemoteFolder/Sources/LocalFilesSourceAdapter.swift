@@ -206,6 +206,12 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
             throw ResourceSourceError.invalidReference
         }
+        // A folder item cannot enter a file operation, but this declaration is
+        // only an early semantic guard; the resolved disk facts below still
+        // independently prove that every candidate is a regular readable file.
+        guard item.kind != .folder, !item.metadata.isDirectory else {
+            throw ResourceSourceError.invalidReference
+        }
         guard let path = ResourcePath(rawValue: item.path), !path.isRoot else {
             throw ResourceSourceError.invalidReference
         }
@@ -221,7 +227,8 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             .fileSizeKey
         ])
         let isDirectory = values?.isDirectory ?? false
-        let kind = isDirectory ? .folder : kind(for: url)
+        let isRegularFile = values?.isRegularFile == true
+        let kind = isDirectory ? .folder : isRegularFile ? kind(for: url) : .unknown
         let name = url.lastPathComponent
         let childPath = parentPath.child(name) ?? parentPath
         let metadata = makeMetadata(from: url, values: values, isDirectory: isDirectory)
@@ -263,6 +270,15 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             return ResourceMetadata(
                 modifiedAt: values?.contentModificationDate,
                 isDirectory: true,
+                acceptsRanges: false,
+                revision: .unknown
+            )
+        }
+
+        guard values?.isRegularFile == true else {
+            return ResourceMetadata(
+                modifiedAt: values?.contentModificationDate,
+                isDirectory: false,
                 acceptsRanges: false,
                 revision: .unknown
             )
