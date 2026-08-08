@@ -19,6 +19,14 @@ enum ResourceCacheVariant: Hashable, Sendable {
     case preview
     case thumbnail
     case byteRange(ResourceByteRange)
+
+    /// Descriptive aliases keep call sites readable without introducing a
+    /// second representation for the same cache variants.
+    static var original: Self { .content }
+
+    static func range(_ value: ResourceByteRange) -> Self {
+        .byteRange(value)
+    }
 }
 
 /// A persistent cache identity for one content revision and one variant.
@@ -30,6 +38,9 @@ struct ResourceCacheKey: Hashable, Sendable {
     let identity: ResourceIdentity
     let revision: ResourceRevision
     let variant: ResourceCacheVariant
+
+    var resourceIdentity: ResourceIdentity { identity }
+    var resourceRevision: ResourceRevision { revision }
 
     init?(
         identity: ResourceIdentity,

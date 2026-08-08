@@ -51,17 +51,122 @@ struct ResourceCapability: OptionSet, Hashable, Sendable {
     static let search = Self(rawValue: 1 << 6)
 }
 
-/// 资源的稳定身份：由来源 ID 与规范化逻辑路径确定性派生，
-/// 不依赖展示名称、绝对文件 URL、请求 URL 或随机 UUID。
-/// 同一来源同一路径跨列举、导航与重启保持一致；用于 SwiftUI 导航、
-/// 缓存键与未来的索引/进度恢复。
+/// 资源的稳定位置身份：由来源 ID 与规范化逻辑路径确定性派生。
 ///
-/// 不变量：真实 `ResourceItem` 只能经由 `ResourceItem` 的单一构造入口派生，
-/// 不允许调用方分别传入互相矛盾的 `sourceID` 与 `logicalPath`，也不存在
-/// 可注入真实数据的共享占位。
+/// `logicalPath` 保留为规范化字符串以兼容现有领域调用点，但显式构造器只
+/// 接受 `ResourcePath`，因此模块内不存在以任意原始字符串构造真实身份的入口。
+/// 持久化时使用版本化的 `identityKey`，不包含展示名称、URL 或请求头。
 struct ResourceIdentity: Hashable, Sendable {
+    static let keyVersion = "v1"
+
     let sourceID: UUID
     let logicalPath: String
+
+    init(sourceID: UUID, logicalPath: ResourcePath) {
+        self.sourceID = sourceID
+        self.logicalPath = logicalPath.normalized
+    }
+
+    /// 可逆、版本化的持久化键：`v1|<lowercase UUID>|<normalized path>`。
+    var identityKey: String {
+        "\(Self.keyVersion)|\(sourceID.uuidString.lowercased())|\(logicalPath)"
+    }
+
+    /// 从 canonical `identityKey` 解析身份。
+    ///
+    /// 只切前两个 `|`；余下全部属于路径，因此文件名中的 `|` 不会丢失。
+    /// UUID 与路径都必须已经是 canonical 表示，任何可被归一化但本身不规范的
+    /// 输入都被拒绝，避免解析时静默产生另一身份。
+    init?(identityKey: String) {
+        let fields = identityKey.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+        guard fields.count == 3,
+              String(fields[0]) == Self.keyVersion,
+              !fields[1].isEmpty,
+              !fields[2].isEmpty else {
+            return nil
+        }
+
+        let uuidText = String(fields[1])
+        guard let sourceID = UUID(uuidString: uuidText),
+              sourceID.uuidString.lowercased() == uuidText else {
+            return nil
+        }
+        let pathText = String(fields[2])
+        guard let path = ResourcePath(rawValue: pathText),
+              path.normalized == pathText else {
+            return nil
+        }
+        self.init(sourceID: sourceID, logicalPath: path)
+    }
+
+    /// Explicit spelling for callers that prefer a parser-style API.
+    static func parse(identityKey: String) -> ResourceIdentity? {
+        ResourceIdentity(identityKey: identityKey)
+    }
+}
+
+/// Evidence describing the bytes currently occupying a resource location.
+///
+/// The associated values are intentionally opaque. In particular, ETags are
+/// retained exactly as received, including weak ETags and quote characters.
+enum ResourceRevision: Hashable, Sendable {
+    case etag(String)
+    case serverVersion(String)
+    case modifiedAndSize(modifiedAt: Date, byteSize: Int64)
+    case unknown
+
+    /// Selects the strongest available evidence in the only supported order:
+    /// ETag, server version, modification time + non-negative byte size, unknown.
+    static func strongest(
+        etag: String?,
+        serverVersion: String?,
+        modifiedAt: Date?,
+        byteSize: Int64?
+    ) -> ResourceRevision {
+        if let etag, !Self.isBlank(etag) {
+            return .etag(etag)
+        }
+        if let serverVersion, !Self.isBlank(serverVersion) {
+            return .serverVersion(serverVersion)
+        }
+        if let modifiedAt, let byteSize, byteSize >= 0 {
+            return .modifiedAndSize(modifiedAt: modifiedAt, byteSize: byteSize)
+        }
+        return .unknown
+    }
+
+    /// Alias retained as a descriptive construction entry; it delegates to
+    /// `strongest` so evidence priority cannot diverge between call sites.
+    static func from(
+        etag: String? = nil,
+        serverVersion: String? = nil,
+        modifiedAt: Date? = nil,
+        byteSize: Int64? = nil
+    ) -> ResourceRevision {
+        strongest(
+            etag: etag,
+            serverVersion: serverVersion,
+            modifiedAt: modifiedAt,
+            byteSize: byteSize
+        )
+    }
+
+    var isKnown: Bool {
+        switch self {
+        case .etag(let value), .serverVersion(let value):
+            return !Self.isBlank(value)
+        case .modifiedAndSize(_, let byteSize):
+            return byteSize >= 0
+        case .unknown:
+            return false
+        }
+    }
+
+    var isUnknown: Bool { !isKnown }
+
+    private static func isBlank(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 struct ResourceItem: Identifiable, Hashable, Sendable {
@@ -70,8 +175,7 @@ struct ResourceItem: Identifiable, Hashable, Sendable {
     let kind: ResourceKind
     let sourceID: UUID
     let path: String
-    let sizeDescription: String
-    let modifiedDescription: String
+    let metadata: ResourceMetadata
     let capabilities: ResourceCapability
     let accent: ResourceAccent
 
@@ -83,19 +187,17 @@ struct ResourceItem: Identifiable, Hashable, Sendable {
         logicalPath: ResourcePath,
         name: String,
         kind: ResourceKind,
-        sizeDescription: String,
-        modifiedDescription: String,
+        metadata: ResourceMetadata,
         capabilities: ResourceCapability,
         accent: ResourceAccent
     ) {
         self.sourceID = sourceID
         let normalized = logicalPath.normalized
         self.path = normalized
-        self.id = ResourceIdentity(sourceID: sourceID, logicalPath: normalized)
+        self.id = ResourceIdentity(sourceID: sourceID, logicalPath: logicalPath)
         self.name = name
         self.kind = kind
-        self.sizeDescription = sizeDescription
-        self.modifiedDescription = modifiedDescription
+        self.metadata = metadata
         self.capabilities = capabilities
         self.accent = accent
     }
@@ -181,4 +283,3 @@ enum ResourceAccent: String, Hashable, Sendable {
         }
     }
 }
-

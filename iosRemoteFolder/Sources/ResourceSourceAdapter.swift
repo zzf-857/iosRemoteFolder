@@ -40,20 +40,29 @@ extension ResourceSourceAdapter {
 /// 资源元数据：来自本地文件属性或 HTTP HEAD 探测。
 struct ResourceMetadata: Hashable, Sendable {
     var byteSize: Int64?
-    var contentType: String?
     var modifiedAt: Date?
+    var mimeType: String?
+    var typeIdentifier: String?
+    var isDirectory: Bool
     var acceptsRanges: Bool
+    var revision: ResourceRevision
 
     init(
         byteSize: Int64? = nil,
-        contentType: String? = nil,
         modifiedAt: Date? = nil,
-        acceptsRanges: Bool = false
+        mimeType: String? = nil,
+        typeIdentifier: String? = nil,
+        isDirectory: Bool = false,
+        acceptsRanges: Bool = false,
+        revision: ResourceRevision = .unknown
     ) {
         self.byteSize = byteSize
-        self.contentType = contentType
         self.modifiedAt = modifiedAt
+        self.mimeType = mimeType
+        self.typeIdentifier = typeIdentifier
+        self.isDirectory = isDirectory
         self.acceptsRanges = acceptsRanges
+        self.revision = revision
     }
 }
 
@@ -198,8 +207,7 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
                 logicalPath: ResourcePath(rawValue: folderPath)!,
                 name: folderName,
                 kind: .folder,
-                sizeDescription: "文件夹",
-                modifiedDescription: "目录",
+                metadata: ResourceMetadata(isDirectory: true),
                 capabilities: [.list],
                 accent: .recommended(for: .folder)
             )

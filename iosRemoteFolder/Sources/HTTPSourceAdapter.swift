@@ -1,6 +1,7 @@
 import Foundation
+import UniformTypeIdentifiers
 
-/// HTTP/HTTPS 直链资源描述：一个来源由一组预先配置的直链组成。
+/// HTTP/HTTPS 资源描述：一个来源由一组预先配置的远端 URL 组成。
 ///
 /// Scheme 契约：`url` 只允许 `http` 与 `https`；其他 scheme 会在 adapter
 /// 边界被拒绝并映射为 `ResourceSourceError.invalidReference`。
@@ -80,6 +81,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         for rawDescriptor in descriptors {
             var descriptor = rawDescriptor
             if !(descriptor.url.scheme?.lowercased() == "http" || descriptor.url.scheme?.lowercased() == "https") {
+                invalidDescriptor = true
+            }
+            if descriptor.kind == .folder {
                 invalidDescriptor = true
             }
             guard let canonicalPath = ResourcePath(rawValue: descriptor.path) else {
@@ -182,8 +186,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 logicalPath: ResourcePath(rawValue: folderPath)!,
                 name: folderName,
                 kind: .folder,
-                sizeDescription: "文件夹",
-                modifiedDescription: "目录",
+                metadata: ResourceMetadata(isDirectory: true),
                 capabilities: [.list],
                 accent: .recommended(for: .folder)
             )
@@ -203,8 +206,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             logicalPath: path,
             name: descriptor.name,
             kind: descriptor.kind,
-            sizeDescription: "待探测",
-            modifiedDescription: "直链资源",
+            metadata: ResourceMetadata(isDirectory: false),
             capabilities: [.read, .download, .directURL],
             accent: .recommended(for: descriptor.kind)
         )
@@ -228,7 +230,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         let key = capabilityKey(for: descriptor)
         do {
             let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
-            let metadata = Self.headMetadata(from: response)
+            let metadata = Self.headMetadata(from: response, descriptor: descriptor)
             verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
             return metadata
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
@@ -238,7 +240,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 descriptor: descriptor,
                 headers: ["Range": "bytes=0-0"]
             )
-            var metadata = Self.partialGetMetadata(from: response)
+            var metadata = Self.partialGetMetadata(from: response, descriptor: descriptor)
             // 与 connect() 共用同一证据规则：malformed 206 不声明也不缓存 Range 支持。
             metadata.acceptsRanges = Self.verifiedRangeProbeEvidence(from: response)
             verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
@@ -306,7 +308,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     /// `ResourcePath.normalized`，并与身份和 `pathToDescriptor` 寻址共用该值。
     /// URL 是第二维；展示名称与可能含凭证的 headers 不进入键。
     private func capabilityKey(for descriptor: HTTPResourceDescriptor) -> CapabilityKey {
-        CapabilityKey(path: descriptor.path, url: descriptor.url)
+        // Initialization canonicalizes every valid descriptor. Re-parse here so
+        // the key visibly consumes the same normalized value as identity and
+        // `pathToDescriptor`; invalid input never falls back to a raw path.
+        let path = ResourcePath(rawValue: descriptor.path)!
+        return CapabilityKey(path: path.normalized, url: descriptor.url)
     }
 
     private func makeRequest(
@@ -485,25 +491,60 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return collected
     }
 
-    /// HEAD 元数据：`Content-Length` 即完整大小；只在 `Accept-Ranges: bytes` 时声称 Range 支持。
-    private static func headMetadata(from response: HTTPURLResponse) -> ResourceMetadata {
-        let byteSize = response.expectedContentLength >= 0 ? Int64(response.expectedContentLength) : nil
+    /// HEAD 元数据：`Content-Length` 代表完整响应大小；只在
+    /// `Accept-Ranges: bytes` 时声称 Range 支持。
+    private static func headMetadata(
+        from response: HTTPURLResponse,
+        descriptor: HTTPResourceDescriptor
+    ) -> ResourceMetadata {
+        let byteSize: Int64?
+        if response.statusCode == 206 {
+            // A partial HEAD response has the same single-fragment semantics as
+            // a partial GET: never treat Content-Length (often 1) as full size.
+            byteSize = contentRangeTotalLength(from: response)
+        } else if response.expectedContentLength >= 0 {
+            byteSize = Int64(response.expectedContentLength)
+        } else {
+            byteSize = nil
+        }
+        let modifiedAt = headerValue("Last-Modified", in: response).flatMap(parseHTTPDate)
+        let mimeType = response.mimeType
         return ResourceMetadata(
             byteSize: byteSize,
-            contentType: response.mimeType,
-            modifiedAt: headerValue("Last-Modified", in: response).flatMap(parseHTTPDate),
-            acceptsRanges: acceptsByteRanges(response)
+            modifiedAt: modifiedAt,
+            mimeType: mimeType,
+            typeIdentifier: typeIdentifier(forMIMEType: mimeType, descriptor: descriptor),
+            isDirectory: false,
+            acceptsRanges: acceptsByteRanges(response),
+            revision: revision(from: response, modifiedAt: modifiedAt, byteSize: byteSize)
         )
     }
 
-    /// 206 探测元数据：`Content-Length` 是分片大小而非文件总大小；
-    /// 总大小只从 `Content-Range` 解析，无法确认时保持 nil，不猜测。
-    private static func partialGetMetadata(from response: HTTPURLResponse) -> ResourceMetadata {
-        ResourceMetadata(
-            byteSize: contentRangeTotalLength(from: response),
-            contentType: response.mimeType,
-            modifiedAt: headerValue("Last-Modified", in: response).flatMap(parseHTTPDate),
-            acceptsRanges: false
+    /// 405/501 后的探测元数据：206 的 `Content-Length` 是单字节分片大小，
+    /// 所以完整大小只能来自合法 `Content-Range` 总长度。若服务端忽略 Range
+    /// 返回 200，则其 Content-Length 才可能代表完整响应大小。
+    private static func partialGetMetadata(
+        from response: HTTPURLResponse,
+        descriptor: HTTPResourceDescriptor
+    ) -> ResourceMetadata {
+        let byteSize: Int64?
+        if response.statusCode == 206 {
+            byteSize = contentRangeTotalLength(from: response)
+        } else if response.statusCode == 200, response.expectedContentLength >= 0 {
+            byteSize = Int64(response.expectedContentLength)
+        } else {
+            byteSize = nil
+        }
+        let modifiedAt = headerValue("Last-Modified", in: response).flatMap(parseHTTPDate)
+        let mimeType = response.mimeType
+        return ResourceMetadata(
+            byteSize: byteSize,
+            modifiedAt: modifiedAt,
+            mimeType: mimeType,
+            typeIdentifier: typeIdentifier(forMIMEType: mimeType, descriptor: descriptor),
+            isDirectory: false,
+            acceptsRanges: false,
+            revision: revision(from: response, modifiedAt: modifiedAt, byteSize: byteSize)
         )
     }
 
@@ -545,7 +586,64 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
 
     /// 解析 `Content-Range` 的总长度；`*` 或格式非法时视为未知，返回 nil。
     private static func contentRangeTotalLength(from response: HTTPURLResponse) -> Int64? {
-        parseContentRange(from: response)?.total
+        guard let parsed = parseContentRange(from: response),
+              parsed.first >= 0,
+              parsed.last >= parsed.first else {
+            return nil
+        }
+        if let total = parsed.total, total <= parsed.last {
+            return nil
+        }
+        return parsed.total
+    }
+
+    private static func revision(
+        from response: HTTPURLResponse,
+        modifiedAt: Date?,
+        byteSize: Int64?
+    ) -> ResourceRevision {
+        ResourceRevision.strongest(
+            etag: headerValue("ETag", in: response),
+            serverVersion: serverVersion(from: response),
+            modifiedAt: modifiedAt,
+            byteSize: byteSize
+        )
+    }
+
+    /// Different HTTP services use different names for an opaque version token.
+    /// All supported spellings feed the same strongest-evidence constructor; the
+    /// value itself is never interpreted or exposed in presentation models.
+    private static func serverVersion(from response: HTTPURLResponse) -> String? {
+        let fields = [
+            "X-Resource-Version",
+            "X-Server-Version",
+            "X-Version",
+            "Content-Version",
+            "Version"
+        ]
+        for field in fields {
+            if let value = headerValue(field, in: response),
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func typeIdentifier(
+        forMIMEType mimeType: String?,
+        descriptor: HTTPResourceDescriptor
+    ) -> String? {
+        if let mimeType, let type = UTType(mimeType: mimeType) {
+            return type.identifier
+        }
+        // A descriptor extension is only a fallback after a real HTTP metadata
+        // probe; unprobed items still carry nil typed metadata.
+        guard let type = UTType(filenameExtension: descriptor.url.pathExtension),
+              !descriptor.url.pathExtension.isEmpty else {
+            return nil
+        }
+        return type.identifier
     }
 
     /// 响应是否声明 `Accept-Ranges: bytes`。

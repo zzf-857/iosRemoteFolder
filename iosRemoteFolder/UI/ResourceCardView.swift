@@ -20,7 +20,7 @@ struct ResourceCardView: View {
             HStack(spacing: 6) {
                 Text(resource.kind.title)
                 Text("·")
-                Text(resource.sizeDescription)
+                Text(ResourceMetadataFormatter.size(for: resource.metadata))
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -40,4 +40,3 @@ private extension ResourceAccent {
         }
     }
 }
-

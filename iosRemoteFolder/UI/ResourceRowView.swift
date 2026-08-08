@@ -14,7 +14,7 @@ struct ResourceRowView: View {
                 Text(resource.name)
                     .font(.body.weight(.medium))
                     .lineLimit(1)
-                Text("\(resource.kind.title) · \(resource.modifiedDescription)")
+                Text("\(resource.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -26,4 +26,3 @@ struct ResourceRowView: View {
         .padding(.vertical, 6)
     }
 }
-

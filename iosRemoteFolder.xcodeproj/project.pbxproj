@@ -26,6 +26,7 @@
 		B00000000000000000000017 /* ResourceCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000017 /* ResourceCardView.swift */; };
 		B00000000000000000000018 /* ResourceRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000018 /* ResourceRowView.swift */; };
 		B00000000000000000000019 /* SourceRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000019 /* SourceRowView.swift */; };
+		B00000000000000000000026 /* ResourceMetadataFormatter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000026 /* ResourceMetadataFormatter.swift */; };
 		B00000000000000000000020 /* ResourceReference.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000020 /* ResourceReference.swift */; };
 		B00000000000000000000021 /* ResourceSourceState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000021 /* ResourceSourceState.swift */; };
 		B00000000000000000000022 /* LocalFilesSourceAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000022 /* LocalFilesSourceAdapter.swift */; };
@@ -75,6 +76,7 @@
 		C00000000000000000000023 /* HTTPSourceAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPSourceAdapter.swift; sourceTree = "<group>"; };
 		C00000000000000000000024 /* SourcesStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourcesStore.swift; sourceTree = "<group>"; };
 		C00000000000000000000025 /* ResourcePath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourcePath.swift; sourceTree = "<group>"; };
+		C00000000000000000000026 /* ResourceMetadataFormatter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceMetadataFormatter.swift; sourceTree = "<group>"; };
 		C00000000000000000000030 /* MockURLProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockURLProtocol.swift; sourceTree = "<group>"; };
 		C00000000000000000000031 /* ResourceReferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceReferenceTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000032 /* LocalFilesSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalFilesSourceAdapterTests.swift; sourceTree = "<group>"; };
@@ -142,7 +144,7 @@
 		A00000000000000000000014 /* Cache */ = {isa = PBXGroup; children = (C00000000000000000000012, ); path = Cache; sourceTree = "<group>"; };
 		A00000000000000000000015 /* Playback */ = {isa = PBXGroup; children = (C00000000000000000000013, ); path = Playback; sourceTree = "<group>"; };
 		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, ); path = Viewers; sourceTree = "<group>"; };
-		A00000000000000000000017 /* UI */ = {isa = PBXGroup; children = (C00000000000000000000016, C00000000000000000000017, C00000000000000000000018, C00000000000000000000019, ); path = UI; sourceTree = "<group>"; };
+		A00000000000000000000017 /* UI */ = {isa = PBXGroup; children = (C00000000000000000000016, C00000000000000000000017, C00000000000000000000018, C00000000000000000000019, C00000000000000000000026, ); path = UI; sourceTree = "<group>"; };
 		A00000000000000000000018 /* iosRemoteFolderTests */ = {
 			isa = PBXGroup;
 			children = (
@@ -276,6 +278,7 @@
 				B00000000000000000000023 /* HTTPSourceAdapter.swift in Sources */,
 				B00000000000000000000024 /* SourcesStore.swift in Sources */,
 				B00000000000000000000025 /* ResourcePath.swift in Sources */,
+				B00000000000000000000026 /* ResourceMetadataFormatter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

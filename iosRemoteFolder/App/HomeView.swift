@@ -78,7 +78,7 @@ private struct ContinueCard: View {
             Text(resource.name)
                 .font(.headline)
                 .lineLimit(2)
-            Text(resource.modifiedDescription)
+            Text(ResourceMetadataFormatter.modified(for: resource.metadata))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -125,4 +125,3 @@ private struct SectionTitle: View {
             .font(.title3.bold())
     }
 }
-

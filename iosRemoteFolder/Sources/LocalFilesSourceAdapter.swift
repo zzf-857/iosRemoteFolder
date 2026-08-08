@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// 本地文件来源 adapter：把设备上一个可访问的目录映射为资源来源。
 ///
@@ -65,11 +66,22 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
         let file = try validatedFile(for: item)
+        let type = typeInfo(for: file.url)
+        let byteSize = file.values.fileSize.map { Int64($0) }
+        let modifiedAt = file.values.contentModificationDate
         return ResourceMetadata(
-            byteSize: file.values.fileSize.map { Int64($0) },
-            contentType: contentType(for: file.url),
-            modifiedAt: file.values.contentModificationDate,
-            acceptsRanges: true
+            byteSize: byteSize,
+            modifiedAt: modifiedAt,
+            mimeType: type.mimeType,
+            typeIdentifier: type.identifier,
+            isDirectory: false,
+            acceptsRanges: true,
+            revision: ResourceRevision.strongest(
+                etag: nil,
+                serverVersion: nil,
+                modifiedAt: modifiedAt,
+                byteSize: byteSize
+            )
         )
     }
 
@@ -171,7 +183,11 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             throw ResourceSourceError.mapping(error)
         }
 
-        guard values.isDirectory == false else {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw ResourceSourceError.notFound
+        }
+        guard !isDirectory.boolValue, values.isDirectory != true else {
             throw ResourceSourceError.invalidReference
         }
         guard values.isRegularFile == true else {
@@ -190,7 +206,6 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
             throw ResourceSourceError.invalidReference
         }
-        guard item.kind != .folder else { throw ResourceSourceError.invalidReference }
         guard let path = ResourcePath(rawValue: item.path), !path.isRoot else {
             throw ResourceSourceError.invalidReference
         }
@@ -198,21 +213,30 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     private func makeItem(from url: URL, parentPath: ResourcePath) -> ResourceItem {
-        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey])
+        let values = try? url.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isReadableKey,
+            .contentModificationDateKey,
+            .fileSizeKey
+        ])
         let isDirectory = values?.isDirectory ?? false
         let kind = isDirectory ? .folder : kind(for: url)
         let name = url.lastPathComponent
         let childPath = parentPath.child(name) ?? parentPath
-        let capabilities: ResourceCapability = isDirectory
+        let metadata = makeMetadata(from: url, values: values, isDirectory: isDirectory)
+        var capabilities: ResourceCapability = metadata.isDirectory
             ? [.list]
-            : [.read, .rangeRead, .download]
+            : [.read, .download]
+        if metadata.acceptsRanges {
+            capabilities.insert(.rangeRead)
+        }
         return ResourceItem(
             sourceID: source.id,
             logicalPath: childPath,
             name: name,
             kind: kind,
-            sizeDescription: sizeDescription(values?.fileSize, isDirectory: isDirectory),
-            modifiedDescription: modifiedDescription(values?.contentModificationDate),
+            metadata: metadata,
             capabilities: capabilities,
             accent: .recommended(for: kind)
         )
@@ -230,31 +254,46 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         }
     }
 
-    private func contentType(for url: URL) -> String? {
-        switch kind(for: url) {
-        case .pdf: return "application/pdf"
-        case .markdown: return "text/markdown"
-        case .text: return "text/plain"
-        case .image: return "image/*"
-        case .video: return "video/*"
-        case .audio: return "audio/*"
-        default: return nil
+    private func makeMetadata(
+        from url: URL,
+        values: URLResourceValues?,
+        isDirectory: Bool
+    ) -> ResourceMetadata {
+        guard !isDirectory else {
+            return ResourceMetadata(
+                modifiedAt: values?.contentModificationDate,
+                isDirectory: true,
+                acceptsRanges: false,
+                revision: .unknown
+            )
         }
+
+        let byteSize = values?.fileSize.map { Int64($0) }
+        let modifiedAt = values?.contentModificationDate
+        let type = typeInfo(for: url)
+        let isReadable = values?.isReadable == true
+        let isRegularFile = values?.isRegularFile == true
+        return ResourceMetadata(
+            byteSize: byteSize,
+            modifiedAt: modifiedAt,
+            mimeType: type.mimeType,
+            typeIdentifier: type.identifier,
+            isDirectory: false,
+            acceptsRanges: isRegularFile && isReadable,
+            revision: ResourceRevision.strongest(
+                etag: nil,
+                serverVersion: nil,
+                modifiedAt: modifiedAt,
+                byteSize: byteSize
+            )
+        )
     }
 
-    private func sizeDescription(_ fileSize: Int?, isDirectory: Bool) -> String {
-        if isDirectory { return "文件夹" }
-        guard let fileSize else { return "未知大小" }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: Int64(fileSize))
-    }
-
-    private func modifiedDescription(_ date: Date?) -> String {
-        guard let date else { return "未知时间" }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.unitsStyle = .full
-        return formatter.localizedString(for: date, relativeTo: Date())
+    private func typeInfo(for url: URL) -> (mimeType: String?, identifier: String?) {
+        guard !url.pathExtension.isEmpty,
+              let type = UTType(filenameExtension: url.pathExtension) else {
+            return (nil, nil)
+        }
+        return (type.preferredMIMEType, type.identifier)
     }
 }
