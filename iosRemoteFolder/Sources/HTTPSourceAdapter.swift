@@ -240,9 +240,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 descriptor: descriptor,
                 headers: ["Range": "bytes=0-0"]
             )
-            var metadata = Self.partialGetMetadata(from: response, descriptor: descriptor)
-            // 与 connect() 共用同一证据规则：malformed 206 不声明也不缓存 Range 支持。
-            metadata.acceptsRanges = Self.verifiedRangeProbeEvidence(from: response)
+            let metadata = Self.partialGetMetadata(from: response, descriptor: descriptor)
+            // 与 connect() 共用同一证据规则：malformed 206 不声明、不缓存 Range
+            // 支持，也不把不可信的 Content-Range 总长度带入 metadata revision。
             verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
             return metadata
         }
@@ -532,7 +532,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     ) -> ResourceMetadata {
         let byteSize: Int64?
         if response.statusCode == 206 {
-            byteSize = contentRangeTotalLength(from: response)
+            // A probe response is trustworthy only when its 0-0 evidence and
+            // optional fragment length both pass the shared verifier.
+            byteSize = verifiedRangeProbeEvidence(from: response)
+                ? contentRangeTotalLength(from: response)
+                : nil
         } else if response.statusCode == 200, response.expectedContentLength >= 0 {
             byteSize = Int64(response.expectedContentLength)
         } else {
@@ -546,7 +550,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             mimeType: mimeType,
             typeIdentifier: typeIdentifier(forMIMEType: mimeType, descriptor: descriptor),
             isDirectory: false,
-            acceptsRanges: false,
+            acceptsRanges: verifiedRangeProbeEvidence(from: response),
             revision: revision(from: response, modifiedAt: modifiedAt, byteSize: byteSize)
         )
     }
@@ -619,10 +623,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     private static func serverVersion(from response: HTTPURLResponse) -> String? {
         let fields = [
             "X-Resource-Version",
-            "X-Server-Version",
-            "X-Version",
-            "Content-Version",
-            "Version"
+            "X-Object-Version",
+            "X-File-Version",
+            "X-Asset-Version",
+            "X-Revision",
+            "Content-Version"
         ]
         for field in fields {
             if let value = headerValue(field, in: response),
