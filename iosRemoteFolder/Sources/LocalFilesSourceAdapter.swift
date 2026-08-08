@@ -62,7 +62,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
-        let itemPath = try resourcePath(from: item)
+        let itemPath = try validatedResourcePath(for: item)
         let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ResourceSourceError.notFound
@@ -71,7 +71,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
-        let itemPath = try resourcePath(from: item)
+        let itemPath = try validatedResourcePath(for: item)
         let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         let attributes: [FileAttributeKey: Any]
         do {
@@ -90,7 +90,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        let itemPath = try resourcePath(from: item)
+        let itemPath = try validatedResourcePath(for: item)
         let url = try resolvedURL(forPath: itemPath, isDirectory: false)
         guard let range else {
             // 完整读取保持既有行为与错误映射。
@@ -164,9 +164,15 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         return resolvedCandidate
     }
 
-    /// 从 `ResourceItem.path` 解析规范化逻辑路径；`..` 或非法的逻辑路径直接报 `invalidReference`。
-    private func resourcePath(from item: ResourceItem) throws -> ResourcePath {
-        guard let path = ResourcePath(rawValue: item.path) else {
+    /// 校验 item 属于本来源、身份与规范化路径一致、可寻址且为可读文件（非目录）。
+    /// 任何不满足都映射为 `invalidReference`，杜绝跨来源读取与伪造身份。
+    private func validatedResourcePath(for item: ResourceItem) throws -> ResourcePath {
+        guard item.sourceID == source.id else { throw ResourceSourceError.invalidReference }
+        guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard item.kind != .folder else { throw ResourceSourceError.invalidReference }
+        guard let path = ResourcePath(rawValue: item.path), !path.isRoot else {
             throw ResourceSourceError.invalidReference
         }
         return path
@@ -182,11 +188,10 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             ? [.list]
             : [.read, .rangeRead, .download]
         return ResourceItem(
-            id: ResourceIdentity(sourceID: source.id, logicalPath: childPath.normalized),
+            sourceID: source.id,
+            logicalPath: childPath,
             name: name,
             kind: kind,
-            sourceID: source.id,
-            path: childPath.normalized,
             sizeDescription: sizeDescription(values?.fileSize, isDirectory: isDirectory),
             modifiedDescription: modifiedDescription(values?.contentModificationDate),
             capabilities: capabilities,

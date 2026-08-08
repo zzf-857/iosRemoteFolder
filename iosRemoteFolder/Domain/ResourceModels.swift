@@ -55,16 +55,13 @@ struct ResourceCapability: OptionSet, Hashable, Sendable {
 /// 不依赖展示名称、绝对文件 URL、请求 URL 或随机 UUID。
 /// 同一来源同一路径跨列举、导航与重启保持一致；用于 SwiftUI 导航、
 /// 缓存键与未来的索引/进度恢复。
+///
+/// 不变量：真实 `ResourceItem` 只能经由 `ResourceItem` 的单一构造入口派生，
+/// 不允许调用方分别传入互相矛盾的 `sourceID` 与 `logicalPath`，也不存在
+/// 可注入真实数据的共享占位。
 struct ResourceIdentity: Hashable, Sendable {
     let sourceID: UUID
     let logicalPath: String
-
-    /// 兼容占位：仅在未显式提供身份的构造（测试桩、旧假数据）中使用，
-    /// 不参与真实来源的稳定寻址。
-    static let placeholder = ResourceIdentity(
-        sourceID: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
-        logicalPath: ""
-    )
 }
 
 struct ResourceItem: Identifiable, Hashable, Sendable {
@@ -78,22 +75,25 @@ struct ResourceItem: Identifiable, Hashable, Sendable {
     let capabilities: ResourceCapability
     let accent: ResourceAccent
 
+    /// 单一构造入口：身份（`id`）与规范化路径（`path`）都由 `sourceID + logicalPath`
+    /// 确定性派生，调用方无法分别传入互相矛盾的 `id`、`sourceID` 与 `path`，
+    /// 也无法用共享占位污染真实数据。
     init(
-        id: ResourceIdentity = .placeholder,
+        sourceID: UUID,
+        logicalPath: ResourcePath,
         name: String,
         kind: ResourceKind,
-        sourceID: UUID,
-        path: String,
         sizeDescription: String,
         modifiedDescription: String,
         capabilities: ResourceCapability,
         accent: ResourceAccent
     ) {
-        self.id = id
+        self.sourceID = sourceID
+        let normalized = logicalPath.normalized
+        self.path = normalized
+        self.id = ResourceIdentity(sourceID: sourceID, logicalPath: normalized)
         self.name = name
         self.kind = kind
-        self.sourceID = sourceID
-        self.path = path
         self.sizeDescription = sizeDescription
         self.modifiedDescription = modifiedDescription
         self.capabilities = capabilities

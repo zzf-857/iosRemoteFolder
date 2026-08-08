@@ -88,9 +88,25 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             }
             map[normalized] = descriptor
         }
+        // 文件/虚拟目录同路径冲突：若某规范化路径是另一路径的严格前缀
+        // （例如同时配置 `/a` 与 `/a/b`），同一路径既要做文件又要做目录，
+        // 虚拟树无法一致，整体拒绝，避免 SwiftUI 看到同一身份的两个冲突节点。
+        var prefixConflict = false
+        let normalizedPaths = Array(map.keys)
+        for a in normalizedPaths {
+            guard let pa = ResourcePath(rawValue: a) else { continue }
+            for b in normalizedPaths where a != b {
+                guard let pb = ResourcePath(rawValue: b) else { continue }
+                if pa.isUnder(pb) || pb.isUnder(pa) {
+                    prefixConflict = true
+                    break
+                }
+            }
+            if prefixConflict { break }
+        }
         self.descriptors = descriptors
         self.pathToDescriptor = map
-        self.hasPathConflict = conflict
+        self.hasPathConflict = conflict || prefixConflict
         self.hasInvalidScheme = invalidScheme
 
         if let session {
@@ -132,27 +148,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     }
 
     func listResources() async throws -> [ResourceItem] {
-        // 兼容入口：返回已配置直链平铺列表，保持既有调用方与测试契约；
-        // 真实可浏览的虚拟目录树由 `listResources(at:)` 提供。
-        guard !hasInvalidScheme, !hasPathConflict else {
-            throw ResourceSourceError.invalidReference
-        }
-        for descriptor in descriptors {
-            _ = try validated(descriptor)
-        }
-        return descriptors.map { descriptor in
-            ResourceItem(
-                id: ResourceIdentity(sourceID: source.id, logicalPath: descriptor.path),
-                name: descriptor.name,
-                kind: descriptor.kind,
-                sourceID: source.id,
-                path: descriptor.path,
-                sizeDescription: "待探测",
-                modifiedDescription: "直链资源",
-                capabilities: [.read, .download, .directURL],
-                accent: .recommended(for: descriptor.kind)
-            )
-        }
+        // 兼容入口：严格转发到根目录，与 `listResources(at: .root)` 等价；
+        // 不再返回平铺全集，避免无参数入口与根目录语义分裂。
+        try await listResources(at: .root)
     }
 
     /// 在已配置直链上构建可浏览的虚拟目录树：进入任意目录只返回该层的直接子项
@@ -179,11 +177,10 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         }
         let folders = folderNames.map { (folderPath, folderName) in
             ResourceItem(
-                id: ResourceIdentity(sourceID: source.id, logicalPath: folderPath),
+                sourceID: source.id,
+                logicalPath: ResourcePath(rawValue: folderPath)!,
                 name: folderName,
                 kind: .folder,
-                sourceID: source.id,
-                path: folderPath,
                 sizeDescription: "文件夹",
                 modifiedDescription: "目录",
                 capabilities: [.list],
@@ -201,11 +198,10 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
 
     private func makeFileItem(_ descriptor: HTTPResourceDescriptor, path: ResourcePath) -> ResourceItem {
         ResourceItem(
-            id: ResourceIdentity(sourceID: source.id, logicalPath: path.normalized),
+            sourceID: source.id,
+            logicalPath: path,
             name: descriptor.name,
             kind: descriptor.kind,
-            sourceID: source.id,
-            path: path.normalized,
             sizeDescription: "待探测",
             modifiedDescription: "直链资源",
             capabilities: [.read, .download, .directURL],
@@ -282,6 +278,11 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
 
     private func descriptor(for item: ResourceItem) throws -> HTTPResourceDescriptor {
         guard item.sourceID == source.id else { throw ResourceSourceError.invalidReference }
+        // 身份一致性：item 的稳定身份必须与来源和规范化路径一致，
+        // 拒绝伪造身份或身份与路径矛盾的资源。
+        guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
+            throw ResourceSourceError.invalidReference
+        }
         guard !hasInvalidScheme, !hasPathConflict else { throw ResourceSourceError.invalidReference }
         // 用规范化逻辑路径精确寻址：重复路径在初始化阶段已成冲突并整体拒绝，
         // 不会像 `first(where:)` 那样静默选择某一项。

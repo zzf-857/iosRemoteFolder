@@ -181,7 +181,7 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
         guard !path.isRoot else { return all }
         // 按规范化路径过滤：直接子文件保留，深层资源合成必要的虚拟文件夹。
         var folderNames: [String: String] = [:]
-        var fileItems: [ResourceItem] = [:]
+        var fileItems: [String: ResourceItem] = [:]
         for item in all {
             guard let itemPath = ResourcePath(rawValue: item.path), itemPath.isUnder(path) else { continue }
             let remaining = itemPath.components.dropFirst(path.components.count)
@@ -195,11 +195,10 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
         }
         let folders = folderNames.map { (folderPath, folderName) in
             ResourceItem(
-                id: ResourceIdentity(sourceID: source.id, logicalPath: folderPath),
+                sourceID: source.id,
+                logicalPath: ResourcePath(rawValue: folderPath)!,
                 name: folderName,
                 kind: .folder,
-                sourceID: source.id,
-                path: folderPath,
                 sizeDescription: "文件夹",
                 modifiedDescription: "目录",
                 capabilities: [.list],
@@ -221,14 +220,5 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         throw ResourceSourceError.capabilityUnavailable
-    }
-}
-
-extension ResourceSourceAdapter {
-    /// 默认回退：未专门实现 `listResources(at:)` 的 adapter（例如测试桩只实现
-    /// 无参数 `listResources()`）沿用原有列举语义，避免协议迁移要求所有 conformer
-    /// 立即实现带路径列举。
-    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
-        try await listResources()
     }
 }

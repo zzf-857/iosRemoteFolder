@@ -173,6 +173,14 @@ final class SourcesStore {
         for sourceID in connectingIDs {
             transition(sourceID, to: .disconnected)
         }
+        // 被取消/替换的浏览任务必须结束 isLoading，避免过期任务无法覆盖新结果
+        // 却又让界面永久停留在加载中；同时清除可能已失效的错误状态。
+        for entry in entries {
+            update(entry.id) { e in
+                e.browse.isLoading = false
+                e.browse.error = nil
+            }
+        }
     }
 
     // MARK: - 浏览
@@ -185,6 +193,9 @@ final class SourcesStore {
         let generation = nextBrowseGeneration(for: sourceID)
         update(sourceID) { entry in
             entry.browse.currentPath = path
+            // 切换目录时立即清空旧 items，避免在新面包屑下继续展示旧目录内容；
+            // 失败状态也与目标目录一致（error 在结果返回时再写入）。
+            entry.browse.items = []
             entry.browse.isLoading = true
             entry.browse.error = nil
         }
@@ -220,8 +231,12 @@ final class SourcesStore {
     }
 
     /// 进入一个文件夹：文件夹的 `path` 即其完整规范化逻辑路径。
+    /// 拒绝来源不匹配或身份/路径矛盾的文件夹，避免越界下钻。
     func enter(_ sourceID: UUID, folder: ResourceItem) {
         guard folder.kind == .folder,
+              folder.sourceID == sourceID,
+              folder.id.sourceID == sourceID,
+              folder.id.logicalPath == folder.path,
               let path = ResourcePath(rawValue: folder.path) else { return }
         loadDirectory(sourceID, at: path)
     }
