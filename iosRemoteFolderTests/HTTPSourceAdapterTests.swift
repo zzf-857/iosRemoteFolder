@@ -19,6 +19,11 @@ struct HTTPSourceAdapterTests {
         #expect(items.allSatisfy { $0.capabilities.contains(.directURL) })
         #expect(items.allSatisfy { !$0.capabilities.contains(.rangeRead) })
         #expect(items.allSatisfy { $0.sourceID == adapter.source.id })
+        #expect(items.allSatisfy { !$0.metadata.isDirectory })
+        #expect(items.allSatisfy { $0.metadata.byteSize == nil })
+        #expect(items.allSatisfy { $0.metadata.modifiedAt == nil })
+        #expect(items.allSatisfy { $0.metadata.mimeType == nil })
+        #expect(items.allSatisfy { $0.metadata.revision.isUnknown })
     }
 
     @Test("无参数列举与根目录列举返回相同稳定身份")
@@ -56,10 +61,17 @@ struct HTTPSourceAdapterTests {
 
         #expect(rootItems.map(\.path) == ["/library"])
         #expect(library.kind == .folder)
+        #expect(library.metadata.isDirectory)
+        #expect(library.metadata.revision.isUnknown)
         #expect(library.capabilities == [.list])
         #expect(firstListing.map(\.path) == ["/library/images", "/library/manual.pdf"])
         #expect(firstListing.map(\.id) == secondListing.map(\.id))
-        #expect(cover.id == ResourceIdentity(sourceID: adapter.source.id, logicalPath: "/library/images/cover.jpg"))
+        #expect(
+            cover.id == ResourceIdentity(
+                sourceID: adapter.source.id,
+                logicalPath: ResourcePath(rawValue: "/library/images/cover.jpg")!
+            )
+        )
     }
 
     @Test("重复规范化路径与文件目录冲突均被拒绝")
@@ -141,7 +153,8 @@ struct HTTPSourceAdapterTests {
                     "Content-Length": "12345",
                     "Content-Type": "application/pdf",
                     "Accept-Ranges": "bytes",
-                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
+                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT",
+                    "ETag": "W/\"revision-7\""
                 ],
                 body: Data()
             )
@@ -151,9 +164,33 @@ struct HTTPSourceAdapterTests {
         let metadata = try await adapter.fetchMetadata(for: items[0])
         #expect(observedMethod.value == "HEAD")
         #expect(metadata.byteSize == 12345)
-        #expect(metadata.contentType == "application/pdf")
+        #expect(metadata.mimeType == "application/pdf")
+        #expect(metadata.typeIdentifier != nil)
+        #expect(!metadata.isDirectory)
         #expect(metadata.acceptsRanges)
         #expect(metadata.modifiedAt != nil)
+        #expect(metadata.revision == .etag("W/\"revision-7\""))
+    }
+
+    @Test("HTTP 服务端版本优先于修改时间与大小")
+    func serverVersionMetadata() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 200,
+                headers: [
+                    "Content-Length": "12345",
+                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT",
+                    "X-Resource-Version": "opaque-version-9"
+                ],
+                body: Data()
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let item = try #require(try await adapter.listResources().first)
+        let metadata = try await adapter.fetchMetadata(for: item)
+
+        #expect(metadata.revision == .serverVersion("opaque-version-9"))
     }
 
     @Test("HEAD 被拒绝时降级为 Range GET 探测")
@@ -168,7 +205,12 @@ struct HTTPSourceAdapterTests {
             }
             return .respond(
                 status: 206,
-                headers: ["Content-Range": "bytes 0-0/88", "Content-Length": "1"],
+                headers: [
+                    "Content-Range": "bytes 0-0/88",
+                    "Content-Length": "1",
+                    "Content-Type": "application/pdf",
+                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
+                ],
                 body: Data([0])
             )
         }
@@ -178,6 +220,13 @@ struct HTTPSourceAdapterTests {
         #expect(methods.value == ["HEAD", "GET"])
         #expect(metadata.acceptsRanges)
         #expect(metadata.byteSize == 88)
+        #expect(metadata.mimeType == "application/pdf")
+        guard case .modifiedAndSize(let modifiedAt, let byteSize) = metadata.revision else {
+            Issue.record("合法 206 探测应使用完整大小形成 metadata revision")
+            return
+        }
+        #expect(modifiedAt == metadata.modifiedAt)
+        #expect(byteSize == 88)
     }
 
     @Test("malformed 206 探测不声明 Range")
@@ -189,7 +238,11 @@ struct HTTPSourceAdapterTests {
             }
             return .respond(
                 status: 206,
-                headers: ["Content-Range": "bytes 1-1/88", "Content-Length": "1"],
+                headers: [
+                    "Content-Range": "bytes 1-1/88",
+                    "Content-Length": "1",
+                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
+                ],
                 body: Data([0])
             )
         }
@@ -199,6 +252,8 @@ struct HTTPSourceAdapterTests {
         let reference = try await adapter.reference(for: items[0])
 
         #expect(!metadata.acceptsRanges)
+        #expect(metadata.byteSize == nil)
+        #expect(metadata.revision.isUnknown)
         guard case .remoteHTTP(let value) = reference else {
             Issue.record("应为 HTTP 引用")
             return
@@ -510,8 +565,7 @@ struct HTTPSourceAdapterTests {
             logicalPath: ResourcePath(rawValue: path)!,
             name: URL(fileURLWithPath: path).lastPathComponent,
             kind: .pdf,
-            sizeDescription: "",
-            modifiedDescription: "",
+            metadata: ResourceMetadata(),
             capabilities: [.read],
             accent: .orange
         )

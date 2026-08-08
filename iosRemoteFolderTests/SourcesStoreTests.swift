@@ -246,8 +246,7 @@ struct SourcesStoreTests {
             logicalPath: ResourcePath(rawValue: path)!,
             name: URL(fileURLWithPath: path).lastPathComponent,
             kind: .text,
-            sizeDescription: "",
-            modifiedDescription: "",
+            metadata: ResourceMetadata(),
             capabilities: [.read],
             accent: .teal
         )

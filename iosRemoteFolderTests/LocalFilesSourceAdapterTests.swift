@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Testing
 
 @testable import iosRemoteFolder
@@ -100,12 +101,17 @@ final class LocalFilesSourceAdapterTests {
         let folder = try #require(items.first { $0.kind == .folder })
         #expect(folder.capabilities.contains(.list))
         #expect(!folder.capabilities.contains(.read))
+        #expect(folder.metadata.isDirectory)
+        #expect(folder.metadata.revision.isUnknown)
 
         let file = try #require(items.first { $0.name == "a-notes.md" })
         #expect(file.capabilities.contains(.read))
         #expect(file.capabilities.contains(.rangeRead))
-        #expect(file.sizeDescription.isEmpty == false)
-        #expect(file.modifiedDescription.isEmpty == false)
+        #expect(file.capabilities.contains(.download))
+        #expect(file.metadata.byteSize == Int64(Data("# 笔记".utf8).count))
+        #expect(file.metadata.modifiedAt != nil)
+        #expect(file.metadata.acceptsRanges)
+        #expect(file.metadata.revision.isKnown)
     }
 
     @Test("子目录列举返回完整路径和稳定身份")
@@ -124,7 +130,12 @@ final class LocalFilesSourceAdapterTests {
         #expect(folder.kind == .folder)
         #expect(file.path == "/资料/说明.txt")
         #expect(file.id == secondListing.first?.id)
-        #expect(file.id == ResourceIdentity(sourceID: sourceID, logicalPath: "/资料/说明.txt"))
+        #expect(
+            file.id == ResourceIdentity(
+                sourceID: sourceID,
+                logicalPath: ResourcePath(rawValue: "/资料/说明.txt")!
+            )
+        )
     }
 
     @Test("空目录列举返回空列表")
@@ -279,6 +290,13 @@ final class LocalFilesSourceAdapterTests {
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path) }
 
+        let listedItem = try #require(try await adapter.listResources().first { $0.name == "locked.txt" })
+        #expect(listedItem.kind == .unknown)
+        #expect(!listedItem.metadata.acceptsRanges)
+        #expect(!listedItem.capabilities.contains(.read))
+        #expect(!listedItem.capabilities.contains(.download))
+        #expect(!listedItem.capabilities.contains(.rangeRead))
+
         let item = makeItem(path: "/locked.txt")
         await #expect(throws: ResourceSourceError.permissionDenied) {
             _ = try await adapter.reference(for: item)
@@ -291,6 +309,25 @@ final class LocalFilesSourceAdapterTests {
         }
     }
 
+    @Test("非普通文件不声明读取、下载或区间能力")
+    func nonRegularFileDoesNotAdvertiseReadCapabilities() async throws {
+        let fifo = rootURL.appending(path: "stream.txt")
+        let result = fifo.path.withCString { path in
+            Darwin.mkfifo(path, mode_t(0o600))
+        }
+        #expect(result == 0)
+        guard result == 0 else { return }
+
+        let item = try #require(try await adapter.listResources().first { $0.name == "stream.txt" })
+        #expect(item.kind == .unknown)
+        #expect(!item.metadata.isDirectory)
+        #expect(!item.metadata.acceptsRanges)
+        #expect(item.metadata.revision.isUnknown)
+        #expect(!item.capabilities.contains(.read))
+        #expect(!item.capabilities.contains(.download))
+        #expect(!item.capabilities.contains(.rangeRead))
+    }
+
     @Test("元数据包含大小、修改时间并支持区间读取")
     func metadata() async throws {
         try Data("12345".utf8).write(to: rootURL.appending(path: "meta.txt"))
@@ -298,7 +335,16 @@ final class LocalFilesSourceAdapterTests {
         let metadata = try await adapter.fetchMetadata(for: item)
         #expect(metadata.byteSize == 5)
         #expect(metadata.modifiedAt != nil)
+        #expect(metadata.mimeType != nil)
+        #expect(metadata.typeIdentifier != nil)
+        #expect(!metadata.isDirectory)
         #expect(metadata.acceptsRanges)
+        guard case .modifiedAndSize(let modifiedAt, let byteSize) = metadata.revision else {
+            Issue.record("本地普通文件应以修改时间与大小形成 revision")
+            return
+        }
+        #expect(modifiedAt == metadata.modifiedAt)
+        #expect(byteSize == 5)
     }
 
     // MARK: - Helpers
@@ -313,8 +359,7 @@ final class LocalFilesSourceAdapterTests {
             logicalPath: ResourcePath(rawValue: path)!,
             name: URL(fileURLWithPath: path).lastPathComponent,
             kind: kind,
-            sizeDescription: "",
-            modifiedDescription: "",
+            metadata: ResourceMetadata(isDirectory: kind == .folder),
             capabilities: [.read],
             accent: .teal
         )

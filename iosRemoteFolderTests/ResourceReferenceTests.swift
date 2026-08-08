@@ -56,6 +56,177 @@ struct ResourceReferenceTests {
     }
 }
 
+@Suite("资源身份、版本与缓存键")
+struct ResourceIdentityRevisionTests {
+    private let sourceID = UUID(uuidString: "12345678-1234-1234-1234-123456789ABC")!
+
+    @Test("身份键使用 canonical UUID 且含多个分隔符的路径可逆")
+    func identityKeyRoundTrip() throws {
+        let path = try #require(ResourcePath(rawValue: "/资料/a|b|c.pdf"))
+        let identity = ResourceIdentity(sourceID: sourceID, logicalPath: path)
+
+        #expect(identity.identityKey == "v1|12345678-1234-1234-1234-123456789abc|/资料/a|b|c.pdf")
+        #expect(ResourceIdentity(identityKey: identity.identityKey) == identity)
+        #expect(ResourceIdentity.parse(identityKey: identity.identityKey) == identity)
+    }
+
+    @Test("身份键拒绝错误版本与非 canonical 输入")
+    func identityKeyRejectsInvalidRepresentations() {
+        #expect(ResourceIdentity(identityKey: "v2|12345678-1234-1234-1234-123456789abc|/a.pdf") == nil)
+        #expect(ResourceIdentity(identityKey: "v1|12345678-1234-1234-1234-123456789ABC|/a.pdf") == nil)
+        #expect(ResourceIdentity(identityKey: "v1|12345678-1234-1234-1234-123456789abc|//a.pdf") == nil)
+        #expect(ResourceIdentity(identityKey: "v1|12345678-1234-1234-1234-123456789abc|/../a.pdf") == nil)
+        #expect(ResourceIdentity(identityKey: "v1|12345678-1234-1234-1234-123456789abc") == nil)
+    }
+
+    @Test("revision 只按 ETag、服务端版本、修改时间与大小的顺序选择")
+    func strongestRevisionEvidence() {
+        let modifiedAt = Date(timeIntervalSince1970: 1_786_003_200)
+
+        #expect(
+            ResourceRevision.strongest(
+                etag: "W/\"opaque\"",
+                serverVersion: "server-2",
+                modifiedAt: modifiedAt,
+                byteSize: 42
+            ) == .etag("W/\"opaque\"")
+        )
+        #expect(
+            ResourceRevision.strongest(
+                etag: " \n ",
+                serverVersion: "server-2",
+                modifiedAt: modifiedAt,
+                byteSize: 42
+            ) == .serverVersion("server-2")
+        )
+        #expect(
+            ResourceRevision.strongest(
+                etag: nil,
+                serverVersion: " ",
+                modifiedAt: modifiedAt,
+                byteSize: 42
+            ) == .modifiedAndSize(modifiedAt: modifiedAt, byteSize: 42)
+        )
+        #expect(
+            ResourceRevision.strongest(
+                etag: nil,
+                serverVersion: nil,
+                modifiedAt: modifiedAt,
+                byteSize: -1
+            ).isUnknown
+        )
+    }
+
+    @Test("unknown revision 不能生成持久缓存键")
+    func unknownRevisionRejectedByCacheKey() throws {
+        let identity = ResourceIdentity(
+            sourceID: sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: "/manual.pdf"))
+        )
+
+        #expect(
+            ResourceCacheKey(
+                identity: identity,
+                revision: .unknown,
+                variant: .content
+            ) == nil
+        )
+        #expect(
+            ResourceCacheKey(
+                identity: identity,
+                revision: .etag(" \n "),
+                variant: .content
+            ) == nil
+        )
+    }
+
+    @Test("缓存键隔离内容版本、变体与字节区间")
+    func cacheKeyIsolation() async throws {
+        let identity = ResourceIdentity(
+            sourceID: sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: "/manual.pdf"))
+        )
+        let oldRevision = ResourceRevision.etag("\"old\"")
+        let newRevision = ResourceRevision.etag("\"new\"")
+        let firstRange = ResourceByteRange(lowerBound: 0, upperBound: 99)
+        let secondRange = ResourceByteRange(lowerBound: 100, upperBound: 199)
+        let contentKey = try #require(
+            ResourceCacheKey(identity: identity, revision: oldRevision, variant: .content)
+        )
+        let previewKey = try #require(
+            ResourceCacheKey(identity: identity, revision: oldRevision, variant: .preview)
+        )
+        let thumbnailKey = try #require(
+            ResourceCacheKey(identity: identity, revision: oldRevision, variant: .thumbnail)
+        )
+        let firstRangeKey = try #require(
+            ResourceCacheKey(identity: identity, revision: oldRevision, variant: .byteRange(firstRange))
+        )
+        let secondRangeKey = try #require(
+            ResourceCacheKey(identity: identity, revision: oldRevision, variant: .byteRange(secondRange))
+        )
+        let replacementKey = try #require(
+            ResourceCacheKey(identity: identity, revision: newRevision, variant: .content)
+        )
+
+        #expect(
+            Set([
+                contentKey,
+                previewKey,
+                thumbnailKey,
+                firstRangeKey,
+                secondRangeKey,
+                replacementKey,
+            ]).count == 6
+        )
+
+        let coordinator = CacheCoordinator()
+        await coordinator.setState(.offlineAvailable, for: contentKey)
+        #expect(await coordinator.state(for: contentKey) == .offlineAvailable)
+        #expect(await coordinator.state(for: replacementKey) == .online)
+        #expect(
+            !(await coordinator.setState(
+                .offlineAvailable,
+                for: identity,
+                revision: .unknown,
+                variant: .content
+            ))
+        )
+        #expect(
+            await coordinator.state(
+                for: identity,
+                revision: .unknown,
+                variant: .content
+            ) == nil
+        )
+    }
+}
+
+@Suite("资源元数据展示")
+struct ResourceMetadataFormatterTests {
+    @Test("目录与未知元数据使用明确 fallback")
+    func fallbacks() {
+        let folder = ResourceMetadata(isDirectory: true)
+        let unknown = ResourceMetadata()
+
+        #expect(ResourceMetadataFormatter.size(for: folder) == "文件夹")
+        #expect(ResourceMetadataFormatter.modified(for: folder) == "目录")
+        #expect(ResourceMetadataFormatter.size(for: unknown) == "大小未知")
+        #expect(ResourceMetadataFormatter.modified(for: unknown) == "时间未知")
+    }
+
+    @Test("有效 typed metadata 由系统 Locale 格式化")
+    func typedMetadataFormatting() {
+        let metadata = ResourceMetadata(
+            byteSize: 1_048_576,
+            modifiedAt: Date(timeIntervalSinceNow: -60)
+        )
+
+        #expect(!ResourceMetadataFormatter.size(for: metadata).isEmpty)
+        #expect(!ResourceMetadataFormatter.modified(for: metadata).isEmpty)
+    }
+}
+
 @Suite("来源错误映射")
 struct ResourceSourceErrorTests {
     @Test("URLError 映射到统一错误")
