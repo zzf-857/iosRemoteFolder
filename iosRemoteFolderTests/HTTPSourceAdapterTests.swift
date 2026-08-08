@@ -110,6 +110,32 @@ struct HTTPSourceAdapterTests {
         #expect(metadata.byteSize == 88)
     }
 
+    @Test("malformed 206 探测不声明 Range")
+    func malformedProbeDoesNotAdvertiseRange() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { request in
+            if request.httpMethod == "HEAD" {
+                return .respond(status: 405, headers: [:], body: Data())
+            }
+            return .respond(
+                status: 206,
+                headers: ["Content-Range": "bytes 1-1/88", "Content-Length": "1"],
+                body: Data([0])
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let items = try await adapter.listResources()
+        let metadata = try await adapter.fetchMetadata(for: items[0])
+        let reference = try await adapter.reference(for: items[0])
+
+        #expect(!metadata.acceptsRanges)
+        guard case .remoteHTTP(let value) = reference else {
+            Issue.record("应为 HTTP 引用")
+            return
+        }
+        #expect(!value.supportsRange)
+    }
+
     @Test("连接探测成功")
     func connectSucceeds() async throws {
         MockURLProtocol.reset()
@@ -118,6 +144,34 @@ struct HTTPSourceAdapterTests {
         }
         let adapter = makeAdapter(descriptors: [descriptor()])
         try await adapter.connect()
+    }
+
+    @Test("成功 HEAD 会清除陈旧的 Range 能力")
+    func headProbeClearsStaleRangeCapability() async throws {
+        MockURLProtocol.reset()
+        let requestCount = TestBox(0)
+        MockURLProtocol.register(Self.fileURL) { _ in
+            requestCount.value += 1
+            if requestCount.value == 1 {
+                return .respond(status: 200, headers: ["Accept-Ranges": "bytes"], body: Data())
+            }
+            return .respond(status: 200, headers: [:], body: Data())
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let items = try await adapter.listResources()
+
+        try await adapter.connect()
+        let firstReference = try await adapter.reference(for: items[0])
+        try await adapter.connect()
+        let secondReference = try await adapter.reference(for: items[0])
+
+        guard case .remoteHTTP(let first) = firstReference,
+              case .remoteHTTP(let second) = secondReference else {
+            Issue.record("应为 HTTP 引用")
+            return
+        }
+        #expect(first.supportsRange)
+        #expect(!second.supportsRange)
     }
 
     @Test("没有配置直链时连接不发起网络请求")
@@ -193,6 +247,23 @@ struct HTTPSourceAdapterTests {
             range: ResourceByteRange(lowerBound: 2, upperBound: 5)
         )
         #expect(String(decoding: data, as: UTF8.self) == "2345")
+    }
+
+    @Test("Range 200 回退在预算边界抛出超限")
+    func rangedReadFallbackHonorsBudgetBoundary() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(status: 200, headers: [:], body: Data([0, 1, 2, 3]))
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()], maxRangeFallbackBytes: 3)
+        let items = try await adapter.listResources()
+
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            _ = try await adapter.readData(
+                for: items[0],
+                range: ResourceByteRange(lowerBound: 3, upperBound: 3)
+            )
+        }
     }
 
     @Test("区间超出内容时截断到可用部分")
@@ -301,7 +372,8 @@ struct HTTPSourceAdapterTests {
 
     private func makeAdapter(
         descriptors: [HTTPResourceDescriptor],
-        timeout: TimeInterval = 5
+        timeout: TimeInterval = 5,
+        maxRangeFallbackBytes: Int64 = HTTPSourceAdapter.defaultMaxRangeFallbackBytes
     ) -> HTTPSourceAdapter {
         let source = ResourceSource(
             id: UUID(),
@@ -315,7 +387,8 @@ struct HTTPSourceAdapterTests {
             source: source,
             descriptors: descriptors,
             session: MockURLProtocol.makeSession(),
-            timeout: timeout
+            timeout: timeout,
+            maxRangeFallbackBytes: maxRangeFallbackBytes
         )
     }
 
