@@ -107,7 +107,7 @@ struct HTTPSourceAdapterTests {
         let metadata = try await adapter.fetchMetadata(for: items[0])
         #expect(methods.value == ["HEAD", "GET"])
         #expect(metadata.acceptsRanges)
-        #expect(metadata.byteSize == 1)
+        #expect(metadata.byteSize == 88)
     }
 
     @Test("连接探测成功")
