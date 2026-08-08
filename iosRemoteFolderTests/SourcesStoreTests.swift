@@ -12,6 +12,7 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
     private var released = false
     private var failure: ResourceSourceError?
     private var connectCount = 0
+    private var requestedListPaths: [ResourcePath] = []
 
     init(source: ResourceSource, items: [ResourceItem] = []) {
         self.source = source
@@ -22,6 +23,12 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         lock.lock()
         defer { lock.unlock() }
         return connectCount
+    }
+
+    var listPaths: [ResourcePath] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestedListPaths
     }
 
     func setFailure(_ error: ResourceSourceError?) {
@@ -49,7 +56,10 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         }
     }
 
-    func listResources() async throws -> [ResourceItem] { items }
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        recordListPath(path)
+        return items
+    }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
         throw ResourceSourceError.capabilityUnavailable
@@ -72,6 +82,12 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         return failure
     }
 
+    private func recordListPath(_ path: ResourcePath) {
+        lock.lock()
+        defer { lock.unlock() }
+        requestedListPaths.append(path)
+    }
+
     private var isReleasedSnapshot: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -81,10 +97,26 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
 
 @Suite("来源连接状态仓库") @MainActor
 struct SourcesStoreTests {
+    @Test("无参数列举由协议扩展单向转发根目录")
+    func noArgumentListingForwardsToRoot() async throws {
+        let source = makeSource()
+        let stub = StubSourceAdapter(source: source)
+
+        _ = try await stub.listResources()
+
+        #expect(stub.listPaths == [.root])
+    }
+
     @Test("连接成功进入就绪并回写资源数量")
     func connectSucceeds() async throws {
         let source = makeSource()
-        let stub = StubSourceAdapter(source: source, items: [sampleItem(source.id), sampleItem(source.id)])
+        let stub = StubSourceAdapter(
+            source: source,
+            items: [
+                sampleItem(source.id, path: "/first.txt"),
+                sampleItem(source.id, path: "/second.txt"),
+            ]
+        )
         let store = SourcesStore(sources: [source]) { _ in stub }
 
         store.connect(source.id)
@@ -94,6 +126,7 @@ struct SourcesStoreTests {
         try await waitUntil { store.entries.first?.state == .ready }
         #expect(store.entries.first?.source.status == .connected)
         #expect(store.entries.first?.source.itemCountDescription == "2 个资源")
+        #expect(stub.listPaths == [.root])
     }
 
     @Test("连接失败保留可行动错误")
@@ -207,12 +240,12 @@ struct SourcesStoreTests {
         )
     }
 
-    private func sampleItem(_ sourceID: UUID) -> ResourceItem {
+    private func sampleItem(_ sourceID: UUID, path: String = "/示例.txt") -> ResourceItem {
         ResourceItem(
-            name: "示例.txt",
-            kind: .text,
             sourceID: sourceID,
-            path: "/示例.txt",
+            logicalPath: ResourcePath(rawValue: path)!,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: .text,
             sizeDescription: "",
             modifiedDescription: "",
             capabilities: [.read],

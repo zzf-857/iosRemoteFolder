@@ -108,6 +108,25 @@ final class LocalFilesSourceAdapterTests {
         #expect(file.modifiedDescription.isEmpty == false)
     }
 
+    @Test("子目录列举返回完整路径和稳定身份")
+    func nestedListingUsesStableIdentity() async throws {
+        let folderURL = rootURL.appending(path: "资料")
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        try Data("正文".utf8).write(to: folderURL.appending(path: "说明.txt"))
+
+        let rootItems = try await adapter.listResources()
+        let folder = try #require(rootItems.first { $0.path == "/资料" })
+        let folderPath = try #require(ResourcePath(rawValue: folder.path))
+        let firstListing = try await adapter.listResources(at: folderPath)
+        let secondListing = try await adapter.listResources(at: folderPath)
+        let file = try #require(firstListing.first)
+
+        #expect(folder.kind == .folder)
+        #expect(file.path == "/资料/说明.txt")
+        #expect(file.id == secondListing.first?.id)
+        #expect(file.id == ResourceIdentity(sourceID: sourceID, logicalPath: "/资料/说明.txt"))
+    }
+
     @Test("空目录列举返回空列表")
     func listingEmptyDirectory() async throws {
         let items = try await adapter.listResources()
@@ -151,6 +170,41 @@ final class LocalFilesSourceAdapterTests {
         #expect(String(decoding: data, as: UTF8.self) == content)
     }
 
+    @Test("磁盘目录伪装成文件时三个入口都拒绝")
+    func disguisedDirectoryRejectedByAllFileEntrypoints() async throws {
+        try FileManager.default.createDirectory(
+            at: rootURL.appending(path: "伪装.txt"),
+            withIntermediateDirectories: true
+        )
+        let item = makeItem(path: "/伪装.txt", kind: .text)
+
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.reference(for: item)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.fetchMetadata(for: item)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.readData(for: item, range: nil)
+        }
+    }
+
+    @Test("跨来源文件被三个入口拒绝")
+    func foreignSourceRejectedByAllFileEntrypoints() async throws {
+        try Data("content".utf8).write(to: rootURL.appending(path: "foreign.txt"))
+        let item = makeItem(path: "/foreign.txt", sourceID: UUID())
+
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.reference(for: item)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.fetchMetadata(for: item)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.readData(for: item, range: nil)
+        }
+    }
+
     @Test("按区间读取返回分片")
     func rangedRead() async throws {
         try Data("0123456789".utf8).write(to: rootURL.appending(path: "digits.txt"))
@@ -173,29 +227,52 @@ final class LocalFilesSourceAdapterTests {
         #expect(String(decoding: data, as: UTF8.self) == "23")
     }
 
-    @Test("文件不存在时引用与读取都映射为 notFound")
+    @Test("文件不存在时三个入口都映射为 notFound")
     func missingFile() async {
         let item = makeItem(path: "/missing.txt")
         await #expect(throws: ResourceSourceError.notFound) {
             _ = try await adapter.reference(for: item)
         }
         await #expect(throws: ResourceSourceError.notFound) {
+            _ = try await adapter.fetchMetadata(for: item)
+        }
+        await #expect(throws: ResourceSourceError.notFound) {
             _ = try await adapter.readData(for: item, range: nil)
         }
     }
 
-    @Test("路径穿越被拒绝")
-    func pathTraversalRejected() async {
-        let traversal = makeItem(path: "/../escape.txt")
+    @Test("路径穿越在 ResourcePath 构造边界被拒绝")
+    func pathTraversalRejected() {
+        #expect(ResourcePath(rawValue: "/../escape.txt") == nil)
+        #expect(ResourcePath(rawValue: "/safe/../../escape.txt") == nil)
+    }
+
+    @Test("指向根目录外的符号链接被三个入口拒绝")
+    func externalSymlinkRejectedByAllFileEntrypoints() async throws {
+        let externalRoot = FileManager.default.temporaryDirectory
+            .appending(path: "LocalFilesExternal-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: externalRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: externalRoot) }
+        let externalFile = externalRoot.appending(path: "secret.txt")
+        try Data("secret".utf8).write(to: externalFile)
+        try FileManager.default.createSymbolicLink(
+            at: rootURL.appending(path: "outside.txt"),
+            withDestinationURL: externalFile
+        )
+        let item = makeItem(path: "/outside.txt")
+
         await #expect(throws: ResourceSourceError.invalidReference) {
-            _ = try await adapter.reference(for: traversal)
+            _ = try await adapter.reference(for: item)
         }
         await #expect(throws: ResourceSourceError.invalidReference) {
-            _ = try await adapter.readData(for: traversal, range: nil)
+            _ = try await adapter.fetchMetadata(for: item)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.readData(for: item, range: nil)
         }
     }
 
-    @Test("无权限文件读取映射为 permissionDenied")
+    @Test("无权限文件的三个入口映射为 permissionDenied")
     func unreadableFile() async throws {
         let locked = rootURL.appending(path: "locked.txt")
         try Data("secret".utf8).write(to: locked)
@@ -203,6 +280,12 @@ final class LocalFilesSourceAdapterTests {
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path) }
 
         let item = makeItem(path: "/locked.txt")
+        await #expect(throws: ResourceSourceError.permissionDenied) {
+            _ = try await adapter.reference(for: item)
+        }
+        await #expect(throws: ResourceSourceError.permissionDenied) {
+            _ = try await adapter.fetchMetadata(for: item)
+        }
         await #expect(throws: ResourceSourceError.permissionDenied) {
             _ = try await adapter.readData(for: item, range: nil)
         }
@@ -220,12 +303,16 @@ final class LocalFilesSourceAdapterTests {
 
     // MARK: - Helpers
 
-    private func makeItem(path: String) -> ResourceItem {
+    private func makeItem(
+        path: String,
+        kind: ResourceKind = .text,
+        sourceID itemSourceID: UUID? = nil
+    ) -> ResourceItem {
         ResourceItem(
+            sourceID: itemSourceID ?? sourceID,
+            logicalPath: ResourcePath(rawValue: path)!,
             name: URL(fileURLWithPath: path).lastPathComponent,
-            kind: .text,
-            sourceID: sourceID,
-            path: path,
+            kind: kind,
             sizeDescription: "",
             modifiedDescription: "",
             capabilities: [.read],

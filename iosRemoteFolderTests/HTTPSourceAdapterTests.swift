@@ -15,10 +15,71 @@ struct HTTPSourceAdapterTests {
             descriptor(path: "/b.jpg", name: "b.jpg", kind: .image)
         ])
         let items = try await adapter.listResources()
-        #expect(items.map(\.path) == ["/a.pdf", "/b.jpg"])
+        #expect(Set(items.map(\.path)) == Set(["/a.pdf", "/b.jpg"]))
         #expect(items.allSatisfy { $0.capabilities.contains(.directURL) })
         #expect(items.allSatisfy { !$0.capabilities.contains(.rangeRead) })
         #expect(items.allSatisfy { $0.sourceID == adapter.source.id })
+    }
+
+    @Test("无参数列举与根目录列举返回相同稳定身份")
+    func noArgumentListingMatchesRootIdentitySet() async throws {
+        MockURLProtocol.reset()
+        let adapter = makeAdapter(descriptors: [
+            descriptor(path: "/a.pdf"),
+            descriptor(path: "/b.jpg", name: "b.jpg", kind: .image),
+        ])
+
+        let noArgumentItems = try await adapter.listResources()
+        let rootItems = try await adapter.listResources(at: .root)
+
+        #expect(Set(noArgumentItems.map(\.id)) == Set(rootItems.map(\.id)))
+        #expect(Set(noArgumentItems.map(\.path)) == Set(["/a.pdf", "/b.jpg"]))
+    }
+
+    @Test("虚拟目录支持下钻并保持稳定身份")
+    func virtualDirectoriesSupportStableDrillDown() async throws {
+        MockURLProtocol.reset()
+        let adapter = makeAdapter(descriptors: [
+            descriptor(path: "/library/manual.pdf"),
+            descriptor(path: "/library/images/cover.jpg", name: "cover.jpg", kind: .image),
+        ])
+
+        let rootItems = try await adapter.listResources()
+        let library = try #require(rootItems.first)
+        let libraryPath = try #require(ResourcePath(rawValue: library.path))
+        let firstListing = try await adapter.listResources(at: libraryPath)
+        let secondListing = try await adapter.listResources(at: libraryPath)
+        let images = try #require(firstListing.first { $0.path == "/library/images" })
+        let imagesPath = try #require(ResourcePath(rawValue: images.path))
+        let imageItems = try await adapter.listResources(at: imagesPath)
+        let cover = try #require(imageItems.first)
+
+        #expect(rootItems.map(\.path) == ["/library"])
+        #expect(library.kind == .folder)
+        #expect(library.capabilities == [.list])
+        #expect(firstListing.map(\.path) == ["/library/images", "/library/manual.pdf"])
+        #expect(firstListing.map(\.id) == secondListing.map(\.id))
+        #expect(cover.id == ResourceIdentity(sourceID: adapter.source.id, logicalPath: "/library/images/cover.jpg"))
+    }
+
+    @Test("重复规范化路径与文件目录冲突均被拒绝")
+    func conflictingDescriptorPathsRejected() async throws {
+        MockURLProtocol.reset()
+        let duplicateAdapter = makeAdapter(descriptors: [
+            descriptor(path: "//files/./manual.pdf"),
+            descriptor(path: "/files/manual.pdf"),
+        ])
+        let prefixAdapter = makeAdapter(descriptors: [
+            descriptor(path: "/a", name: "a"),
+            descriptor(path: "/a/b.pdf", name: "b.pdf"),
+        ])
+
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await duplicateAdapter.listResources()
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await prefixAdapter.listResources()
+        }
     }
 
     @Test("引用携带 URL 与自定义请求头")
@@ -45,17 +106,26 @@ struct HTTPSourceAdapterTests {
             _ = try await adapter.reference(for: unknown)
         }
         await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.fetchMetadata(for: unknown)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
             _ = try await adapter.readData(for: unknown, range: nil)
         }
     }
 
-    @Test("跨来源资源映射为 invalidReference")
+    @Test("跨来源资源被三个文件入口拒绝")
     func foreignSourceRejected() async throws {
         MockURLProtocol.reset()
         let adapter = makeAdapter(descriptors: [descriptor()])
-        let foreign = makeItem(path: "/files/manual.pdf", sourceID: UUID())
+        let foreign = makeItem(path: "/manual.pdf", sourceID: UUID())
         await #expect(throws: ResourceSourceError.invalidReference) {
             _ = try await adapter.reference(for: foreign)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.fetchMetadata(for: foreign)
+        }
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.readData(for: foreign, range: nil)
         }
     }
 
@@ -144,6 +214,32 @@ struct HTTPSourceAdapterTests {
         }
         let adapter = makeAdapter(descriptors: [descriptor()])
         try await adapter.connect()
+    }
+
+    @Test("规范化路径复用连接探测的 Range 能力证据")
+    func canonicalPathReusesRangeCapabilityEvidence() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { request in
+            #expect(request.httpMethod == "HEAD")
+            return .respond(status: 200, headers: ["Accept-Ranges": "bytes"], body: Data())
+        }
+        let adapter = makeAdapter(descriptors: [
+            descriptor(path: "//files/./manual.pdf", url: Self.fileURL),
+        ])
+
+        #expect(adapter.descriptors.map(\.path) == ["/files/manual.pdf"])
+        try await adapter.connect()
+        let filesPath = try #require(ResourcePath(rawValue: "/files"))
+        let fileItems = try await adapter.listResources(at: filesPath)
+        let item = try #require(fileItems.first)
+        let reference = try await adapter.reference(for: item)
+
+        guard case .remoteHTTP(let value) = reference else {
+            Issue.record("应为 HTTP 引用")
+            return
+        }
+        #expect(item.path == "/files/manual.pdf")
+        #expect(value.supportsRange)
     }
 
     @Test("成功 HEAD 会清除陈旧的 Range 能力")
@@ -393,28 +489,27 @@ struct HTTPSourceAdapterTests {
     }
 
     private func descriptor(
-        path: String = "/files/manual.pdf",
+        path: String = "/manual.pdf",
         name: String = "manual.pdf",
         kind: ResourceKind = .pdf,
+        url: URL? = nil,
         headers: [String: String] = [:]
     ) -> HTTPResourceDescriptor {
         HTTPResourceDescriptor(
             path: path,
             name: name,
             kind: kind,
-            url: path == "/files/manual.pdf"
-                ? Self.fileURL
-                : URL(string: "http://resources.test\(path)")!,
+            url: url ?? Self.fileURL,
             headers: headers
         )
     }
 
     private func makeItem(path: String, sourceID: UUID) -> ResourceItem {
         ResourceItem(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: path)!,
             name: URL(fileURLWithPath: path).lastPathComponent,
             kind: .pdf,
-            sourceID: sourceID,
-            path: path,
             sizeDescription: "",
             modifiedDescription: "",
             capabilities: [.read],

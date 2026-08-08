@@ -13,15 +13,16 @@
 - 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
 - HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
 - Sources 页面连接中、失败、重试状态
-- 52 个 Swift Testing fixture 测试和托管测试 target
+- 61 个 Swift Testing fixture 测试和托管测试 target
 - PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口与假数据流程
 
 当前正在进行：
 
-- D-024 真实来源浏览垂直切片：规范化目录路径（`ResourcePath`）、稳定资源身份（`ResourceIdentity`）、`SourcesStore` 真实资源列表与 Browse 根目录/子目录下钻已首次实现（`ab572df`）。
-- D-024 首次实现经主程复核**未通过**：`ResourcePath.swift` 未加入 Xcode App target 导致工程不可编译，且存在目录入口语义分裂、HTTP 文件/虚拟目录同路径冲突、稳定身份可伪造、本地来源隔离不足、Browse 旧内容与取消 loading 不一致、缓存键仍为 UUID 等问题。
-- 本次提交为 D-024 阻塞修复：收口“规范化目录路径 + 稳定身份 + 来源隔离 + Browse 生命周期”契约，恢复工程可编译基线。**本次提交处于修复态，待 Codex 主程复核；未声称测试已全部通过，也未完成真实查看器。** 测试契约（含平铺列举旧行为与 `StubSourceAdapter` 缺 `listResources(at:)` 实现）由主程复核时调整。
+- D-024 真实来源浏览与稳定身份基线已经 Codex 主程验收。`ResourcePath`、`ResourceIdentity`、Local/HTTP 子目录列举、HTTP 虚拟目录冲突拒绝、来源隔离、Browse 生命周期和稳定缓存寻址均已落地。
+- `7ed2db7` 完成最终来源契约收口：`listResources(at:)` 是唯一必需列举入口，无参数入口只转发 `.root`；Local 三个文件入口共用真实可读普通文件校验；HTTP 身份、寻址与 Range 能力键共用 canonical path + URL。
+- 主程已迁移测试基线并补充 D-024 契约覆盖。iPhone 17 Pro / iOS 26.5 上 61/61 测试、generic iOS Simulator Debug 构建、工程列表、差异检查和普通 App 安装启动全部通过。
 - 来源读取契约（D-023）已由主程验收：`dbf31da` 实现、`32b04bb` 测试基线、`3dddb6e` 边界回归用例；HTTP 206、Range 探测、50MB 流式回退、取消语义和本地 symlink 防护在 D-024 阻塞修复中保持兼容，未削弱。
+- 下一阶段为 D-029：分离位置身份、内容 revision 与展示字符串，建立 typed metadata、可逆持久化身份键和 revision-aware cache key；尚未进入内容会话或真实查看器。
 
 尚未完成：
 
@@ -49,4 +50,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；来源读取契约已验收通过，真实目录浏览仍未完成。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；来源读取与真实目录浏览基线均已验收通过。
