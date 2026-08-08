@@ -13,13 +13,13 @@
 - 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
 - HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
 - Sources 页面连接中、失败、重试状态
-- 49 个 Swift Testing fixture 测试和托管测试 target
+- 52 个 Swift Testing fixture 测试和托管测试 target
 - PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口与假数据流程
 
 当前正在进行：
 
 - 实现 D-024 真实来源浏览垂直切片：规范化目录路径、稳定资源 ID、SourcesStore 真实资源列表和 Browse 根目录/子目录下钻
-- 来源读取契约已由主程验收通过：`dbf31da` 实现、`32b04bb` 测试基线；49/49 测试、Debug 构建和模拟器启动通过
+- 来源读取契约已由主程验收通过：`dbf31da` 实现、`32b04bb` 测试基线、`3dddb6e` 边界回归用例；52/52 测试、Debug 构建和模拟器启动通过
 
 尚未完成：
 
