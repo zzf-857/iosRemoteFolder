@@ -47,17 +47,29 @@ private struct HomeHeader: View {
 
 private struct ContinueSection: View {
     let resources: [ResourceItem]
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionTitle(title: "继续")
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 14) {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(spacing: 14) {
                     ForEach(resources) { resource in
                         NavigationLink(value: resource) {
-                            ContinueCard(resource: resource)
+                            ContinueCard(resource: resource, fillsWidth: true)
                         }
                         .buttonStyle(.plain)
+                    }
+                }
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 14) {
+                        ForEach(resources) { resource in
+                            NavigationLink(value: resource) {
+                                ContinueCard(resource: resource, fillsWidth: false)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
             }
@@ -67,6 +79,7 @@ private struct ContinueSection: View {
 
 private struct ContinueCard: View {
     let resource: ResourceItem
+    let fillsWidth: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -77,14 +90,22 @@ private struct ContinueCard: View {
                 .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
             Text(resource.name)
                 .font(.headline)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Text(ResourceMetadataFormatter.modified(for: resource.metadata))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(width: 172, alignment: .leading)
+        .frame(
+            minWidth: fillsWidth ? 0 : 180,
+            maxWidth: fillsWidth ? .infinity : 280,
+            alignment: .leading
+        )
+        .fixedSize(horizontal: false, vertical: true)
         .padding(18)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(Text("双击继续打开资源"))
     }
 }
 

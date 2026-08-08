@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ResourceCardView: View {
     let resource: ResourceItem
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -16,16 +17,40 @@ struct ResourceCardView: View {
             }
             Text(resource.name)
                 .font(.headline)
-                .lineLimit(2)
-            HStack(spacing: 6) {
-                Text(resource.kind.title)
-                Text("·")
-                Text(ResourceMetadataFormatter.size(for: resource.metadata))
+                .fixedSize(horizontal: false, vertical: true)
+            if dynamicTypeSize.isAccessibilitySize {
+                metadataStack
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    metadataLine
+                    metadataStack
+                }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(Text(resource.kind == .folder ? "双击进入文件夹" : "双击打开资源"))
+    }
+
+    private var metadataLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(resource.kind.title)
+            Text("·")
+            Text(ResourceMetadataFormatter.size(for: resource.metadata))
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var metadataStack: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(resource.kind.title)
+            Text(ResourceMetadataFormatter.size(for: resource.metadata))
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

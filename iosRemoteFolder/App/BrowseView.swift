@@ -97,38 +97,48 @@ private struct BrowseContentView: View {
     @ViewBuilder
     private var listing: some View {
         if selectedEntry == nil {
-            ContentUnavailableView(
-                "选择来源",
-                systemImage: "externaldrive",
-                description: Text("从上方选择一个来源开始浏览")
-            )
+            statusScroll {
+                ContentUnavailableView(
+                    "选择来源",
+                    systemImage: "externaldrive",
+                    description: Text("从上方选择一个来源开始浏览")
+                )
+            }
         } else if let entry = selectedEntry {
             switch entry.state {
             case .connecting:
-                ProgressView("正在连接…")
+                statusScroll {
+                    ProgressView("正在连接…")
+                }
             case .disconnected:
                 if !entry.hasAdapter {
-                    ContentUnavailableView(
-                        "适配器开发中",
-                        systemImage: "wrench",
-                        description: Text("该来源类型暂未接入")
-                    )
+                    statusScroll {
+                        ContentUnavailableView(
+                            "适配器开发中",
+                            systemImage: "wrench",
+                            description: Text("该来源类型暂未接入")
+                        )
+                    }
                 } else {
-                    ContentUnavailableView {
-                        Label("尚未连接", systemImage: "wifi.exclamationmark")
-                    } description: {
-                        Text("点击重试以连接此来源")
-                    } actions: {
-                        Button("重试") { store.connect(entry.id) }
+                    statusScroll {
+                        ContentUnavailableView {
+                            Label("尚未连接", systemImage: "wifi.exclamationmark")
+                        } description: {
+                            Text("点击重试以连接此来源")
+                        } actions: {
+                            Button("重试") { store.connect(entry.id) }
+                        }
                     }
                 }
             case .failed(let error):
-                ContentUnavailableView {
-                    Label("连接失败", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(error.localizedDescription)
-                } actions: {
-                    Button("重试") { store.retry(entry.id) }
+                statusScroll {
+                    ContentUnavailableView {
+                        Label("连接失败", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(error.localizedDescription)
+                    } actions: {
+                        Button("重试") { store.retry(entry.id) }
+                    }
                 }
             case .ready:
                 directoryListing(entry: entry)
@@ -142,19 +152,23 @@ private struct BrowseContentView: View {
         if browse.isLoading && browse.items.isEmpty {
             ProgressView("加载中…")
         } else if let error = browse.error {
-            ContentUnavailableView {
-                Label("加载失败", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text(error.localizedDescription)
-            } actions: {
-                Button("重试") { store.loadDirectory(entry.id, at: browse.currentPath) }
+            statusScroll {
+                ContentUnavailableView {
+                    Label("加载失败", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(error.localizedDescription)
+                } actions: {
+                    Button("重试") { store.loadDirectory(entry.id, at: browse.currentPath) }
+                }
             }
         } else if browse.isEmpty {
-            ContentUnavailableView(
-                "此文件夹为空",
-                systemImage: "folder",
-                description: Text("没有可显示的资源")
-            )
+            statusScroll {
+                ContentUnavailableView(
+                    "此文件夹为空",
+                    systemImage: "folder",
+                    description: Text("没有可显示的资源")
+                )
+            }
         } else {
             List {
                 breadcrumbSection(entry: entry, browse: browse)
@@ -162,6 +176,16 @@ private struct BrowseContentView: View {
                     row(for: item, entry: entry)
                 }
             }
+        }
+    }
+
+    private func statusScroll<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView {
+            content()
+                .frame(maxWidth: .infinity, minHeight: 180)
+                .padding()
         }
     }
 
@@ -206,18 +230,22 @@ private struct BrowseContentView: View {
                         Label("根目录", systemImage: "folder")
                     }
                     .buttonStyle(.borderless)
+                    .frame(minHeight: 44)
                     ForEach(Array(path.components.enumerated()), id: \.offset) { index, component in
                         let prefix = "/" + path.components.prefix(index + 1).joined(separator: "/")
                         Text("/")
                             .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
                         Button {
                             if let crumb = ResourcePath(rawValue: prefix) {
                                 store.loadDirectory(entry.id, at: crumb)
                             }
                         } label: {
                             Text(component)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .buttonStyle(.borderless)
+                        .frame(minHeight: 44)
                     }
                 }
                 .padding(.vertical, 4)
@@ -250,5 +278,8 @@ private struct SourceChip: View {
         .buttonStyle(.plain)
         .tint(AppTheme.accent)
         .opacity(hasAdapter ? 1 : 0.6)
+        .frame(minHeight: 44)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityValue(Text(hasAdapter ? (isSelected ? "已选中，可浏览" : "可浏览") : "适配器未接入"))
     }
 }

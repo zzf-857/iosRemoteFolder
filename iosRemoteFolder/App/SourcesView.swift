@@ -57,23 +57,27 @@ private struct SourceConnectionRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .frame(minHeight: 44, alignment: .leading)
             case .failed(let error):
                 VStack(alignment: .leading, spacing: 6) {
                     Text(error.localizedDescription)
                         .font(.caption)
                         .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                     Button(action: retry) {
                         Label("重试", systemImage: "arrow.clockwise")
                             .font(.caption)
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.mini)
                     .tint(AppTheme.accent)
+                    .frame(minHeight: 44)
                 }
             case .disconnected where !entry.hasAdapter:
                 Text("适配器开发中，即将支持")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 44, alignment: .leading)
             case .disconnected, .ready:
                 EmptyView()
             }
