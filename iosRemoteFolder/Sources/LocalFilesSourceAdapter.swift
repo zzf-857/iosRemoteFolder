@@ -3,7 +3,8 @@ import Foundation
 /// 本地文件来源 adapter：把设备上一个可访问的目录映射为资源来源。
 ///
 /// 该 adapter 只负责文件系统能力，不触碰网络。它会把 `ResourceItem.path`
-/// 安全地解析为磁盘上的真实 URL，并拒绝任何路径穿越。所有底层文件错误
+/// 安全地解析为磁盘上的真实 URL，并拒绝任何路径穿越。引用、元数据与读取
+/// 共用同一磁盘事实校验，只接受真实存在、可读的普通文件。所有底层文件错误
 /// 都映射为 `ResourceSourceError`。
 struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     let source: ResourceSource
@@ -33,10 +34,6 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         }
     }
 
-    func listResources() async throws -> [ResourceItem] {
-        try await listResources(at: .root)
-    }
-
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
         let baseURL = try resolvedURL(forPath: path, isDirectory: true)
         let urls: [URL]
@@ -62,45 +59,31 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
-        let itemPath = try validatedResourcePath(for: item)
-        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw ResourceSourceError.notFound
-        }
-        return .localFile(.init(fileURL: url, supportsRandomAccess: true))
+        let file = try validatedFile(for: item)
+        return .localFile(.init(fileURL: file.url, supportsRandomAccess: true))
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
-        let itemPath = try validatedResourcePath(for: item)
-        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        } catch {
-            throw ResourceSourceError.mapping(error)
-        }
-        let byteSize = (attributes[.size] as? NSNumber)?.int64Value
-        let modifiedAt = attributes[.modificationDate] as? Date
+        let file = try validatedFile(for: item)
         return ResourceMetadata(
-            byteSize: byteSize,
-            contentType: contentType(for: url),
-            modifiedAt: modifiedAt,
+            byteSize: file.values.fileSize.map { Int64($0) },
+            contentType: contentType(for: file.url),
+            modifiedAt: file.values.contentModificationDate,
             acceptsRanges: true
         )
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        let itemPath = try validatedResourcePath(for: item)
-        let url = try resolvedURL(forPath: itemPath, isDirectory: false)
+        let file = try validatedFile(for: item)
         guard let range else {
             // 完整读取保持既有行为与错误映射。
             do {
-                return try Data(contentsOf: url)
+                return try Data(contentsOf: file.url)
             } catch {
                 throw ResourceSourceError.mapping(error)
             }
         }
-        return try readRange(range, of: url)
+        return try readRange(range, of: file.url)
     }
 
     /// 区间读取：只 seek/read 请求的字节窗口，不把整个文件载入内存。
@@ -164,8 +147,44 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         return resolvedCandidate
     }
 
-    /// 校验 item 属于本来源、身份与规范化路径一致、可寻址且为可读文件（非目录）。
-    /// 任何不满足都映射为 `invalidReference`，杜绝跨来源读取与伪造身份。
+    /// 三个文件入口共用的验证结果；属性来自 symlink/root 边界解析后的真实 URL。
+    private struct ValidatedFile {
+        let url: URL
+        let values: URLResourceValues
+    }
+
+    /// 校验来源/身份/逻辑路径与 root/symlink 边界，再以磁盘事实确认候选存在、
+    /// 非目录、是普通文件且可读。缺失、无权限等底层错误保持统一映射。
+    private func validatedFile(for item: ResourceItem) throws -> ValidatedFile {
+        let path = try validatedResourcePath(for: item)
+        let url = try resolvedURL(forPath: path, isDirectory: false)
+        let values: URLResourceValues
+        do {
+            values = try url.resourceValues(forKeys: [
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .isReadableKey,
+                .fileSizeKey,
+                .contentModificationDateKey,
+            ])
+        } catch {
+            throw ResourceSourceError.mapping(error)
+        }
+
+        guard values.isDirectory == false else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard values.isRegularFile == true else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard values.isReadable == true else {
+            throw ResourceSourceError.permissionDenied
+        }
+        return ValidatedFile(url: url, values: values)
+    }
+
+    /// 校验 item 属于本来源、身份与规范化路径一致且声明为文件。
+    /// 磁盘文件类型与可读性由 `validatedFile(for:)` 独立确认，不能信任展示 kind。
     private func validatedResourcePath(for item: ResourceItem) throws -> ResourcePath {
         guard item.sourceID == source.id else { throw ResourceSourceError.invalidReference }
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {

@@ -13,11 +13,7 @@ protocol ResourceSourceAdapter: Sendable {
     /// 探测并建立连接。失败时抛出可行动的 `ResourceSourceError`。
     func connect() async throws
 
-    /// 列举当前可见资源：本地来源为顶层目录内容，HTTP 来源为已配置直链。
-    /// 兼容入口：默认转发到根目录，保证既有调用方与测试 target 不因协议迁移失去编译入口。
-    func listResources() async throws -> [ResourceItem]
-
-    /// 列举指定逻辑目录下的直接子项（文件夹与文件）。
+    /// 列举指定逻辑目录下的直接子项（文件夹与文件），这是唯一必需的列举语义。
     /// 本地来源解析真实子目录，HTTP 来源在已配置直链上构建虚拟目录树；
     /// 规范化后的逻辑路径必须唯一，重复路径须明确报 `invalidReference`，
     /// 不能由 `first(where:)` 静默选择。
@@ -32,6 +28,13 @@ protocol ResourceSourceAdapter: Sendable {
     /// 读取资源数据；`range` 为 nil 表示完整读取。
     /// 不支持区间读取的来源必须显式降级或抛出 `capabilityUnavailable`。
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data
+}
+
+extension ResourceSourceAdapter {
+    /// 根目录兼容入口；严格且只向唯一必需的带路径入口转发。
+    func listResources() async throws -> [ResourceItem] {
+        try await listResources(at: .root)
+    }
 }
 
 /// 资源元数据：来自本地文件属性或 HTTP HEAD 探测。
@@ -169,10 +172,6 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
         guard source.status != .needsAttention else {
             throw ResourceSourceError.authenticationRequired
         }
-    }
-
-    func listResources() async throws -> [ResourceItem] {
-        try await listResources(at: .root)
     }
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
