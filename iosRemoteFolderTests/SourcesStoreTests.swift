@@ -117,7 +117,7 @@ struct SourcesStoreTests {
                 sampleItem(source.id, path: "/second.txt"),
             ]
         )
-        let store = SourcesStore(sources: [source]) { _ in stub }
+        let store = try makeStore(sources: [source], adapters: [stub])
 
         store.connect(source.id)
         #expect(store.entries.first?.state == .connecting)
@@ -134,7 +134,7 @@ struct SourcesStoreTests {
         let source = makeSource()
         let stub = StubSourceAdapter(source: source)
         stub.setFailure(.networkUnavailable)
-        let store = SourcesStore(sources: [source]) { _ in stub }
+        let store = try makeStore(sources: [source], adapters: [stub])
 
         store.connect(source.id)
         stub.release()
@@ -147,7 +147,7 @@ struct SourcesStoreTests {
         let source = makeSource()
         let stub = StubSourceAdapter(source: source, items: [sampleItem(source.id)])
         stub.setFailure(.timedOut)
-        let store = SourcesStore(sources: [source]) { _ in stub }
+        let store = try makeStore(sources: [source], adapters: [stub])
 
         store.connect(source.id)
         stub.release()
@@ -161,9 +161,9 @@ struct SourcesStoreTests {
     }
 
     @Test("没有适配器的来源保持未连接")
-    func sourceWithoutAdapterStaysDisconnected() async {
+    func sourceWithoutAdapterStaysDisconnected() async throws {
         let source = makeSource(kind: .alist)
-        let store = SourcesStore(sources: [source]) { _ in nil }
+        let store = try makeStore(sources: [source], adapters: [])
         store.connectAll()
         #expect(store.entries.first?.state == .disconnected)
         #expect(store.entries.first?.hasAdapter == false)
@@ -176,13 +176,10 @@ struct SourcesStoreTests {
         let sourceC = makeSource(kind: .webdav)
         let stubA = StubSourceAdapter(source: sourceA)
         let stubB = StubSourceAdapter(source: sourceB)
-        let store = SourcesStore(sources: [sourceA, sourceB, sourceC]) { source in
-            switch source.id {
-            case sourceA.id: return stubA
-            case sourceB.id: return stubB
-            default: return nil
-            }
-        }
+        let store = try makeStore(
+            sources: [sourceA, sourceB, sourceC],
+            adapters: [stubA, stubB]
+        )
 
         store.connectAll()
         #expect(entry(of: sourceA, in: store)?.state == .connecting)
@@ -201,7 +198,7 @@ struct SourcesStoreTests {
     func connectAllSkipsReady() async throws {
         let source = makeSource()
         let stub = StubSourceAdapter(source: source)
-        let store = SourcesStore(sources: [source]) { _ in stub }
+        let store = try makeStore(sources: [source], adapters: [stub])
 
         store.connectAll()
         stub.release()
@@ -216,7 +213,7 @@ struct SourcesStoreTests {
     func duplicateConnectReplacesTask() async throws {
         let source = makeSource()
         let stub = StubSourceAdapter(source: source, items: [sampleItem(source.id)])
-        let store = SourcesStore(sources: [source]) { _ in stub }
+        let store = try makeStore(sources: [source], adapters: [stub])
 
         store.connect(source.id)
         store.connect(source.id)
@@ -228,6 +225,14 @@ struct SourcesStoreTests {
     }
 
     // MARK: - Helpers
+
+    private func makeStore(
+        sources: [ResourceSource],
+        adapters: [any ResourceSourceAdapter]
+    ) throws -> SourcesStore {
+        let registry = try SourceRegistry(sources: sources, adapters: adapters)
+        return SourcesStore(registry: registry)
+    }
 
     private func makeSource(kind: ResourceSource.SourceKind = .local) -> ResourceSource {
         ResourceSource(
@@ -266,4 +271,299 @@ func waitUntil(timeout: Duration = .seconds(3), _ condition: @MainActor () -> Bo
         try await Task.sleep(for: .milliseconds(10))
     }
     Issue.record("等待条件超时")
+}
+
+/// 内容会话专用桩：可观察 metadata/read 次数，并可在读取前挂起以验证取消。
+private final class ContentStubAdapter: ResourceSourceAdapter, @unchecked Sendable {
+    let source: ResourceSource
+    let metadata: ResourceMetadata
+    let content: Data
+    let delay: Duration?
+    let rangeResponse: Data?
+
+    private let lock = NSLock()
+    private var metadataCallCount = 0
+    private var readCallCount = 0
+
+    init(
+        source: ResourceSource,
+        metadata: ResourceMetadata,
+        content: Data,
+        delay: Duration? = nil,
+        rangeResponse: Data? = nil
+    ) {
+        self.source = source
+        self.metadata = metadata
+        self.content = content
+        self.delay = delay
+        self.rangeResponse = rangeResponse
+    }
+
+    var metadataCalls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return metadataCallCount
+    }
+
+    var readCalls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return readCallCount
+    }
+
+    func connect() async throws {}
+
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        []
+    }
+
+    func reference(for item: ResourceItem) async throws -> ResourceReference {
+        throw ResourceSourceError.capabilityUnavailable
+    }
+
+    func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
+        incrementMetadataCalls()
+        return metadata
+    }
+
+    func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
+        incrementReadCalls()
+        if let delay {
+            try await Task.sleep(for: delay)
+        }
+        try Task.checkCancellation()
+        guard let range else { return content }
+        if let rangeResponse { return rangeResponse }
+        guard range.lowerBound < Int64(content.count) else { return Data() }
+        let upperBound = min(range.upperBound, Int64(content.count - 1))
+        let lowerIndex = Int(range.lowerBound)
+        let upperIndex = Int(upperBound) + 1
+        return content.subdata(
+            in: lowerIndex..<upperIndex
+        )
+    }
+
+    private func incrementMetadataCalls() {
+        lock.lock()
+        metadataCallCount += 1
+        lock.unlock()
+    }
+
+    private func incrementReadCalls() {
+        lock.lock()
+        readCallCount += 1
+        lock.unlock()
+    }
+}
+
+@Suite("统一来源注册与内容会话")
+struct ResourceAccessServiceTests {
+    @Test("registry 拒绝重复来源、未注册 adapter 和重复 adapter")
+    func registryRejectsDuplicateConfiguration() {
+        let source = makeSource()
+        let otherSource = makeSource()
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(),
+            content: Data()
+        )
+
+        #expect(throws: SourceRegistryError.duplicateSourceID(source.id)) {
+            _ = try SourceRegistry(sources: [source, source], adapters: [])
+        }
+        #expect(throws: SourceRegistryError.adapterSourceNotRegistered(otherSource.id)) {
+            _ = try SourceRegistry(sources: [source], adapters: [
+                ContentStubAdapter(
+                    source: otherSource,
+                    metadata: ResourceMetadata(),
+                    content: Data()
+                )
+            ])
+        }
+        #expect(throws: SourceRegistryError.duplicateAdapterSourceID(source.id)) {
+            _ = try SourceRegistry(sources: [source], adapters: [adapter, adapter])
+        }
+    }
+
+    @Test("完整读取先取最新 metadata，并拒绝未知或超预算大小")
+    func fullReadRequiresKnownBudget() async throws {
+        let source = makeSource()
+        let content = Data("hello".utf8)
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: Int64(content.count)),
+            content: content
+        )
+        let session = try await makeService(source: source, adapter: adapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+
+        let result = try await session.readData(maximumBytes: 5)
+        #expect(result == content)
+        #expect(adapter.metadataCalls == 2)
+        #expect(adapter.readCalls == 1)
+
+        let tooSmall = try await makeService(
+            source: source,
+            adapter: ContentStubAdapter(
+                source: source,
+                metadata: ResourceMetadata(byteSize: Int64(content.count)),
+                content: content
+            )
+        ).makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            _ = try await tooSmall.readData(maximumBytes: 4)
+        }
+
+        let unknownAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(),
+            content: content
+        )
+        let unknown = try await makeService(source: source, adapter: unknownAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            _ = try await unknown.readData(maximumBytes: 5)
+        }
+        #expect(unknownAdapter.readCalls == 0)
+    }
+
+    @Test("区间读取同时校验 capability、metadata Range 和请求预算")
+    func rangeReadChecksCapabilitiesAndBudget() async throws {
+        let source = makeSource()
+        let content = Data("0123456789".utf8)
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: true
+            ),
+            content: content
+        )
+        let service = try makeService(source: source, adapter: adapter)
+        let noRange = try await service.makeSession(
+            for: makeItem(sourceID: source.id, capabilities: [.read])
+        )
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            _ = try await noRange.readData(
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1),
+                maximumBytes: 2
+            )
+        }
+        #expect(adapter.readCalls == 0)
+
+        let tooLarge = try await service.makeSession(
+            for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead])
+        )
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            _ = try await tooLarge.readData(
+                range: ResourceByteRange(lowerBound: 0, upperBound: 2),
+                maximumBytes: 2
+            )
+        }
+
+        let noMetadataRangeAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: false
+            ),
+            content: content
+        )
+        let noMetadataRange = try await makeService(
+            source: source,
+            adapter: noMetadataRangeAdapter
+        ).makeSession(for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead]))
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            _ = try await noMetadataRange.readData(
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1),
+                maximumBytes: 2
+            )
+        }
+        #expect(noMetadataRangeAdapter.readCalls == 0)
+    }
+
+    @Test("违约响应不交付，并且 close/cancel 是幂等终态")
+    func responseValidationAndTerminalCancellation() async throws {
+        let source = makeSource()
+        let content = Data("0123456789".utf8)
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: true
+            ),
+            content: content,
+            rangeResponse: Data("overflow".utf8)
+        )
+        let session = try await makeService(source: source, adapter: adapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead]))
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await session.readData(
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1),
+                maximumBytes: 20
+            )
+        }
+
+        await session.cancel()
+        await session.close()
+        await session.cancel()
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await session.fetchMetadata()
+        }
+    }
+
+    @Test("调用方取消会取消对应在途操作")
+    func callerCancellationCancelsOperation() async throws {
+        let source = makeSource()
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: 5),
+            content: Data("hello".utf8),
+            delay: .seconds(10)
+        )
+        let session = try await makeService(source: source, adapter: adapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        let task = Task {
+            try await session.readData(maximumBytes: 5)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await task.value
+        }
+    }
+
+    private func makeService(
+        source: ResourceSource,
+        adapter: any ResourceSourceAdapter
+    ) throws -> ResourceAccessService {
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+        return ResourceAccessService(registry: registry)
+    }
+
+    private func makeSource() -> ResourceSource {
+        ResourceSource(
+            id: UUID(),
+            name: "会话测试来源",
+            kind: .local,
+            endpoint: "test://content",
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+    }
+
+    private func makeItem(
+        sourceID: UUID,
+        capabilities: ResourceCapability
+    ) -> ResourceItem {
+        ResourceItem(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: "/content.txt")!,
+            name: "content.txt",
+            kind: .text,
+            metadata: ResourceMetadata(),
+            capabilities: capabilities,
+            accent: .blue
+        )
+    }
 }

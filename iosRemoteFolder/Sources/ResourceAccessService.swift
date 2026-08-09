@@ -24,15 +24,19 @@ final class ResourceAccessService: Sendable {
             throw ResourceSourceError.capabilityUnavailable
         }
 
-        let latestMetadata = try await registry.fetchMetadata(
-            sourceID: item.sourceID,
-            for: item
-        )
-        guard !latestMetadata.isDirectory else {
-            throw ResourceSourceError.capabilityUnavailable
+        let session = ResourceContentSession(registry: registry, item: item)
+        do {
+            let latestMetadata = try await session.fetchMetadata()
+            guard !latestMetadata.isDirectory else {
+                throw ResourceSourceError.capabilityUnavailable
+            }
+            return session
+        } catch {
+            // A failed creation probe must not leave an unowned operation or
+            // a usable session behind; close is idempotent for all failures.
+            await session.close()
+            throw error
         }
-
-        return ResourceContentSession(registry: registry, item: item)
     }
 
     private static func isCanonicalResource(_ item: ResourceItem) -> Bool {
