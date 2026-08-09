@@ -19,11 +19,11 @@
 - D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
 - D-028B 已通过主程复核：`ResourceViewerHost` 先经 `ResourceAccessService` 创建会话并获取最新 typed metadata，再进入占位 Viewer；加载、失败、取消和重试状态均有结构化生命周期
 - D-030A 已通过 Codex 主程复核：Local adapter 增加 bookmark 位置值、stale/失效重新授权错误、平衡 security-scoped lease 和 `NSFileCoordinator` 协调访问
-- D-030B 已实现待主程复核：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
+- D-030B 已实现，主程构建/测试基线复核通过，真实 Files Provider 生命周期待验证：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
 
 当前阶段：
 
-- D-030B Files 来源配置生命周期已实现，等待 Codex 主程复核；本轮不进入 D-032 的 SwiftData/Keychain 迁移，也不把当前占位 Viewer 误认为已完成内容解码。
+- D-030B Files 来源配置生命周期已实现，主程构建/75 项测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；本轮不进入 D-032 的 SwiftData/Keychain 迁移，也不把当前占位 Viewer 误认为已完成内容解码。
 
 尚未完成：
 
@@ -52,4 +52,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A、D-028B 会话状态门和 D-030A 均已完成主程复核，D-030B Files 配置生命周期已实现待复核，真实内容解码仍待后续工作单。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A、D-028B 会话状态门和 D-030A 均已完成主程复核，D-030B Files 配置生命周期已实现且主程基线通过，真实 Files Provider 生命周期与内容解码仍待后续工作单。
