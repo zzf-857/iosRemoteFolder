@@ -21,6 +21,11 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
             throw ResourceSourceError.invalidReference
         }
 
+        guard url.startAccessingSecurityScopedResource() else {
+            throw ResourceSourceError.permissionDenied
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             throw ResourceSourceError.notFound
@@ -34,7 +39,7 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
 
         do {
             self.bookmarkData = try url.bookmarkData(
-                options: [],
+                options: .minimalBookmark,
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
@@ -59,7 +64,7 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
         do {
             resolvedURL = try URL(
                 resolvingBookmarkData: bookmarkData,
-                options: [],
+                options: .withoutImplicitStartAccessing,
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             )
