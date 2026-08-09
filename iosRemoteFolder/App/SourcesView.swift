@@ -121,6 +121,7 @@ struct SourcesView: View {
             }
             reauthorizationSourceID = nil
         case .failure(let error):
+            reauthorizationSourceID = nil
             guard !Self.isUserCancellation(error) else { return }
             appModel.sourceActionError = ResourceSourceError.mapping(error).localizedDescription
         }

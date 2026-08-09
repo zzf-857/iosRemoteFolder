@@ -139,6 +139,7 @@ final class AppModel {
     // MARK: - Composition-root mutations
 
     private func performAddLocalSource(directoryURL: URL) async {
+        sourceActionError = nil
         do {
             try Task.checkCancellation()
             let location = try LocalSourceLocation(directoryURL: directoryURL)
@@ -161,7 +162,7 @@ final class AppModel {
                 // mutation, so this critical section cannot leave split ownership.
                 try await registry.register(source: source, adapter: adapter)
             } catch {
-                try? configurationStore.remove(sourceID: source.id)
+                _ = try? configurationStore.remove(sourceID: source.id)
                 throw error
             }
             await synchronizeStore()
@@ -173,6 +174,7 @@ final class AppModel {
     }
 
     private func performReauthorize(sourceID: UUID, directoryURL: URL) async {
+        sourceActionError = nil
         do {
             try Task.checkCancellation()
             guard let oldConfiguration = configurationStore.configuration(for: sourceID) else {
@@ -194,7 +196,7 @@ final class AppModel {
                 // do not stop between them after the new bookmark is persisted.
                 try await registry.replace(source: source, adapter: adapter)
             } catch {
-                try? configurationStore.replace(oldConfiguration)
+                _ = try? configurationStore.replace(oldConfiguration)
                 throw error
             }
             await synchronizeStore()
@@ -206,6 +208,7 @@ final class AppModel {
     }
 
     private func performRemove(sourceID: UUID) async {
+        sourceActionError = nil
         do {
             try Task.checkCancellation()
             let removedConfiguration = try configurationStore.remove(sourceID: sourceID)
@@ -216,7 +219,7 @@ final class AppModel {
             } catch {
                 // Persisted configuration is restored if registry mutation is
                 // rejected, keeping the two ownership boundaries consistent.
-                try? configurationStore.insert(removedConfiguration)
+                _ = try? configurationStore.insert(removedConfiguration)
                 throw error
             }
             await synchronizeStore()
