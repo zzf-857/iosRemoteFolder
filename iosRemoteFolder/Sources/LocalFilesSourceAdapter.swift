@@ -3,173 +3,275 @@ import UniformTypeIdentifiers
 
 /// 本地文件来源 adapter：把设备上一个可访问的目录映射为资源来源。
 ///
-/// 该 adapter 只负责文件系统能力，不触碰网络。它会把 `ResourceItem.path`
-/// 安全地解析为磁盘上的真实 URL，并拒绝任何路径穿越。引用、元数据与读取
-/// 共用同一磁盘事实校验，只接受真实存在、可读的普通文件。所有底层文件错误
-/// 都映射为 `ResourceSourceError`。
+/// adapter 内部区分沙盒 demo 根和 security-scoped bookmark 根。每次操作都在
+/// 同一 root lease 内解析路径、协调文件访问并完成磁盘事实校验；bookmark、
+/// lease 和绝对 URL 不会越过 Sources 边界。引用、元数据与读取共用同一验证入口。
 struct LocalFilesSourceAdapter: ResourceSourceAdapter {
     let source: ResourceSource
-    /// 来源根目录；所有列举与读取都被约束在这个目录内。
-    let rootURL: URL
-    /// 符号链接解析后的真实根路径，作为读取边界校验的事实基准。
-    private let resolvedRootURL: URL
 
+    private enum RootLocation: Sendable {
+        case sandbox(URL)
+        case bookmark(LocalSourceLocation)
+    }
+
+    private struct RootContext: Sendable {
+        let rootURL: URL
+        let resolvedRootURL: URL
+    }
+
+    private let rootLocation: RootLocation
+
+    /// 保留沙盒 demo/test 入口；该根目录不需要 security-scoped lease。
     init(source: ResourceSource, rootURL: URL) {
         self.source = source
-        let standardized = rootURL.standardizedFileURL
-        self.rootURL = standardized
-        self.resolvedRootURL = standardized.resolvingSymlinksInPath()
+        self.rootLocation = .sandbox(rootURL.standardizedFileURL)
+    }
+
+    /// 由后续 Files picker/来源配置传入 bookmark 位置。初始化时会解析一次，
+    /// 因而 stale/失效 bookmark 会显式失败，不会回退到旧的绝对路径。
+    init(source: ResourceSource, location: LocalSourceLocation) throws {
+        try Self.validate(location: location)
+        self.source = source
+        self.rootLocation = .bookmark(location)
     }
 
     func connect() async throws {
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: rootURL.path, isDirectory: &isDirectory)
-        guard exists else {
-            throw ResourceSourceError.notFound
-        }
-        guard isDirectory.boolValue else {
-            throw ResourceSourceError.invalidReference
-        }
-        guard FileManager.default.isReadableFile(atPath: rootURL.path) else {
-            throw ResourceSourceError.permissionDenied
+        try Task.checkCancellation()
+        try withRootAccess { context in
+            try coordinatedRead(at: context.rootURL) { url in
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                    throw ResourceSourceError.notFound
+                }
+                guard isDirectory.boolValue else {
+                    throw ResourceSourceError.invalidReference
+                }
+                guard FileManager.default.isReadableFile(atPath: url.path) else {
+                    throw ResourceSourceError.permissionDenied
+                }
+                try Task.checkCancellation()
+            }
         }
     }
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
-        let baseURL = try resolvedURL(forPath: path, isDirectory: true)
-        let urls: [URL]
-        do {
-            urls = try FileManager.default.contentsOfDirectory(
-                at: baseURL,
-                includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey],
-                options: [.skipsHiddenFiles]
-            )
-        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoPermissionError {
-            throw ResourceSourceError.permissionDenied
-        } catch {
-            throw ResourceSourceError.mapping(error)
-        }
+        try Task.checkCancellation()
+        return try withRootAccess { context in
+            let baseURL = try resolvedURL(forPath: path, isDirectory: true, in: context)
+            return try coordinatedRead(at: baseURL) { coordinatedURL in
+                try Task.checkCancellation()
+                let urls: [URL]
+                do {
+                    urls = try FileManager.default.contentsOfDirectory(
+                        at: coordinatedURL,
+                        includingPropertiesForKeys: [
+                            .isDirectoryKey,
+                            .isRegularFileKey,
+                            .isReadableKey,
+                            .contentModificationDateKey,
+                            .fileSizeKey,
+                        ],
+                        options: [.skipsHiddenFiles]
+                    )
+                } catch {
+                    throw ResourceSourceError.mapping(error)
+                }
 
-        return urls
-            .map { makeItem(from: $0, parentPath: path) }
-            .sorted { lhs, rhs in
-                if lhs.kind == .folder && rhs.kind != .folder { return true }
-                if lhs.kind != .folder && rhs.kind == .folder { return false }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                let items = urls
+                    .map { makeItem(from: $0, parentPath: path) }
+                    .sorted { lhs, rhs in
+                        if lhs.kind == .folder && rhs.kind != .folder { return true }
+                        if lhs.kind != .folder && rhs.kind == .folder { return false }
+                        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+                try Task.checkCancellation()
+                return items
             }
+        }
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
-        let file = try validatedFile(for: item)
-        return .localFile(.init(fileURL: file.url, supportsRandomAccess: true))
+        try Task.checkCancellation()
+        return try withRootAccess { context in
+            try withValidatedFile(for: item, in: context) { file in
+                try Task.checkCancellation()
+                return .localFile(.init(fileURL: file.url, supportsRandomAccess: true))
+            }
+        }
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
-        let file = try validatedFile(for: item)
-        let type = typeInfo(for: file.url)
-        let byteSize = file.values.fileSize.map { Int64($0) }
-        let modifiedAt = file.values.contentModificationDate
-        return ResourceMetadata(
-            byteSize: byteSize,
-            modifiedAt: modifiedAt,
-            mimeType: type.mimeType,
-            typeIdentifier: type.identifier,
-            isDirectory: false,
-            acceptsRanges: true,
-            revision: ResourceRevision.strongest(
-                etag: nil,
-                serverVersion: nil,
-                modifiedAt: modifiedAt,
-                byteSize: byteSize
-            )
-        )
+        try Task.checkCancellation()
+        return try withRootAccess { context in
+            try withValidatedFile(for: item, in: context) { file in
+                let type = typeInfo(for: file.url)
+                let byteSize = file.values.fileSize.map { Int64($0) }
+                let modifiedAt = file.values.contentModificationDate
+                try Task.checkCancellation()
+                return ResourceMetadata(
+                    byteSize: byteSize,
+                    modifiedAt: modifiedAt,
+                    mimeType: type.mimeType,
+                    typeIdentifier: type.identifier,
+                    isDirectory: false,
+                    acceptsRanges: true,
+                    revision: ResourceRevision.strongest(
+                        etag: nil,
+                        serverVersion: nil,
+                        modifiedAt: modifiedAt,
+                        byteSize: byteSize
+                    )
+                )
+            }
+        }
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        let file = try validatedFile(for: item)
-        guard let range else {
-            // 完整读取保持既有行为与错误映射。
+        try Task.checkCancellation()
+        return try withRootAccess { context in
+            try withValidatedFile(for: item, in: context) { file in
+                try Task.checkCancellation()
+                guard let range else {
+                    do {
+                        let data = try Data(contentsOf: file.url)
+                        try Task.checkCancellation()
+                        return data
+                    } catch is CancellationError {
+                        throw ResourceSourceError.cancelled
+                    } catch {
+                        throw ResourceSourceError.mapping(error)
+                    }
+                }
+                return try readRange(range, of: file.url)
+            }
+        }
+    }
+
+    // MARK: - Security-scoped and coordinated access
+
+    /// Bookmark URL 的解析、授权租约和 root/symlink 边界在同一 closure 内完成。
+    /// `defer` 保证成功、错误、取消和早退路径都恰好平衡 stop 调用。
+    private func withRootAccess<T>(_ operation: (RootContext) throws -> T) throws -> T {
+        switch rootLocation {
+        case .sandbox(let rootURL):
+            let standardized = rootURL.standardizedFileURL
+            return try operation(
+                RootContext(
+                    rootURL: standardized,
+                    resolvedRootURL: standardized.resolvingSymlinksInPath()
+                )
+            )
+
+        case .bookmark(let location):
             do {
-                return try Data(contentsOf: file.url)
+                return try location.withResolvedURL { url in
+                    guard url.startAccessingSecurityScopedResource() else {
+                        throw ResourceSourceError.permissionDenied
+                    }
+                    defer { url.stopAccessingSecurityScopedResource() }
+
+                    let standardized = url.standardizedFileURL
+                    return try operation(
+                        RootContext(
+                            rootURL: standardized,
+                            resolvedRootURL: standardized.resolvingSymlinksInPath()
+                        )
+                    )
+                }
+            } catch let error as LocalSourceLocation.ResolutionError {
+                switch error {
+                case .staleBookmark:
+                    throw ResourceSourceError.authorizationRequired
+                case .invalidBookmark:
+                    throw ResourceSourceError.invalidReference
+                }
+            }
+        }
+    }
+
+    /// 所有本地读取都经由 NSFileCoordinator 的同步回调完成，避免在协调边界
+    /// 外使用可能被替换的 URL。操作错误优先于协调器的 NSError。
+    private func coordinatedRead<T>(
+        at url: URL,
+        operation: (URL) throws -> T
+    ) throws -> T {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var outcome: Result<T, any Error>?
+        var coordinationError: NSError?
+
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { coordinatedURL in
+            do {
+                outcome = .success(try operation(coordinatedURL))
             } catch {
-                throw ResourceSourceError.mapping(error)
+                outcome = .failure(error)
             }
         }
-        return try readRange(range, of: file.url)
+
+        if let outcome {
+            return try outcome.get()
+        }
+        if let coordinationError {
+            throw ResourceSourceError.mapping(coordinationError)
+        }
+        throw ResourceSourceError.unavailable
     }
 
-    /// 区间读取：只 seek/read 请求的字节窗口，不把整个文件载入内存。
-    private func readRange(_ range: ResourceByteRange, of url: URL) throws -> Data {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw ResourceSourceError.mapping(error)
-        }
-        defer { try? handle.close() }
-        do {
-            let fileSize = Int64(try handle.seekToEnd())
-            // 空文件或区间完全越界：明确返回空数据，而不是报错。
-            guard let clamped = range.clamped(toTotalLength: fileSize) else {
-                return Data()
-            }
-            try handle.seek(toOffset: UInt64(clamped.lowerBound))
-            var remaining = clamped.length
-            var data = Data()
-            while remaining > 0 {
-                let chunkSize = Int(min(remaining, 65_536))
-                // read(upToCount:) 返回 nil 表示已到达 EOF。
-                guard let chunk = try handle.read(upToCount: chunkSize) else { break }
-                if chunk.isEmpty { break }
-                data.append(chunk)
-                remaining -= Int64(chunk.count)
-            }
-            return data
-        } catch {
-            throw ResourceSourceError.mapping(error)
-        }
-    }
+    // MARK: - Path and file facts
 
-    // MARK: - Private
-
-    /// 把资源路径安全解析为磁盘 URL；任何穿越根目录的路径都会被拒绝。
-    ///
-    /// 双重边界校验：先用规范化路径拦截 `..` 穿越，再解析符号链接，
-    /// 用真实路径对照解析后的根目录，拦截指向 root 外部的符号链接。
-    private func resolvedURL(forPath path: ResourcePath, isDirectory: Bool) throws -> URL {
-        let relative = path.relativeString
-        let candidate: URL
-        if relative.isEmpty {
-            candidate = rootURL
-        } else {
-            // 用 fileURLWithPath 解析嵌套相对段；appendingPathComponent 会把含
-            // 斜杠的相对串当作单个组件名，故此处直接拼接为完整路径字符串。
-            candidate = URL(fileURLWithPath: rootURL.path + "/" + relative, isDirectory: isDirectory)
-        }
-        let standardized = candidate.standardizedFileURL
-        guard standardized.path == rootURL.path || standardized.path.hasPrefix(rootURL.path + "/") else {
-            throw ResourceSourceError.invalidReference
-        }
-        let resolvedCandidate = standardized.resolvingSymlinksInPath()
-        let resolvedRoot = resolvedRootURL
-        guard resolvedCandidate.path == resolvedRoot.path
-            || resolvedCandidate.path.hasPrefix(resolvedRoot.path + "/") else {
-            throw ResourceSourceError.invalidReference
-        }
-        return resolvedCandidate
-    }
-
-    /// 三个文件入口共用的验证结果；属性来自 symlink/root 边界解析后的真实 URL。
     private struct ValidatedFile {
         let url: URL
         let values: URLResourceValues
     }
 
-    /// 校验来源/身份/逻辑路径与 root/symlink 边界，再以磁盘事实确认候选存在、
-    /// 非目录、是普通文件且可读。缺失、无权限等底层错误保持统一映射。
-    private func validatedFile(for item: ResourceItem) throws -> ValidatedFile {
+    /// 三个文件入口共用校验、协调和操作 closure；操作不会使用协调回调外的 URL。
+    private func withValidatedFile<T>(
+        for item: ResourceItem,
+        in context: RootContext,
+        operation: (ValidatedFile) throws -> T
+    ) throws -> T {
         let path = try validatedResourcePath(for: item)
-        let url = try resolvedURL(forPath: path, isDirectory: false)
+        let candidate = try resolvedURL(forPath: path, isDirectory: false, in: context)
+        return try coordinatedRead(at: candidate) { coordinatedURL in
+            let file = try validatedFile(at: coordinatedURL)
+            return try operation(file)
+        }
+    }
+
+    /// 把资源路径安全解析为磁盘 URL；先拦截逻辑路径穿越，再拒绝符号链接
+    /// 指向 root 外部的候选路径。
+    private func resolvedURL(
+        forPath path: ResourcePath,
+        isDirectory: Bool,
+        in context: RootContext
+    ) throws -> URL {
+        let relative = path.relativeString
+        let candidate: URL
+        if relative.isEmpty {
+            candidate = context.rootURL
+        } else {
+            candidate = URL(
+                fileURLWithPath: context.rootURL.path + "/" + relative,
+                isDirectory: isDirectory
+            )
+        }
+
+        let standardized = candidate.standardizedFileURL
+        guard standardized.path == context.rootURL.path
+            || standardized.path.hasPrefix(context.rootURL.path + "/") else {
+            throw ResourceSourceError.invalidReference
+        }
+
+        let resolvedCandidate = standardized.resolvingSymlinksInPath()
+        guard resolvedCandidate.path == context.resolvedRootURL.path
+            || resolvedCandidate.path.hasPrefix(context.resolvedRootURL.path + "/") else {
+            throw ResourceSourceError.invalidReference
+        }
+        return resolvedCandidate
+    }
+
+    /// 校验来源/身份/逻辑路径与 root 边界，再以协调回调中的磁盘事实确认候选
+    /// 存在、非目录、普通文件且可读。缺失、目录/非普通文件和不可读保持既有映射。
+    private func validatedFile(at url: URL) throws -> ValidatedFile {
         let values: URLResourceValues
         do {
             values = try url.resourceValues(forKeys: [
@@ -199,16 +301,13 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
         return ValidatedFile(url: url, values: values)
     }
 
-    /// 校验 item 属于本来源、身份与规范化路径一致且声明为文件。
-    /// 磁盘文件类型与可读性由 `validatedFile(for:)` 独立确认，不能信任展示 kind。
+    /// 校验 item 属于本来源、身份与规范化路径一致且声明为文件；磁盘事实由
+    /// `validatedFile(at:)` 独立确认，不能信任展示 kind 或 metadata。
     private func validatedResourcePath(for item: ResourceItem) throws -> ResourcePath {
         guard item.sourceID == source.id else { throw ResourceSourceError.invalidReference }
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
             throw ResourceSourceError.invalidReference
         }
-        // A folder item cannot enter a file operation, but this declaration is
-        // only an early semantic guard; the resolved disk facts below still
-        // independently prove that every candidate is a regular readable file.
         guard item.kind != .folder, !item.metadata.isDirectory else {
             throw ResourceSourceError.invalidReference
         }
@@ -224,7 +323,7 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             .isRegularFileKey,
             .isReadableKey,
             .contentModificationDateKey,
-            .fileSizeKey
+            .fileSizeKey,
         ])
         let isDirectory = values?.isDirectory ?? false
         let isRegularFile = values?.isRegularFile == true
@@ -322,5 +421,54 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
             return (nil, nil)
         }
         return (type.preferredMIMEType, type.identifier)
+    }
+
+    private static func validate(location: LocalSourceLocation) throws {
+        do {
+            try location.withResolvedURL { _ in () }
+        } catch let error as LocalSourceLocation.ResolutionError {
+            switch error {
+            case .staleBookmark:
+                throw ResourceSourceError.authorizationRequired
+            case .invalidBookmark:
+                throw ResourceSourceError.invalidReference
+            }
+        }
+    }
+
+    /// 区间读取：只 seek/read 请求的字节窗口，不把整个文件载入内存。
+    private func readRange(_ range: ResourceByteRange, of url: URL) throws -> Data {
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw ResourceSourceError.mapping(error)
+        }
+        defer { try? handle.close() }
+
+        do {
+            try Task.checkCancellation()
+            let fileSize = Int64(try handle.seekToEnd())
+            guard let clamped = range.clamped(toTotalLength: fileSize) else {
+                return Data()
+            }
+            try handle.seek(toOffset: UInt64(clamped.lowerBound))
+            var remaining = clamped.length
+            var data = Data()
+            while remaining > 0 {
+                try Task.checkCancellation()
+                let chunkSize = Int(min(remaining, 65_536))
+                guard let chunk = try handle.read(upToCount: chunkSize) else { break }
+                if chunk.isEmpty { break }
+                data.append(chunk)
+                remaining -= Int64(chunk.count)
+            }
+            try Task.checkCancellation()
+            return data
+        } catch is CancellationError {
+            throw ResourceSourceError.cancelled
+        } catch {
+            throw ResourceSourceError.mapping(error)
+        }
     }
 }

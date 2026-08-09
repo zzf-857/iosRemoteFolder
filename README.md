@@ -18,14 +18,16 @@
 - D-035 自适应与无障碍壳已通过主程验收：辅助字号布局、VoiceOver 语义、Reduce Motion、方向声明和 disclosure 所有权均已收口
 - D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
 - D-028B 已通过主程复核：`ResourceViewerHost` 先经 `ResourceAccessService` 创建会话并获取最新 typed metadata，再进入占位 Viewer；加载、失败、取消和重试状态均有结构化生命周期
+- D-030A 已由执行 Agent 实现、待 Codex 主程复核：Local adapter 增加 bookmark 位置值、stale/失效重新授权错误、平衡 security-scoped lease 和 `NSFileCoordinator` 协调访问；Files picker、持久化仓库和真实内容解码仍未接入
 
 当前阶段：
 
-- D-028B 会话状态门已收口。下一阶段应单独登记 D-030 安全作用域、D-034 `ViewerResolver` 或 D-031 首个真实 TXT/PDF 内容切片，不得把当前占位 Viewer 误认为已完成内容解码。
+- D-030A 本地来源安全作用域与协调访问基础已实现，等待主程复核。下一步应单独登记 D-030B Files picker/来源配置、D-034 `ViewerResolver` 或 D-031 首个真实 TXT/PDF 内容切片，不得把当前占位 Viewer 误认为已完成内容解码。
 
 尚未完成：
 
 - Alist、WebDAV、SMB/SFTP 等真实协议 adapter
+- Files picker、来源配置持久化、bookmark 恢复/删除语义（D-030B/D-032）
 - 用户可配置来源、Keychain 凭证存储、SwiftData 索引和完整离线下载
 - 真实 PDF/Markdown/TXT/图片/视频/音乐内容解码与生产级缓存
 
@@ -49,4 +51,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A 和 D-028B 会话状态门均已完成主程复核，真实内容查看器与安全作用域仍待后续工作单。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A 和 D-028B 会话状态门均已完成主程复核，D-030A 已实现待复核，真实 Files 配置与内容查看器仍待后续工作单。

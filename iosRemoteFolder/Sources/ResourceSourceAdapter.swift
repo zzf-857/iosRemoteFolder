@@ -42,6 +42,8 @@ extension ResourceSourceAdapter {
 enum ResourceSourceError: LocalizedError, Hashable, Sendable {
     /// 认证失效或需要重新认证（HTTP 401、URLSession 认证质询）。
     case authenticationRequired
+    /// 本地 security-scoped bookmark 已失效或需要用户重新选择目录。
+    case authorizationRequired
     /// 无权限访问（本地文件权限、HTTP 403）。
     case permissionDenied
     /// 资源或来源不存在（本地 ENOENT、HTTP 404）。
@@ -68,6 +70,7 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
     var errorDescription: String? {
         switch self {
         case .authenticationRequired: "来源需要重新认证"
+        case .authorizationRequired: "本地来源需要重新授权，请重新选择文件夹"
         case .permissionDenied: "没有权限访问该资源"
         case .notFound: "资源不存在或已被删除"
         case .timedOut: "连接超时，请检查网络后重试"
