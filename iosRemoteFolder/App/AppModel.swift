@@ -156,7 +156,9 @@ final class AppModel {
             try Task.checkCancellation()
             try configurationStore.insert(configuration)
             do {
-                try Task.checkCancellation()
+                // Once persistence starts, finish the paired registry mutation even
+                // when the caller cancels. The scheduler serializes the next
+                // mutation, so this critical section cannot leave split ownership.
                 try await registry.register(source: source, adapter: adapter)
             } catch {
                 try? configurationStore.remove(sourceID: source.id)
@@ -188,7 +190,8 @@ final class AppModel {
             try Task.checkCancellation()
             try configurationStore.replace(configuration)
             do {
-                try Task.checkCancellation()
+                // Configuration and registry replacement form one commit point;
+                // do not stop between them after the new bookmark is persisted.
                 try await registry.replace(source: source, adapter: adapter)
             } catch {
                 try? configurationStore.replace(oldConfiguration)
@@ -207,7 +210,8 @@ final class AppModel {
             try Task.checkCancellation()
             let removedConfiguration = try configurationStore.remove(sourceID: sourceID)
             do {
-                try Task.checkCancellation()
+                // Complete the paired removal after persistence begins. If the
+                // registry rejects it, restore the configuration below.
                 try await registry.remove(sourceID: sourceID)
             } catch {
                 // Persisted configuration is restored if registry mutation is
@@ -234,8 +238,16 @@ final class AppModel {
     private func scheduleMutation(
         _ operation: @escaping @MainActor () async -> Void
     ) {
+        let previousTask = sourceMutationTask
         sourceMutationTask?.cancel()
         sourceMutationTask = Task { @MainActor in
+            // Mutations are latest-wins but serialized. A cancelled operation is
+            // allowed to finish its in-flight commit/rollback before the next one
+            // touches the same configuration and registry.
+            if let previousTask {
+                await previousTask.value
+            }
+            guard !Task.isCancelled else { return }
             await operation()
         }
     }
