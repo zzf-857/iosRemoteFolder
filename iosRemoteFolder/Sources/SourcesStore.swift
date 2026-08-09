@@ -71,8 +71,11 @@ final class SourcesStore {
         failures: [UUID: ResourceSourceError] = [:]
     ) {
         var incomingIDs = Set<UUID>()
+        var uniqueSnapshots: [SourceRegistrySnapshot] = []
+        uniqueSnapshots.reserveCapacity(snapshots.count)
         for snapshot in snapshots {
             guard incomingIDs.insert(snapshot.id).inserted else { continue }
+            uniqueSnapshots.append(snapshot)
         }
 
         let oldEntriesByID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
@@ -86,8 +89,8 @@ final class SourcesStore {
         }
 
         var nextEntries: [Entry] = []
-        nextEntries.reserveCapacity(snapshots.count)
-        for snapshot in snapshots {
+        nextEntries.reserveCapacity(uniqueSnapshots.count)
+        for snapshot in uniqueSnapshots {
             if var existing = oldEntriesByID[snapshot.id],
                Self.sameSourceDescriptor(existing.source, snapshot.source),
                existing.hasAdapter == snapshot.hasAdapter,

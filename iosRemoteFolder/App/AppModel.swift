@@ -140,6 +140,7 @@ final class AppModel {
 
     private func performAddLocalSource(directoryURL: URL) async {
         do {
+            try Task.checkCancellation()
             let location = try LocalSourceLocation(directoryURL: directoryURL)
             let configuration = LocalSourceConfiguration(
                 displayName: Self.displayName(for: directoryURL),
@@ -152,14 +153,17 @@ final class AppModel {
 
             let source = configuration.resourceSource
             let adapter = try LocalFilesSourceAdapter(source: source, location: location)
+            try Task.checkCancellation()
             try configurationStore.insert(configuration)
             do {
+                try Task.checkCancellation()
                 try await registry.register(source: source, adapter: adapter)
             } catch {
                 try? configurationStore.remove(sourceID: source.id)
                 throw error
             }
             await synchronizeStore()
+            guard !Task.isCancelled else { return }
             sourcesStore.connect(source.id)
         } catch {
             reportSourceError(error)
@@ -168,6 +172,7 @@ final class AppModel {
 
     private func performReauthorize(sourceID: UUID, directoryURL: URL) async {
         do {
+            try Task.checkCancellation()
             guard let oldConfiguration = configurationStore.configuration(for: sourceID) else {
                 throw LocalSourceConfigurationError.sourceNotFound(sourceID)
             }
@@ -180,14 +185,17 @@ final class AppModel {
             )
             let source = configuration.resourceSource
             let adapter = try LocalFilesSourceAdapter(source: source, location: location)
+            try Task.checkCancellation()
             try configurationStore.replace(configuration)
             do {
+                try Task.checkCancellation()
                 try await registry.replace(source: source, adapter: adapter)
             } catch {
                 try? configurationStore.replace(oldConfiguration)
                 throw error
             }
             await synchronizeStore()
+            guard !Task.isCancelled else { return }
             sourcesStore.connect(sourceID)
         } catch {
             reportSourceError(error)
@@ -196,8 +204,10 @@ final class AppModel {
 
     private func performRemove(sourceID: UUID) async {
         do {
+            try Task.checkCancellation()
             let removedConfiguration = try configurationStore.remove(sourceID: sourceID)
             do {
+                try Task.checkCancellation()
                 try await registry.remove(sourceID: sourceID)
             } catch {
                 // Persisted configuration is restored if registry mutation is
