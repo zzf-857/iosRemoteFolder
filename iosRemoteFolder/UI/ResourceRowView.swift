@@ -1,10 +1,47 @@
 import SwiftUI
 
 struct ResourceRowView: View {
+    enum Interaction {
+        case actionable(resultHint: String)
+        case staticContent
+
+        var isActionable: Bool {
+            switch self {
+            case .actionable:
+                true
+            case .staticContent:
+                false
+            }
+        }
+    }
+
     let resource: ResourceItem
+    let interaction: Interaction
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
+        accessibleRow
+    }
+
+    @ViewBuilder
+    private var accessibleRow: some View {
+        switch interaction {
+        case .actionable(let resultHint):
+            rowContent
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(resource.name))
+                .accessibilityValue(Text(metadataText))
+                .accessibilityHint(Text(resultHint))
+        case .staticContent:
+            rowContent
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(resource.name))
+                .accessibilityValue(Text(metadataText))
+                .accessibilityRemoveTraits(.isButton)
+        }
+    }
+
+    private var rowContent: some View {
         Group {
             if dynamicTypeSize.isAccessibilitySize {
                 stackedRow
@@ -17,8 +54,6 @@ struct ResourceRowView: View {
         }
         .frame(minHeight: 44, alignment: .leading)
         .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-        .accessibilityHint(Text(resource.kind == .folder ? "双击进入文件夹" : "双击打开资源"))
     }
 
     private var compactRow: some View {
@@ -27,7 +62,9 @@ struct ResourceRowView: View {
             resourceDetails
                 .layoutPriority(1)
             Spacer(minLength: 0)
-            disclosure
+            if interaction.isActionable {
+                disclosure
+            }
         }
         .padding(.vertical, 6)
     }
@@ -41,7 +78,9 @@ struct ResourceRowView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .layoutPriority(1)
                 Spacer(minLength: 0)
-                disclosure
+                if interaction.isActionable {
+                    disclosure
+                }
             }
             Text(metadataText)
                 .font(.caption)

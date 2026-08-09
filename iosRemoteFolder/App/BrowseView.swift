@@ -205,13 +205,13 @@ private struct BrowseContentView: View {
             Button {
                 store.enter(entry.id, folder: item)
             } label: {
-                ResourceRowView(resource: item)
+                ResourceRowView(resource: item, interaction: .actionable(resultHint: "进入文件夹"))
             }
             .buttonStyle(.plain)
         } else {
             // 文件进入查看器占位入口。
             NavigationLink(value: item) {
-                ResourceRowView(resource: item)
+                ResourceRowView(resource: item, interaction: .actionable(resultHint: "打开资源"))
             }
             .buttonStyle(.plain)
         }
@@ -228,9 +228,10 @@ private struct BrowseContentView: View {
                         store.loadDirectory(entry.id, at: .root)
                     } label: {
                         Label("根目录", systemImage: "folder")
+                            .frame(minWidth: 44, minHeight: 44)
                     }
                     .buttonStyle(.borderless)
-                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                     ForEach(Array(path.components.enumerated()), id: \.offset) { index, component in
                         let prefix = "/" + path.components.prefix(index + 1).joined(separator: "/")
                         Text("/")
@@ -243,9 +244,10 @@ private struct BrowseContentView: View {
                         } label: {
                             Text(component)
                                 .fixedSize(horizontal: true, vertical: false)
+                                .frame(minWidth: 44, minHeight: 44)
                         }
                         .buttonStyle(.borderless)
-                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                     }
                 }
                 .padding(.vertical, 4)

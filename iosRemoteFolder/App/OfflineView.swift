@@ -105,20 +105,25 @@ private struct OfflineResourceRow: View {
             }
         }
         .frame(minHeight: 44, alignment: .leading)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text("\(resource.name)，\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))，已离线"))
     }
 
     private var offlineLabel: some View {
-        Label("已离线", systemImage: "checkmark.circle.fill")
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .accessibilityHidden(true)
+            Text("已离线")
+                .fixedSize(horizontal: false, vertical: true)
+        }
             .foregroundStyle(AppTheme.accent)
-            .fixedSize(horizontal: true, vertical: false)
-            .frame(minHeight: 44)
+            .frame(minHeight: 44, alignment: .leading)
+            .layoutPriority(1)
     }
 
     private var compactLayout: some View {
         HStack(alignment: .top, spacing: 10) {
-            ResourceRowView(resource: resource)
+            ResourceRowView(resource: resource, interaction: .staticContent)
                 .layoutPriority(1)
             offlineLabel
         }
@@ -126,7 +131,7 @@ private struct OfflineResourceRow: View {
 
     private var stackedLayout: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ResourceRowView(resource: resource)
+            ResourceRowView(resource: resource, interaction: .staticContent)
             offlineLabel
         }
     }

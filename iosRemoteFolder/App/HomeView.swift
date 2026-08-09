@@ -104,8 +104,10 @@ private struct ContinueCard: View {
         .fixedSize(horizontal: false, vertical: true)
         .padding(18)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24))
-        .accessibilityElement(children: .combine)
-        .accessibilityHint(Text("双击继续打开资源"))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(resource.name))
+        .accessibilityValue(Text("\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))"))
+        .accessibilityHint(Text("继续查看"))
     }
 }
 
@@ -117,7 +119,12 @@ private struct RecentSection: View {
             SectionTitle(title: "最近打开")
             ForEach(resources) { resource in
                 NavigationLink(value: resource) {
-                    ResourceRowView(resource: resource)
+                    ResourceRowView(
+                        resource: resource,
+                        interaction: .actionable(
+                            resultHint: resource.kind == .folder ? "进入文件夹" : "打开资源"
+                        )
+                    )
                 }
                 .buttonStyle(.plain)
             }

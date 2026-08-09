@@ -28,8 +28,9 @@ struct ResourceCardView: View {
             }
         }
         .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-        .accessibilityHint(Text(resource.kind == .folder ? "双击进入文件夹" : "双击打开资源"))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(resource.name))
+        .accessibilityValue(Text("\(resource.kind.title)，\(ResourceMetadataFormatter.size(for: resource.metadata))"))
     }
 
     private var metadataLine: some View {
