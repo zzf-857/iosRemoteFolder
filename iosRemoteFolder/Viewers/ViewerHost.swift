@@ -1,29 +1,189 @@
 import SwiftUI
 
 struct ResourceViewerHost: View {
+    @Environment(AppModel.self) private var appModel
+
     let resource: ResourceItem
+    @State private var loadState: LoadState = .loading
+    @State private var retryAttempt = 0
+
+    private struct LoadRequest: Hashable, Sendable {
+        let identity: ResourceIdentity
+        let attempt: Int
+    }
+
+    private enum LoadState: Equatable {
+        case loading
+        case ready(ResourceIdentity, ResourceMetadata)
+        case failed(ResourceIdentity, ResourceSourceError)
+        case cancelled(ResourceIdentity)
+    }
+
+    private var loadRequest: LoadRequest {
+        LoadRequest(identity: resource.id, attempt: retryAttempt)
+    }
 
     var body: some View {
         Group {
-            switch ViewerRegistry.viewer(for: resource) {
-            case .pdfReader:
-                PDFReaderView(resource: resource)
-            case .markdownReader:
-                MarkdownReaderView(resource: resource)
-            case .textReader:
-                TextReaderView(resource: resource)
-            case .imageViewer:
-                ImageViewerView(resource: resource)
-            case .videoPlayer:
-                VideoPlayerView(resource: resource)
-            case .musicPlayer:
-                MusicPlayerView(resource: resource)
-            case .systemPreview:
-                UnsupportedViewerView(resource: resource)
+            switch loadState {
+            case .loading:
+                loadingView
+            case .ready(let identity, let metadata) where identity == resource.id:
+                readyView(metadata: metadata)
+            case .failed(let identity, let error) where identity == resource.id:
+                failureView(error: error)
+            case .cancelled(let identity) where identity == resource.id:
+                cancelledView
+            default:
+                // A result from a cancelled task must never be shown for a new
+                // resource while its replacement session is being prepared.
+                loadingView
             }
         }
         .navigationTitle(resource.name)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: loadRequest) {
+            await load(request: loadRequest, resource: resource)
+        }
+    }
+
+    @ViewBuilder
+    private func readyView(metadata: ResourceMetadata) -> some View {
+        VStack(spacing: 0) {
+            metadataSummary(metadata)
+            viewerView
+        }
+    }
+
+    @ViewBuilder
+    private var viewerView: some View {
+        switch ViewerRegistry.viewer(for: resource) {
+        case .pdfReader:
+            PDFReaderView(resource: resource)
+        case .markdownReader:
+            MarkdownReaderView(resource: resource)
+        case .textReader:
+            TextReaderView(resource: resource)
+        case .imageViewer:
+            ImageViewerView(resource: resource)
+        case .videoPlayer:
+            VideoPlayerView(resource: resource)
+        case .musicPlayer:
+            MusicPlayerView(resource: resource)
+        case .systemPreview:
+            UnsupportedViewerView(resource: resource)
+        }
+    }
+
+    private func metadataSummary(_ metadata: ResourceMetadata) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                Label(resource.kind.title, systemImage: resource.kind.systemImage)
+                Text(ResourceMetadataFormatter.size(for: metadata))
+                Text(ResourceMetadataFormatter.modified(for: metadata))
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Label(resource.kind.title, systemImage: resource.kind.systemImage)
+                HStack(spacing: 12) {
+                    Text(ResourceMetadataFormatter.size(for: metadata))
+                    Text(ResourceMetadataFormatter.modified(for: metadata))
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.thinMaterial)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            Text(
+                "\(resource.name)，\(resource.kind.title)，"
+                    + "\(ResourceMetadataFormatter.size(for: metadata))，"
+                    + "\(ResourceMetadataFormatter.modified(for: metadata))"
+            )
+        )
+    }
+
+    private var loadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Label("正在准备资源", systemImage: "arrow.triangle.2.circlepath")
+                .font(.headline)
+            Text("正在获取最新资源信息")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+        .accessibilityElement(children: .combine)
+    }
+
+    private func failureView(error: ResourceSourceError) -> some View {
+        ContentUnavailableView {
+            Label("无法打开资源", systemImage: "exclamationmark.triangle")
+        } description: {
+            Text(error.localizedDescription)
+        } actions: {
+            Button("重试", systemImage: "arrow.clockwise") {
+                retry()
+            }
+        }
+    }
+
+    private var cancelledView: some View {
+        ContentUnavailableView {
+            Label("已取消打开", systemImage: "xmark.circle")
+        } description: {
+            Text("资源信息读取已取消")
+        } actions: {
+            Button("重试", systemImage: "arrow.clockwise") {
+                retry()
+            }
+        }
+    }
+
+    private func retry() {
+        loadState = .loading
+        retryAttempt += 1
+    }
+
+    @MainActor
+    private func load(request: LoadRequest, resource: ResourceItem) async {
+        guard request == loadRequest else { return }
+        loadState = .loading
+
+        var session: ResourceContentSession?
+        let result: LoadState
+        do {
+            let createdSession = try await appModel.resourceAccessService.makeSession(for: resource)
+            session = createdSession
+            let metadata = try await createdSession.fetchMetadata()
+            try Task.checkCancellation()
+            result = .ready(request.identity, metadata)
+        } catch {
+            result = state(for: error, identity: request.identity)
+        }
+
+        // A session may outlive the metadata probe. Closing it here covers
+        // normal completion, retries, identity changes and task cancellation.
+        if let session {
+            await session.close()
+        }
+
+        guard request == loadRequest else { return }
+        loadState = Task.isCancelled ? .cancelled(request.identity) : result
+    }
+
+    private func state(for error: any Error, identity: ResourceIdentity) -> LoadState {
+        if Task.isCancelled {
+            return .cancelled(identity)
+        }
+        let sourceError = (error as? ResourceSourceError) ?? ResourceSourceError.mapping(error)
+        if sourceError == .cancelled {
+            return .cancelled(identity)
+        }
+        return .failed(identity, sourceError)
     }
 }
 
@@ -277,4 +437,3 @@ private struct ViewerHeader: View {
         }
     }
 }
-
