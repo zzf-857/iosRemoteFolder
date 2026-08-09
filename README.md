@@ -20,7 +20,7 @@
 
 当前正在进行：
 
-- D-028B 尚未开始：下一步先登记工作单，再把首个真实查看器接入 `ResourceContentSession`；本阶段不扩展 WebDAV、Alist 或其他新协议。
+- D-028B 工作单已登记，当前推进 `ResourceViewerHost` 的会话状态门和生命周期接入：查看器先经 `ResourceAccessService` 获取真实 typed metadata，再显示占位壳或可行动错误；本阶段不读取内容字节、不实现解码器，也不扩展 WebDAV、Alist 或其他新协议。
 
 尚未完成：
 
@@ -48,4 +48,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035 和 D-028A 均已验收，D-028B 尚未开始。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035 和 D-028A 均已验收，D-028B 工作单已登记并待执行 Agent 接手。
