@@ -12,7 +12,9 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
 
     private let bookmarkData: Data
 
-    /// 从 Files/目录选择器返回的目录 URL 创建只读 security-scoped bookmark。
+    /// 从 Files/目录选择器返回的目录 URL 创建位置 bookmark。
+    /// iOS 通过选择器 URL 自带的隐式 security scope 恢复授权；`.withSecurityScope`
+    /// 是 macOS 专用选项，不能用于 iOS 17 target。
     init(directoryURL: URL) throws {
         let url = directoryURL.standardizedFileURL
         guard url.isFileURL else {
@@ -32,7 +34,7 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
 
         do {
             self.bookmarkData = try url.bookmarkData(
-                options: [.withSecurityScope],
+                options: [],
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
@@ -57,7 +59,7 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
         do {
             resolvedURL = try URL(
                 resolvingBookmarkData: bookmarkData,
-                options: [.withSecurityScope],
+                options: [],
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             )
