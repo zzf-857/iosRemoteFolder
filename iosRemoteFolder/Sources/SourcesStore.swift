@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// 来源连接状态仓库：持有全部 adapter，驱动连接与重试，并向 UI 报告状态。
+/// 来源连接状态仓库：通过注入的 registry 驱动连接与重试，并向 UI 报告状态。
 ///
 /// 架构边界：UI 只依赖本仓库暴露的 `entries` 与 `connect` 等方法，
 /// 不直接调用 URLSession 或 FileManager；adapter 抛出的错误统一映射为
@@ -39,7 +39,7 @@ final class SourcesStore {
 
     private(set) var entries: [Entry] = []
 
-    @ObservationIgnored private var adapters: [UUID: any ResourceSourceAdapter] = [:]
+    @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var browseTasks: [UUID: Task<Void, Never>] = [:]
     /// 连接代数：每次发起连接递增；过期任务的任何状态写入都会被忽略，
@@ -48,48 +48,16 @@ final class SourcesStore {
     /// 浏览加载代数：与连接代数同理，避免过期列举覆盖新目录。
     @ObservationIgnored private var browseGenerations: [UUID: Int] = [:]
 
-    init(sources: [ResourceSource], adapterFor: (ResourceSource) -> (any ResourceSourceAdapter)?) {
-        for source in sources {
-            let adapter = adapterFor(source)
-            if let adapter {
-                adapters[source.id] = adapter
-            }
-            entries.append(Entry(source: source, state: .disconnected, hasAdapter: adapter != nil, browse: SourceBrowse()))
-        }
-    }
-
-    /// 当前阶段的演示接线：本地来源指向应用文稿目录，HTTP 来源指向本机直链示例；
-    /// Alist、WebDAV 等协议尚未接入 adapter。
-    static func demo() -> SourcesStore {
-        SourcesStore(sources: SampleData.sources) { source in
-            let adapter: (any ResourceSourceAdapter)?
-            switch source.kind {
-            case .local:
-                adapter = LocalFilesSourceAdapter(source: source, rootURL: URL.documentsDirectory)
-            case .http:
-                adapter = HTTPSourceAdapter(source: source, descriptors: demoHTTPDescriptors)
-            case .alist, .webdav, .lan:
-                adapter = nil
-            }
-            return adapter
-        }
-    }
-
-    static var demoHTTPDescriptors: [HTTPResourceDescriptor] {
-        [
-            HTTPResourceDescriptor(
-                path: "/示例/产品手册.pdf",
-                name: "产品手册.pdf",
-                kind: .pdf,
-                url: URL(string: "http://127.0.0.1:48080/files/product-handbook.pdf")!
-            ),
-            HTTPResourceDescriptor(
-                path: "/示例/团队合影.jpg",
-                name: "团队合影.jpg",
-                kind: .image,
-                url: URL(string: "http://127.0.0.1:48080/files/team-photo.jpg")!
+    init(registry: SourceRegistry) {
+        self.registry = registry
+        self.entries = registry.snapshots.map { snapshot in
+            Entry(
+                source: snapshot.source,
+                state: .disconnected,
+                hasAdapter: snapshot.hasAdapter,
+                browse: SourceBrowse()
             )
-        ]
+        }
     }
 
     // MARK: - 连接
@@ -109,14 +77,15 @@ final class SourcesStore {
     /// 的真实资源列表；失败进入 failed（保留可行动错误）；任务被取消时回到 disconnected，
     /// 不会永久停留在 connecting。
     func connect(_ sourceID: UUID) {
-        guard let adapter = adapters[sourceID] else { return }
+        guard let entry = entry(for: sourceID), entry.hasAdapter else { return }
         connectionTasks[sourceID]?.cancel()
         let generation = nextConnectionGeneration(for: sourceID)
         transition(sourceID, to: .connecting)
+        let registry = self.registry
         let task = Task {
             do {
-                try await adapter.connect()
-                let resources = try await adapter.listResources(at: .root)
+                try await registry.connect(sourceID: sourceID)
+                let resources = try await registry.listResources(sourceID: sourceID, at: .root)
                 try Task.checkCancellation()
                 guard self.isCurrentConnectionGeneration(sourceID, generation) else { return }
                 self.transition(sourceID, to: .ready)
@@ -188,7 +157,7 @@ final class SourcesStore {
     /// 列举指定来源的当前目录资源（真实来源闭环）。
     /// 重复调用会取消上一次未完成的列举任务。
     func loadDirectory(_ sourceID: UUID, at path: ResourcePath) {
-        guard let adapter = adapters[sourceID] else { return }
+        guard let entry = entry(for: sourceID), entry.hasAdapter else { return }
         browseTasks[sourceID]?.cancel()
         let generation = nextBrowseGeneration(for: sourceID)
         update(sourceID) { entry in
@@ -199,9 +168,10 @@ final class SourcesStore {
             entry.browse.isLoading = true
             entry.browse.error = nil
         }
+        let registry = self.registry
         let task = Task {
             do {
-                let items = try await adapter.listResources(at: path)
+                let items = try await registry.listResources(sourceID: sourceID, at: path)
                 try Task.checkCancellation()
                 guard self.isCurrentBrowseGeneration(sourceID, generation) else { return }
                 self.update(sourceID) { entry in

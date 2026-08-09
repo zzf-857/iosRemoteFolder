@@ -23,7 +23,7 @@
 - 主程已迁移测试基线并补充 D-024 契约覆盖。iPhone 17 Pro / iOS 26.5 上 61/61 测试、generic iOS Simulator Debug 构建、工程列表、差异检查和普通 App 安装启动全部通过。
 - 来源读取契约（D-023）已由主程验收：`dbf31da` 实现、`32b04bb` 测试基线、`3dddb6e` 边界回归用例；HTTP 206、Range 探测、50MB 流式回退、取消语义和本地 symlink 防护在 D-024 阻塞修复中保持兼容，未削弱。
 - D-029 已通过 Codex 主程验收：位置身份、typed metadata、内容 revision、UI Locale 格式化和 revision-aware cache key 已形成正式基线；最终阻塞修复为 `f94c6ca9`，iPhone 17 Pro / iOS 26.5 完整测试 70/70 通过，generic Simulator Debug 构建、iPhone/iPad 安装启动和工程检查通过。
-- 下一阶段先关闭 D-035 自适应与无障碍壳：当前 iPhone 最大辅助字号会压缩继续卡片和资源/来源行，且生成的 Info.plist 尚未声明 iPhone/iPad 支持方向；该 UI 欠账独立于 D-029，关闭后再进入 D-028 内容访问会话。
+- D-028A 架构基础已实现，待主程复核：AppModel composition root 创建唯一 actor `SourceRegistry`，SourcesStore 与 `ResourceAccessService` 注入同一实例；`ResourceContentSession` 提供 typed metadata、显式预算的完整/区间读取与幂等取消/关闭，尚未接入真实 Viewer。
 
 尚未完成：
 
