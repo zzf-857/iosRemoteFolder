@@ -205,13 +205,21 @@ private struct BrowseContentView: View {
             Button {
                 store.enter(entry.id, folder: item)
             } label: {
-                ResourceRowView(resource: item, interaction: .actionable(resultHint: "进入文件夹"))
+                ResourceRowView(
+                    resource: item,
+                    interaction: .actionable(resultHint: "进入文件夹"),
+                    disclosureOwnership: .resourceRow
+                )
             }
             .buttonStyle(.plain)
         } else {
             // 文件进入查看器占位入口。
             NavigationLink(value: item) {
-                ResourceRowView(resource: item, interaction: .actionable(resultHint: "打开资源"))
+                ResourceRowView(
+                    resource: item,
+                    interaction: .actionable(resultHint: "打开资源"),
+                    disclosureOwnership: .container
+                )
             }
             .buttonStyle(.plain)
         }

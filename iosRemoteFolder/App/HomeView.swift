@@ -123,7 +123,8 @@ private struct RecentSection: View {
                         resource: resource,
                         interaction: .actionable(
                             resultHint: resource.kind == .folder ? "进入文件夹" : "打开资源"
-                        )
+                        ),
+                        disclosureOwnership: .resourceRow
                     )
                 }
                 .buttonStyle(.plain)

@@ -4,20 +4,27 @@ struct ResourceRowView: View {
     enum Interaction {
         case actionable(resultHint: String)
         case staticContent
+    }
 
-        var isActionable: Bool {
-            switch self {
-            case .actionable:
-                true
-            case .staticContent:
-                false
-            }
-        }
+    enum DisclosureOwnership {
+        case resourceRow
+        case container
+        case none
     }
 
     let resource: ResourceItem
     let interaction: Interaction
+    let disclosureOwnership: DisclosureOwnership
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var rendersDisclosure: Bool {
+        switch (interaction, disclosureOwnership) {
+        case (.actionable, .resourceRow):
+            true
+        default:
+            false
+        }
+    }
 
     var body: some View {
         accessibleRow
@@ -62,7 +69,7 @@ struct ResourceRowView: View {
             resourceDetails
                 .layoutPriority(1)
             Spacer(minLength: 0)
-            if interaction.isActionable {
+            if rendersDisclosure {
                 disclosure
             }
         }
@@ -78,7 +85,7 @@ struct ResourceRowView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .layoutPriority(1)
                 Spacer(minLength: 0)
-                if interaction.isActionable {
+                if rendersDisclosure {
                     disclosure
                 }
             }

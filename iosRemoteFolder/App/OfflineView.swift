@@ -123,7 +123,11 @@ private struct OfflineResourceRow: View {
 
     private var compactLayout: some View {
         HStack(alignment: .top, spacing: 10) {
-            ResourceRowView(resource: resource, interaction: .staticContent)
+            ResourceRowView(
+                resource: resource,
+                interaction: .staticContent,
+                disclosureOwnership: .none
+            )
                 .layoutPriority(1)
             offlineLabel
         }
@@ -131,7 +135,11 @@ private struct OfflineResourceRow: View {
 
     private var stackedLayout: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ResourceRowView(resource: resource, interaction: .staticContent)
+            ResourceRowView(
+                resource: resource,
+                interaction: .staticContent,
+                disclosureOwnership: .none
+            )
             offlineLabel
         }
     }
