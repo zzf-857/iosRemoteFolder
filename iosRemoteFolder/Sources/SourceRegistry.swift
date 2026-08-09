@@ -4,6 +4,8 @@ import Foundation
 struct SourceRegistrySnapshot: Identifiable, Hashable, Sendable {
     let source: ResourceSource
     let hasAdapter: Bool
+    /// 只表示 adapter 注册关系的版本，不暴露 adapter 或其内部状态。
+    let adapterRevision: UUID
 
     var id: UUID { source.id }
 }
@@ -43,6 +45,7 @@ actor SourceRegistry {
     private var sourceOrder: [UUID]
     private var sources: [UUID: ResourceSource]
     private var adapters: [UUID: any ResourceSourceAdapter]
+    private var adapterRevisions: [UUID: UUID]
 
     init(
         sources: [ResourceSource],
@@ -71,13 +74,19 @@ actor SourceRegistry {
             adapterMap[adapterSourceID] = adapter
         }
 
+        let revisionMap = sourceIDs.reduce(into: [UUID: UUID]()) { result, sourceID in
+            result[sourceID] = UUID()
+        }
+
         self.sources = sourceMap
         self.sourceOrder = sourceOrder
         self.adapters = adapterMap
+        self.adapterRevisions = revisionMap
         self.initialSnapshots = sources.map { source in
             SourceRegistrySnapshot(
                 source: source,
-                hasAdapter: adapterMap[source.id] != nil
+                hasAdapter: adapterMap[source.id] != nil,
+                adapterRevision: revisionMap[source.id] ?? UUID()
             )
         }
     }
@@ -88,7 +97,8 @@ actor SourceRegistry {
             guard let source = sources[sourceID] else { return nil }
             return SourceRegistrySnapshot(
                 source: source,
-                hasAdapter: adapters[sourceID] != nil
+                hasAdapter: adapters[sourceID] != nil,
+                adapterRevision: adapterRevisions[sourceID] ?? UUID()
             )
         }
     }
@@ -119,6 +129,7 @@ actor SourceRegistry {
             adapters[source.id] = adapter
         }
         sources[source.id] = source
+        adapterRevisions[source.id] = UUID()
         sourceOrder.append(source.id)
     }
 
@@ -142,6 +153,7 @@ actor SourceRegistry {
             adapters.removeValue(forKey: source.id)
         }
         sources[source.id] = source
+        adapterRevisions[source.id] = UUID()
     }
 
     /// 移除来源及其 adapter；不会删除来源对应的原目录或远端数据。
@@ -151,6 +163,7 @@ actor SourceRegistry {
             throw SourceRegistryError.sourceNotRegistered(sourceID)
         }
         adapters.removeValue(forKey: sourceID)
+        adapterRevisions.removeValue(forKey: sourceID)
         sourceOrder.removeAll { $0 == sourceID }
         return source
     }

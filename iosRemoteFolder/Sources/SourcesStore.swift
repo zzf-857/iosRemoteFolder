@@ -40,6 +40,9 @@ final class SourcesStore {
     private(set) var entries: [Entry] = []
 
     @ObservationIgnored private let registry: SourceRegistry
+    /// 与 registry 快照中的 adapter 注册版本配对；只用于判断来源替换，
+    /// 不携带 adapter 或底层客户端。
+    @ObservationIgnored private var adapterRevisions: [UUID: UUID] = [:]
     @ObservationIgnored private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var browseTasks: [UUID: Task<Void, Never>] = [:]
     /// 连接代数：每次发起连接递增；过期任务的任何状态写入都会被忽略，
@@ -50,7 +53,11 @@ final class SourcesStore {
 
     init(registry: SourceRegistry) {
         self.registry = registry
-        self.entries = registry.initialSnapshots.map { snapshot in
+        let snapshots = registry.initialSnapshots
+        self.adapterRevisions = Dictionary(
+            uniqueKeysWithValues: snapshots.map { ($0.id, $0.adapterRevision) }
+        )
+        self.entries = snapshots.map { snapshot in
             Entry(
                 source: snapshot.source,
                 state: .disconnected,
@@ -86,6 +93,7 @@ final class SourcesStore {
             cancelWork(for: sourceID)
             connectionGenerations.removeValue(forKey: sourceID)
             browseGenerations.removeValue(forKey: sourceID)
+            adapterRevisions.removeValue(forKey: sourceID)
         }
 
         var nextEntries: [Entry] = []
@@ -94,6 +102,7 @@ final class SourcesStore {
             if var existing = oldEntriesByID[snapshot.id],
                Self.sameSourceDescriptor(existing.source, snapshot.source),
                existing.hasAdapter == snapshot.hasAdapter,
+               adapterRevisions[snapshot.id] == snapshot.adapterRevision,
                failures[snapshot.id] == nil {
                 // Registry 的 source 描述可能带有初始化状态；运行时状态仍只由
                 // Store 投影，避免 snapshot 反向写入第二套连接事实。
@@ -106,6 +115,7 @@ final class SourcesStore {
             if oldEntriesByID[snapshot.id] != nil {
                 cancelWork(for: snapshot.id)
             }
+            adapterRevisions[snapshot.id] = snapshot.adapterRevision
             let state: ResourceSourceState
             if let failure = failures[snapshot.id] {
                 state = .failed(failure)
