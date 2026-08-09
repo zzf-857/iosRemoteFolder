@@ -50,7 +50,7 @@ final class SourcesStore {
 
     init(registry: SourceRegistry) {
         self.registry = registry
-        self.entries = registry.snapshots.map { snapshot in
+        self.entries = registry.initialSnapshots.map { snapshot in
             Entry(
                 source: snapshot.source,
                 state: .disconnected,
@@ -58,6 +58,74 @@ final class SourcesStore {
                 browse: SourceBrowse()
             )
         }
+    }
+
+    // MARK: - 动态来源同步
+
+    /// 用 registry 的不可变快照同步来源。新增来源从未连接开始；替换来源会
+    /// 取消旧连接/浏览任务、递增代数并清空目录状态；未变化来源保留当前投影。
+    /// `failures` 只由 composition root 提供，用于恢复 stale/失效 bookmark 的
+    /// 可行动状态，Store 不解析 bookmark，也不持有 adapter。
+    func synchronize(
+        with snapshots: [SourceRegistrySnapshot],
+        failures: [UUID: ResourceSourceError] = [:]
+    ) {
+        var incomingIDs = Set<UUID>()
+        for snapshot in snapshots {
+            guard incomingIDs.insert(snapshot.id).inserted else { continue }
+        }
+
+        let oldEntriesByID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        let oldIDs = Set(oldEntriesByID.keys)
+        let removedIDs = oldIDs.subtracting(incomingIDs)
+
+        for sourceID in removedIDs {
+            cancelWork(for: sourceID)
+            connectionGenerations.removeValue(forKey: sourceID)
+            browseGenerations.removeValue(forKey: sourceID)
+        }
+
+        var nextEntries: [Entry] = []
+        nextEntries.reserveCapacity(snapshots.count)
+        for snapshot in snapshots {
+            if var existing = oldEntriesByID[snapshot.id],
+               Self.sameSourceDescriptor(existing.source, snapshot.source),
+               existing.hasAdapter == snapshot.hasAdapter,
+               failures[snapshot.id] == nil {
+                // Registry 的 source 描述可能带有初始化状态；运行时状态仍只由
+                // Store 投影，避免 snapshot 反向写入第二套连接事实。
+                existing.source.status = Self.projectedStatus(for: existing.state)
+                existing.hasAdapter = snapshot.hasAdapter
+                nextEntries.append(existing)
+                continue
+            }
+
+            if oldEntriesByID[snapshot.id] != nil {
+                cancelWork(for: snapshot.id)
+            }
+            let state: ResourceSourceState
+            if let failure = failures[snapshot.id] {
+                state = .failed(failure)
+            } else {
+                state = .disconnected
+            }
+            var source = snapshot.source
+            source.status = Self.projectedStatus(for: state)
+            nextEntries.append(
+                Entry(
+                    source: source,
+                    state: state,
+                    hasAdapter: snapshot.hasAdapter,
+                    browse: SourceBrowse()
+                )
+            )
+        }
+        entries = nextEntries
+    }
+
+    /// 便于 composition root 在完成 registry mutation 后显式同步 Store。
+    func sync(with snapshots: [SourceRegistrySnapshot], failures: [UUID: ResourceSourceError] = [:]) {
+        synchronize(with: snapshots, failures: failures)
     }
 
     // MARK: - 连接
@@ -224,6 +292,16 @@ final class SourcesStore {
         entries.first { $0.id == sourceID }
     }
 
+    /// 取消来源所有在途工作并递增代数，使迟到结果无法重新写入新来源状态。
+    private func cancelWork(for sourceID: UUID) {
+        _ = nextConnectionGeneration(for: sourceID)
+        _ = nextBrowseGeneration(for: sourceID)
+        connectionTasks[sourceID]?.cancel()
+        browseTasks[sourceID]?.cancel()
+        connectionTasks.removeValue(forKey: sourceID)
+        browseTasks.removeValue(forKey: sourceID)
+    }
+
     /// 状态写入的唯一入口：`ResourceSourceState` 是唯一事实源，
     /// `SourceStatus` 作为兼容投影同步更新。
     private func transition(_ sourceID: UUID, to state: ResourceSourceState) {
@@ -245,6 +323,20 @@ final class SourcesStore {
         case .failed:
             return .needsAttention
         }
+    }
+
+    /// `ResourceSource` also carries connection status and an item-count label,
+    /// both of which are Store-owned runtime projections. Dynamic registry sync
+    /// compares only the immutable source descriptor so adding or replacing one
+    /// source cannot clear another source's ready/browse state.
+    private static func sameSourceDescriptor(
+        _ lhs: ResourceSource,
+        _ rhs: ResourceSource
+    ) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.kind == rhs.kind
+            && lhs.endpoint == rhs.endpoint
     }
 
     private func nextConnectionGeneration(for sourceID: UUID) -> Int {

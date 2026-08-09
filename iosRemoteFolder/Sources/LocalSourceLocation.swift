@@ -57,6 +57,22 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
         self.bookmarkData = bookmarkData
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case bookmarkData
+    }
+
+    /// 解码时保留损坏的 bookmark，以便来源仍能显示为可行动的失效状态。
+    /// 只有真正访问位置时才解析并映射为 `invalidReference`，不会丢弃来源配置。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.bookmarkData = try container.decode(Data.self, forKey: .bookmarkData)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(bookmarkData, forKey: .bookmarkData)
+    }
+
     /// 在解析后的短暂 URL 闭包内执行操作；不向调用方返回 bookmark 或路径。
     func withResolvedURL<T>(_ body: (URL) throws -> T) throws -> T {
         var isStale = false
