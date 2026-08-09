@@ -17,10 +17,11 @@
 - PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口与假数据流程
 - D-035 自适应与无障碍壳已通过主程验收：辅助字号布局、VoiceOver 语义、Reduce Motion、方向声明和 disclosure 所有权均已收口
 - D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
+- D-028B 已通过主程复核：`ResourceViewerHost` 先经 `ResourceAccessService` 创建会话并获取最新 typed metadata，再进入占位 Viewer；加载、失败、取消和重试状态均有结构化生命周期
 
-当前正在进行：
+当前阶段：
 
-- D-028B 工作单已登记，当前推进 `ResourceViewerHost` 的会话状态门和生命周期接入：查看器先经 `ResourceAccessService` 获取真实 typed metadata，再显示占位壳或可行动错误；本阶段不读取内容字节、不实现解码器，也不扩展 WebDAV、Alist 或其他新协议。
+- D-028B 会话状态门已收口。下一阶段应单独登记 D-030 安全作用域、D-034 `ViewerResolver` 或 D-031 首个真实 TXT/PDF 内容切片，不得把当前占位 Viewer 误认为已完成内容解码。
 
 尚未完成：
 
@@ -48,4 +49,4 @@ iosRemoteFolder/
   UI/           主题、玻璃功能层和通用资源组件
 ```
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035 和 D-028A 均已验收，D-028B 工作单已登记并待执行 Agent 接手。
+当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A 和 D-028B 会话状态门均已完成主程复核，真实内容查看器与安全作用域仍待后续工作单。
