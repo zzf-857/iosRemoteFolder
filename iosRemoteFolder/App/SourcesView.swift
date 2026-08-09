@@ -98,8 +98,16 @@ struct SourcesView: View {
     }
 
     private func canReauthorize(_ entry: SourcesStore.Entry) -> Bool {
-        guard case .failed(let error) = entry.state else { return false }
-        return error == .authorizationRequired || error == .invalidReference
+        guard appModel.isManagedLocalSource(entry.id),
+              case .failed(let error) = entry.state else {
+            return false
+        }
+        switch error {
+        case .authorizationRequired, .invalidReference, .permissionDenied, .notFound:
+            return true
+        default:
+            return false
+        }
     }
 
     private func handleFolderImportResult(_ result: Result<[URL], Error>) {
