@@ -21,6 +21,7 @@ struct SourcesView: View {
             List {
                 Section {
                     Button {
+                        appModel.dismissSourceError()
                         reauthorizationSourceID = nil
                         isShowingFolderImporter = true
                     } label: {
@@ -56,6 +57,7 @@ struct SourcesView: View {
                             entry: entry,
                             retry: { store.retry(entry.id) },
                             reauthorize: canReauthorize(entry) ? {
+                                appModel.dismissSourceError()
                                 reauthorizationSourceID = entry.id
                                 isShowingFolderImporter = true
                             } : nil,
@@ -113,7 +115,12 @@ struct SourcesView: View {
     private func handleFolderImportResult(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            guard let url = urls.first else { return }
+            appModel.dismissSourceError()
+            guard let url = urls.first else {
+                appModel.sourceActionError = ResourceSourceError.invalidReference.localizedDescription
+                reauthorizationSourceID = nil
+                return
+            }
             if let sourceID = reauthorizationSourceID {
                 pendingAction = .reauthorize(sourceID, url)
             } else {
@@ -122,14 +129,24 @@ struct SourcesView: View {
             reauthorizationSourceID = nil
         case .failure(let error):
             reauthorizationSourceID = nil
-            guard !Self.isUserCancellation(error) else { return }
+            guard !Self.isUserCancellation(error) else {
+                appModel.dismissSourceError()
+                return
+            }
             appModel.sourceActionError = ResourceSourceError.mapping(error).localizedDescription
         }
     }
 
     private static func isUserCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
         let nsError = error as NSError
-        return nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError
+        return (nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError)
+            || (nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled)
     }
 }
 
