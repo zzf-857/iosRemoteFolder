@@ -1,20 +1,42 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum RemoteSourceTestingDefaults {
+    #if DEBUG
+    static let endpoint = "http://pan.zengxiansheng.top:5244/dav/"
+    static let name = "我的 Alist"
+    static let username = "test"
+    /// The password is supplied only through the debug launch environment and
+    /// is never persisted as a source descriptor or written into this target.
+    static var password: String {
+        ProcessInfo.processInfo.environment["IOSREMOTE_DEFAULT_ALIST_PASSWORD"] ?? ""
+    }
+    #else
+    static let endpoint = ""
+    static let name = ""
+    static let username = ""
+    static let password = ""
+    #endif
+}
+
 private struct RemoteSourceDraft: Identifiable {
     let id: UUID
     let sourceID: UUID?
     let name: String
     let endpoint: String
     let kind: ResourceSource.SourceKind
+    let username: String
+    let password: String
 
     static func adding() -> Self {
         Self(
             id: UUID(),
             sourceID: nil,
-            name: "",
-            endpoint: "",
-            kind: .webdav
+            name: RemoteSourceTestingDefaults.name,
+            endpoint: RemoteSourceTestingDefaults.endpoint,
+            kind: .alist,
+            username: RemoteSourceTestingDefaults.username,
+            password: RemoteSourceTestingDefaults.password
         )
     }
 
@@ -24,7 +46,9 @@ private struct RemoteSourceDraft: Identifiable {
             sourceID: source.id,
             name: source.name,
             endpoint: source.endpoint,
-            kind: source.kind
+            kind: source.kind,
+            username: "",
+            password: ""
         )
     }
 }
@@ -254,8 +278,8 @@ private struct RemoteSourceFormView: View {
 
     @State private var name: String
     @State private var endpoint: String
-    @State private var username = ""
-    @State private var password = ""
+    @State private var username: String
+    @State private var password: String
     @State private var kind: ResourceSource.SourceKind
 
     let draft: RemoteSourceDraft
@@ -270,6 +294,8 @@ private struct RemoteSourceFormView: View {
         _name = State(initialValue: draft.name)
         _endpoint = State(initialValue: draft.endpoint)
         _kind = State(initialValue: draft.kind)
+        _username = State(initialValue: draft.username)
+        _password = State(initialValue: draft.password)
     }
 
     private var canSubmit: Bool {
