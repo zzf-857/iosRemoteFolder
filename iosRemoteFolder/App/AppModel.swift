@@ -56,15 +56,28 @@ final class AppModel {
     ) {
         let sharedContainer: ModelContainer?
         if let modelContainer {
+            guard configurationStore == nil, remoteConfigurationStore == nil else {
+                fatalError("显式 ModelContainer 不能与配置 store 混合注入")
+            }
             sharedContainer = modelContainer
-        } else if configurationStore == nil || remoteConfigurationStore == nil {
+        } else if let configurationStore, let remoteConfigurationStore {
+            guard ObjectIdentifier(configurationStore.modelContainer)
+                    == ObjectIdentifier(remoteConfigurationStore.modelContainer) else {
+                fatalError("本地和远端配置 store 必须共享同一个 ModelContainer")
+            }
+            sharedContainer = nil
+        } else if let configurationStore {
+            // 测试/预览只注入一侧时，另一侧必须复用已注入的容器，
+            // 不能悄悄创建第二份持久化来源事实。
+            sharedContainer = configurationStore.modelContainer
+        } else if let remoteConfigurationStore {
+            sharedContainer = remoteConfigurationStore.modelContainer
+        } else {
             do {
                 sharedContainer = try SourceConfigurationPersistence.makePersistentContainer()
             } catch {
                 fatalError("无法创建来源配置容器：\(error.localizedDescription)")
             }
-        } else {
-            sharedContainer = nil
         }
 
         let store: LocalSourceConfigurationStore

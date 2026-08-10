@@ -266,6 +266,147 @@ struct SourcesStoreTests {
     }
 }
 
+@Suite("SwiftData 来源配置迁移")
+@MainActor
+struct SourceConfigurationMigrationTests {
+    private struct LocalLegacyPayload: Codable {
+        let version: Int
+        let configurations: [LocalSourceConfiguration]
+    }
+
+    private struct RemoteLegacyPayload: Codable {
+        let version: Int
+        let configurations: [RemoteSourceConfiguration]
+    }
+
+    @Test("旧本地 payload 只迁移一次并在重建 store 后恢复")
+    func migratesLocalPayloadAndRestoresFromSharedContainer() throws {
+        let suiteName = "iosRemoteFolder.local-migration.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let configuration = LocalSourceConfiguration(
+            id: UUID(),
+            displayName: "文档",
+            endpointDescription: "Files 文件夹",
+            location: try LocalSourceLocation(bookmarkData: Data([1, 2, 3]))
+        )
+        let payload = LocalLegacyPayload(version: 1, configurations: [configuration])
+        defaults.set(
+            try JSONEncoder().encode(payload),
+            forKey: "localSourceConfigurations.v1"
+        )
+
+        let first = LocalSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        #expect(try first.load() == [configuration])
+        #expect(defaults.data(forKey: "localSourceConfigurations.v1") == nil)
+
+        let restored = LocalSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        #expect(try restored.load() == [configuration])
+    }
+
+    @Test("旧远端 payload 迁移后保留 endpoint 与凭证引用")
+    func migratesRemotePayloadAndRestoresFromSharedContainer() throws {
+        let suiteName = "iosRemoteFolder.remote-migration.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let configuration = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "家庭 Alist",
+            endpoint: URL(string: "https://example.com/dav/")!,
+            kind: .alist,
+            credentialReference: UUID().uuidString.lowercased()
+        )
+        let payload = RemoteLegacyPayload(version: 1, configurations: [configuration])
+        defaults.set(
+            try JSONEncoder().encode(payload),
+            forKey: "remoteSourceConfigurations.v1"
+        )
+
+        let first = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        #expect(try first.load() == [configuration])
+        #expect(defaults.data(forKey: "remoteSourceConfigurations.v1") == nil)
+
+        let restored = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        #expect(try restored.load() == [configuration])
+    }
+
+    @Test("已有 SwiftData 记录优先于遗留 payload，并清理遗留 key")
+    func existingRecordsWinOverLegacyPayload() throws {
+        let suiteName = "iosRemoteFolder.migration-precedence.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let stored = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "已保存来源",
+            endpoint: URL(string: "https://example.com/dav/")!,
+            kind: .webdav,
+            credentialReference: nil
+        )
+        let legacy = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "旧来源",
+            endpoint: URL(string: "https://legacy.example.com/dav/")!,
+            kind: .webdav,
+            credentialReference: nil
+        )
+        let store = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        try store.save([stored])
+        defaults.set(
+            try JSONEncoder().encode(
+                RemoteLegacyPayload(version: 1, configurations: [legacy])
+            ),
+            forKey: "remoteSourceConfigurations.v1"
+        )
+
+        let restored = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        #expect(try restored.load() == [stored])
+        #expect(defaults.data(forKey: "remoteSourceConfigurations.v1") == nil)
+    }
+
+    @Test("AppModel 只注入一侧 store 时复用同一 ModelContainer")
+    func appModelReusesInjectedContainerForMissingStore() throws {
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let remote = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "共享容器来源",
+            endpoint: URL(string: "https://example.com/dav/")!,
+            kind: .webdav,
+            credentialReference: nil
+        )
+        let remoteStore = RemoteSourceConfigurationStore(modelContainer: container)
+        try remoteStore.save([remote])
+
+        let localStore = LocalSourceConfigurationStore(modelContainer: container)
+        let model = AppModel(configurationStore: localStore)
+
+        #expect(model.sources.contains { $0.id == remote.id })
+    }
+}
+
 /// 在超时前轮询等待条件成立；超时记录测试失败。
 @MainActor
 func waitUntil(timeout: Duration = .seconds(3), _ condition: @MainActor () -> Bool) async throws {

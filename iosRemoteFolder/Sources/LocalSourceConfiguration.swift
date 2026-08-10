@@ -74,7 +74,8 @@ final class LocalSourceConfigurationStore {
     private static let currentVersion = 1
     private static let storageKey = "localSourceConfigurations.v1"
 
-    private let modelContainer: ModelContainer
+    /// 供 composition root 在混合注入时复用同一容器；不向 UI 或 adapter 暴露。
+    let modelContainer: ModelContainer
     private let modelContext: ModelContext
     private let migrationDefaults: UserDefaults
     private(set) var configurations: [LocalSourceConfiguration]
