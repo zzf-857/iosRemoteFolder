@@ -139,6 +139,113 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test("重定向只允许同源且仍在 endpoint 根路径内")
+    func redirectsStayWithinTrustedRoot() async throws {
+        let sameOriginTarget = URL(string: "https://dav.test/dav/redirected/")!
+        let crossOriginTarget = URL(string: "https://evil.test/dav/")!
+        let escapedRootTarget = URL(string: "https://dav.test/private/")!
+
+        WebDAVMockURLProtocol.reset()
+        let sameOriginAuth = TestBox<String?>(nil)
+        WebDAVMockURLProtocol.register(Self.endpoint) { request in
+            .redirect(status: 307, location: sameOriginTarget)
+        }
+        WebDAVMockURLProtocol.register(sameOriginTarget) { request in
+            sameOriginAuth.value = request.value(forHTTPHeaderField: "Authorization")
+            return .respond(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                body: Self.directoryResponse
+            )
+        }
+
+        let sameOriginAdapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            username: "user",
+            password: "pass",
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        try await sameOriginAdapter.connect()
+        #expect(sameOriginAuth.value == "Basic dXNlcjpwYXNz")
+
+        WebDAVMockURLProtocol.reset()
+        let crossOriginReached = TestBox(false)
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .redirect(status: 302, location: crossOriginTarget)
+        }
+        WebDAVMockURLProtocol.register(crossOriginTarget) { _ in
+            crossOriginReached.value = true
+            return .respond(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                body: Self.directoryResponse
+            )
+        }
+
+        let crossOriginAdapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            username: "user",
+            password: "pass",
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        await #expect(throws: ResourceSourceError.unsafeRedirect) {
+            try await crossOriginAdapter.connect()
+        }
+        #expect(!crossOriginReached.value)
+
+        WebDAVMockURLProtocol.reset()
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .redirect(status: 307, location: escapedRootTarget)
+        }
+        let escapedRootAdapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        await #expect(throws: ResourceSourceError.unsafeRedirect) {
+            try await escapedRootAdapter.connect()
+        }
+    }
+
+    @Test("WebDAV 委托的内容读取同样拒绝跨 origin 重定向")
+    func delegatedContentReadRejectsCrossOriginRedirect() async throws {
+        let crossOriginTarget = URL(string: "https://evil.test/dav/file.txt")!
+        WebDAVMockURLProtocol.reset()
+        let crossOriginReached = TestBox(false)
+        WebDAVMockURLProtocol.register(Self.endpoint) { request in
+            .respond(
+                status: 207,
+                headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
+                body: Self.directoryResponse
+            )
+        }
+        WebDAVMockURLProtocol.register(Self.fileURL) { _ in
+            .redirect(status: 307, location: crossOriginTarget)
+        }
+        WebDAVMockURLProtocol.register(crossOriginTarget) { _ in
+            crossOriginReached.value = true
+            return .respond(status: 206, headers: ["Content-Range": "bytes 0-0/5"], body: Data("a".utf8))
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            username: "user",
+            password: "pass",
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        let item = try #require(try await adapter.listResources(at: .root).first)
+        await #expect(throws: ResourceSourceError.unsafeRedirect) {
+            _ = try await adapter.readData(
+                for: item,
+                range: ResourceByteRange(lowerBound: 0, upperBound: 0)
+            )
+        }
+        #expect(!crossOriginReached.value)
+    }
+
     private static let directoryResponse = Data(
         """
         <?xml version="1.0" encoding="utf-8"?>
@@ -190,6 +297,7 @@ struct WebDAVSourceAdapterTests {
 private final class WebDAVMockURLProtocol: URLProtocol {
     enum Outcome: Sendable {
         case respond(status: Int, headers: [String: String], body: Data)
+        case redirect(status: Int, location: URL)
     }
 
     typealias Handler = @Sendable (URLRequest) -> Outcome
@@ -250,10 +358,34 @@ private final class WebDAVMockURLProtocol: URLProtocol {
                 client?.urlProtocol(self, didLoad: body)
                 client?.urlProtocolDidFinishLoading(self)
             }
+        case .redirect(let status, let location):
+            guard let url = request.url,
+                  let response = HTTPURLResponse(
+                      url: url,
+                      statusCode: status,
+                      httpVersion: "HTTP/1.1",
+                      headerFields: ["Location": location.absoluteString]
+                  ) else {
+                deliver { client?.urlProtocol(self, didFailWithError: URLError(.badURL)) }
+                return
+            }
+            var redirected = URLRequest(url: location)
+            redirected.httpMethod = request.httpMethod
+            redirected.allHTTPHeaderFields = request.allHTTPHeaderFields
+            deliver {
+                client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
+            }
         }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        // URLSession may stop the original protocol instance after it asks the
+        // task delegate to accept or reject a redirect. Complete that instance
+        // so rejected redirects do not linger until the request timeout.
+        guard !delivered else { return }
+        delivered = true
+        client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+    }
 
     private func deliver(_ body: () -> Void) {
         guard !delivered else { return }

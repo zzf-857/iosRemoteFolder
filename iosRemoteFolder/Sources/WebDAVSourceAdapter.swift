@@ -1,4 +1,5 @@
 import Foundation
+import os.lock
 import UniformTypeIdentifiers
 
 /// Standard WebDAV / Alist `/dav/` source adapter.
@@ -12,6 +13,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
     private let endpoint: URL
     private let requestHeaders: [String: String]
+    private let redirectDelegate: WebDAVRedirectDelegate
     private let session: URLSession
     private let timeout: TimeInterval
     private var metadataByPath: [String: ResourceMetadata] = [:]
@@ -32,19 +34,28 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         guard timeout > 0, timeout.isFinite else {
             throw ResourceSourceError.invalidReference
         }
-        self.source = source
-        self.endpoint = try Self.normalizedEndpoint(endpoint)
+        let normalizedEndpoint = try Self.normalizedEndpoint(endpoint)
         self.timeout = timeout
 
         let trimmedUsername = username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let trimmedPassword = password ?? ""
+        let authorizationHeader: String?
         if !trimmedUsername.isEmpty || !trimmedPassword.isEmpty {
             let credential = Data("\(trimmedUsername):\(trimmedPassword)".utf8)
                 .base64EncodedString()
-            self.requestHeaders = ["Authorization": "Basic \(credential)"]
+            let header = "Basic \(credential)"
+            authorizationHeader = header
+            self.requestHeaders = ["Authorization": header]
         } else {
+            authorizationHeader = nil
             self.requestHeaders = [:]
         }
+        self.source = source
+        self.endpoint = normalizedEndpoint
+        self.redirectDelegate = try WebDAVRedirectDelegate(
+            endpoint: normalizedEndpoint,
+            authorization: authorizationHeader
+        )
 
         if let session {
             self.session = session
@@ -131,6 +142,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
             source: source,
             descriptors: [descriptor],
             session: session,
+            taskDelegate: redirectDelegate,
             timeout: timeout
         )
 
@@ -165,6 +177,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
             source: source,
             descriptors: [descriptor],
             session: session,
+            taskDelegate: redirectDelegate,
             timeout: timeout
         )
         return try await httpAdapter.readData(for: item, range: range)
@@ -192,14 +205,20 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await session.data(for: request, delegate: redirectDelegate)
         } catch {
+            if redirectDelegate.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
             throw ResourceSourceError.mapping(error)
         }
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ResourceSourceError.unavailable
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
+            if (300..<400).contains(httpResponse.statusCode) {
+                throw ResourceSourceError.unsafeRedirect
+            }
             throw ResourceSourceError.http(statusCode: httpResponse.statusCode)
         }
         if let contentLength = Self.headerValue("Content-Length", in: httpResponse)
@@ -463,6 +482,108 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         let etag: String?
         let serverVersion: String?
         let statusCode: Int?
+    }
+}
+
+/// URLSession task delegate used only by WebDAV/Alist requests.
+///
+/// Redirects can otherwise move a request carrying Basic Authorization to a
+/// different host or out of the configured `/dav/` root. The delegate refuses
+/// those redirects before URLSession creates the follow-up request.
+private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HTTPRedirectFailureReporting, Sendable {
+    private let scheme: String
+    private let host: String
+    private let port: Int
+    private let basePathComponents: [String]
+    private let authorization: String?
+    private let rejection = OSAllocatedUnfairLock(initialState: false)
+
+    init(endpoint: URL, authorization: String?) throws {
+        guard let scheme = endpoint.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = endpoint.host?.lowercased(),
+              endpoint.user == nil,
+              endpoint.password == nil,
+              endpoint.query == nil,
+              endpoint.fragment == nil,
+              let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              let decodedPath = components.percentEncodedPath.removingPercentEncoding else {
+            throw ResourceSourceError.invalidReference
+        }
+
+        let pathComponents = decodedPath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard !pathComponents.contains("."), !pathComponents.contains("..") else {
+            throw ResourceSourceError.invalidReference
+        }
+
+        self.scheme = scheme
+        self.host = host
+        self.port = endpoint.port ?? (scheme == "https" ? 443 : 80)
+        self.basePathComponents = pathComponents
+        self.authorization = authorization
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard let url = request.url,
+              allows(url),
+              let expectedMethod = task.currentRequest?.httpMethod
+                ?? task.originalRequest?.httpMethod,
+              request.httpMethod?.uppercased() == expectedMethod.uppercased() else {
+            rejection.withLock { $0 = true }
+            task.cancel()
+            completionHandler(nil)
+            return
+        }
+
+        var safeRequest = request
+        if let authorization {
+            safeRequest.setValue(authorization, forHTTPHeaderField: "Authorization")
+        } else {
+            safeRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        completionHandler(safeRequest)
+    }
+
+    func consumeUnsafeRedirect() -> Bool {
+        rejection.withLock {
+            let wasRejected = $0
+            $0 = false
+            return wasRejected
+        }
+    }
+
+    private func allows(_ url: URL) -> Bool {
+        guard let candidateScheme = url.scheme?.lowercased(),
+              let candidateHost = url.host?.lowercased(),
+              candidateScheme == scheme,
+              candidateHost == host,
+              (url.port ?? (candidateScheme == "https" ? 443 : 80)) == port,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let decodedPath = components.percentEncodedPath.removingPercentEncoding else {
+            return false
+        }
+
+        let pathComponents = decodedPath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard !pathComponents.contains("."),
+              !pathComponents.contains(".."),
+              pathComponents.starts(with: basePathComponents) else {
+            return false
+        }
+        return true
     }
 }
 

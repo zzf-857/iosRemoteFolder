@@ -1,6 +1,14 @@
 import Foundation
 import UniformTypeIdentifiers
 
+/// Optional redirect policy feedback used by WebDAV requests. URLSession's
+/// async convenience APIs surface a rejected redirect as cancellation (and a
+/// custom URLProtocol may surface it as timeout), so the policy carries the
+/// more specific source error back to the request boundary.
+protocol HTTPRedirectFailureReporting: AnyObject, Sendable {
+    func consumeUnsafeRedirect() -> Bool
+}
+
 /// HTTP/HTTPS 资源描述：一个来源由一组预先配置的远端 URL 组成。
 ///
 /// Scheme 契约：`url` 只允许 `http` 与 `https`；其他 scheme 会在 adapter
@@ -58,6 +66,8 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     private let hasInvalidDescriptor: Bool
 
     private let session: URLSession
+    /// WebDAV 可注入同源重定向策略；普通 HTTP 直链保持系统既有策略。
+    private let taskDelegate: URLSessionTaskDelegate?
     private let timeout: TimeInterval
     private let maxRangeFallbackBytes: Int64
     /// 已验证的 Range 能力缓存：只有服务端响应证据才能写入。
@@ -67,10 +77,12 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         source: ResourceSource,
         descriptors: [HTTPResourceDescriptor],
         session: URLSession? = nil,
+        taskDelegate: URLSessionTaskDelegate? = nil,
         timeout: TimeInterval = 15,
         maxRangeFallbackBytes: Int64 = HTTPSourceAdapter.defaultMaxRangeFallbackBytes
     ) {
         self.source = source
+        self.taskDelegate = taskDelegate
         self.timeout = timeout
         self.maxRangeFallbackBytes = maxRangeFallbackBytes
 
@@ -347,15 +359,19 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await session.data(for: request, delegate: taskDelegate)
         } catch {
+            if let redirectPolicy = taskDelegate as? any HTTPRedirectFailureReporting,
+               redirectPolicy.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
             throw ResourceSourceError.mapping(error)
         }
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ResourceSourceError.unavailable
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
-            throw ResourceSourceError.http(statusCode: httpResponse.statusCode)
+            throw responseError(for: httpResponse)
         }
         return (data, httpResponse)
     }
@@ -370,8 +386,12 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
-            (bytes, response) = try await session.bytes(for: request)
+            (bytes, response) = try await session.bytes(for: request, delegate: taskDelegate)
         } catch {
+            if let redirectPolicy = taskDelegate as? any HTTPRedirectFailureReporting,
+               redirectPolicy.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
             throw ResourceSourceError.mapping(error)
         }
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -380,9 +400,16 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
             bytes.task.cancel()
-            throw ResourceSourceError.http(statusCode: httpResponse.statusCode)
+            throw responseError(for: httpResponse)
         }
         return (httpResponse, bytes)
+    }
+
+    private func responseError(for response: HTTPURLResponse) -> ResourceSourceError {
+        if taskDelegate != nil, (300..<400).contains(response.statusCode) {
+            return .unsafeRedirect
+        }
+        return .http(statusCode: response.statusCode)
     }
 
     /// 探测请求：只消费状态与响应头，立即取消任务释放连接，避免拉取全量内容。
@@ -503,11 +530,18 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         from response: HTTPURLResponse,
         descriptor: HTTPResourceDescriptor
     ) -> ResourceMetadata {
+        let hasVerifiedPartialEvidence = response.statusCode == 206
+            ? verifiedRangeProbeEvidence(from: response)
+            : false
         let byteSize: Int64?
         if response.statusCode == 206 {
             // A partial HEAD response has the same single-fragment semantics as
             // a partial GET: never treat Content-Length (often 1) as full size.
-            byteSize = contentRangeTotalLength(from: response)
+            // Without a valid 0-0 probe shape, the response is not evidence for
+            // either the complete size or Range support.
+            byteSize = hasVerifiedPartialEvidence
+                ? contentRangeTotalLength(from: response)
+                : nil
         } else if response.expectedContentLength >= 0 {
             byteSize = Int64(response.expectedContentLength)
         } else {
@@ -521,7 +555,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             mimeType: mimeType,
             typeIdentifier: typeIdentifier(forMIMEType: mimeType, descriptor: descriptor),
             isDirectory: false,
-            acceptsRanges: acceptsByteRanges(response),
+            acceptsRanges: response.statusCode == 206
+                ? hasVerifiedPartialEvidence
+                : acceptsByteRanges(response),
             revision: revision(from: response, modifiedAt: modifiedAt, byteSize: byteSize)
         )
     }
