@@ -21,6 +21,8 @@
 - D-030A 已通过 Codex 主程复核：Local adapter 增加 bookmark 位置值、stale/失效重新授权错误、平衡 security-scoped lease 和 `NSFileCoordinator` 协调访问
 - D-030B 已实现，主程构建/测试基线复核通过，真实 Files Provider 生命周期待验证：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
 - D-033A/D-033B 已实现 WebDAV/Alist `/dav/` 读取与来源恢复闭环：Sources 页面可添加远端来源，非敏感 descriptor 通过版本化窄存储恢复，用户名/密码只通过 Keychain credential reference 关联；`PROPFIND Depth: 0/1` 解析 `DAV:` namespace、目录、typed metadata/revision，Basic Auth 只在运行时请求头中传递，GET/Range 复用现有 HTTP 传输与预算/取消/响应校验，Info.plist 声明本地网络用途并启用最小本地 ATS 例外
+- D-033C 已实现 WebDAV/Alist 重定向安全边界：PROPFIND、HEAD/Range 和完整 GET 只接受同源且仍位于规范化 endpoint 根路径内的跳转；跨 origin、路径逃逸、query/fragment、URL 凭证和 method 改写被拒绝，HTTP 直链保留既有行为；异常 `HEAD 206` 不会伪造完整大小或 Range 能力
+- iOS 26 AppIcon 基础资源已接入 Asset Catalog：无文字文件夹/远程入口符号、1024px marketing 图和 iPhone/iPad 多尺寸图标已加入 App target
 - D-036/D-037/D-038/D-039/D-040 功能闭环切片已实现：`ViewerRegistry` 按 typed metadata/UTType/MIME/扩展名解析，TXT 使用显式 10 MiB 预算和编码探测，PDF/图片/视频使用显式 50 MiB 预算，演示图片通过原生缩放/平移查看器呈现，演示音频通过 `AVAudioPlayer` 播放，演示视频通过内存资源加载器交给 `AVPlayer` 播放；D-030B 外部 Provider 证据、SwiftData/Keychain 和其他协议仍未提前视为完成
 - D-041 已实现：成功打开的资源按 `ResourceIdentity` 去重并恢复到 Home 的“继续/最近打开”，最多保留 20 条；临时存储不含 URL、请求头、Token、Cookie 或绝对路径，后续迁移到 SwiftData 不改变身份键语义
 - D-042 已实现：音频/视频查看器按 `ResourceIdentity + ResourceRevision` 保存和恢复播放时间点；unknown 或变化的 revision 不恢复，视频异步时长解析后再恢复
@@ -30,7 +32,7 @@
 
 当前阶段：
 
-- D-030B Files 来源配置生命周期已实现，主程构建/测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-033A/D-033B 已完成 WebDAV/Alist `/dav/` 的 adapter、来源添加、descriptor/Keychain 恢复、目录浏览和内容读取接线，真实 WebDAV/NAS/Alist 服务互操作、跨 origin 重定向策略和 SwiftData 全量迁移仍待专项验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复，D-044 已接通 revision-aware 内容缓存，D-045 已接通缓存内容离线查看。
+- D-030B Files 来源配置生命周期已实现，主程构建/测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-033A/D-033B/D-033C 已完成 WebDAV/Alist `/dav/` 的 adapter、来源添加、descriptor/Keychain 恢复、目录浏览、内容读取和重定向安全接线，真实 WebDAV/NAS/Alist 服务互操作、DNS rebinding 和 SwiftData 全量迁移仍待专项验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复，D-044 已接通 revision-aware 内容缓存，D-045 已接通缓存内容离线查看。
 
 尚未完成：
 
