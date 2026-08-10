@@ -86,6 +86,20 @@ enum SampleData {
             accent: .blue
         ),
         ResourceItem(
+            sourceID: workSourceID,
+            logicalPath: ResourcePath(rawValue: "/产品/路线图封面.png")!,
+            name: "路线图封面.png",
+            kind: .image,
+            metadata: metadata(
+                byteSize: 68,
+                modifiedAt: Date(timeIntervalSince1970: 1_754_700_000),
+                mimeType: "image/png",
+                typeIdentifier: "public.png"
+            ),
+            capabilities: [.read, .download, .thumbnail],
+            accent: .teal
+        ),
+        ResourceItem(
             sourceID: localSourceID,
             logicalPath: ResourcePath(rawValue: "/照片/旅行/海边-2026-01.jpg")!,
             name: "海边-2026-01.jpg",

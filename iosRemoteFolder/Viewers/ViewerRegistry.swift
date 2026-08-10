@@ -15,6 +15,7 @@ enum ViewerPreparation: Hashable, Sendable {
     case none
     case text(maximumBytes: Int64)
     case pdf(maximumBytes: Int64)
+    case image(maximumBytes: Int64)
 }
 
 struct ViewerResolution: Hashable, Sendable {
@@ -77,7 +78,11 @@ struct ViewerRegistry {
                 fallbackDescription: nil
             )
         case .image:
-            return ViewerResolution(kind: .imageViewer, preparation: .none, fallbackDescription: nil)
+            return ViewerResolution(
+                kind: .imageViewer,
+                preparation: .image(maximumBytes: 50 * 1024 * 1024),
+                fallbackDescription: nil
+            )
         case .video:
             return ViewerResolution(kind: .videoPlayer, preparation: .none, fallbackDescription: nil)
         case .audio:

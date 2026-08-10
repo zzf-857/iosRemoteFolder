@@ -271,6 +271,11 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
                 2026-08-10 09:04 通过受控会话读取文本
                 """.utf8
             )
+        case "/产品/路线图封面.png":
+            // A tiny valid raster keeps the demo path offline and deterministic.
+            return Data(
+                base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
         case "/知识库/设计/设计系统与组件规范.pdf":
             return Self.makePDF()
         default:

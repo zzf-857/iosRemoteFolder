@@ -87,7 +87,11 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "文本内容读取无效")
             }
         case .imageViewer:
-            ImageViewerView(resource: resource)
+            if case .image(let data) = payload {
+                ImageViewerView(resource: resource, data: data)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "图片内容读取无效")
+            }
         case .videoPlayer:
             VideoPlayerView(resource: resource)
         case .musicPlayer:
@@ -197,6 +201,13 @@ struct ResourceViewerHost: View {
                     throw ResourceSourceError.invalidResponse
                 }
                 payload = .pdf(data)
+            case .image(let maximumBytes):
+                let data = try await createdSession.readData(maximumBytes: maximumBytes)
+                try Task.checkCancellation()
+                guard ViewerContentDecoder.isValidImageData(data) else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .image(data)
             }
             try Task.checkCancellation()
             result = .ready(request.identity, metadata, resolution, payload)
@@ -229,9 +240,14 @@ struct ResourceViewerHost: View {
 enum ViewerContentPayload: Equatable, Sendable {
     case text(String)
     case pdf(Data)
+    case image(Data)
 }
 
 enum ViewerContentDecoder {
+    static func isValidImageData(_ data: Data) -> Bool {
+        UIImage(data: data) != nil
+    }
+
     static func decodeText(_ data: Data) -> String {
         let bytes = Array(data)
         let encodings: [String.Encoding]
@@ -369,26 +385,77 @@ struct TextReaderView: View {
 
 struct ImageViewerView: View {
     let resource: ResourceItem
+    let data: Data
+
+    @State private var committedScale: CGFloat = 1
+    @State private var gestureScale: CGFloat = 1
+    @State private var committedOffset: CGSize = .zero
+    @State private var gestureOffset: CGSize = .zero
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 16) {
-                Image(systemName: "photo.fill")
-                    .font(.system(size: 72))
-                    .foregroundStyle(AppTheme.accent)
-                Text(resource.name)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                Text("Nuke/NukeUI 原图管线与自有缩放画布")
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.65))
+            if let image = UIImage(data: data) {
+                GeometryReader { proxy in
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .scaleEffect(committedScale * gestureScale)
+                        .offset(
+                            x: committedOffset.width + gestureOffset.width,
+                            y: committedOffset.height + gestureOffset.height
+                        )
+                        .contentShape(Rectangle())
+                        .gesture(
+                            MagnificationGesture()
+                                .onChanged { value in
+                                    gestureScale = value
+                                }
+                                .onEnded { value in
+                                    committedScale = min(max(committedScale * value, 1), 4)
+                                    gestureScale = 1
+                                    if committedScale == 1 {
+                                        committedOffset = .zero
+                                    }
+                                }
+                        )
+                        .simultaneousGesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    guard committedScale > 1 || gestureScale > 1 else { return }
+                                    gestureOffset = value.translation
+                                }
+                                .onEnded { value in
+                                    guard committedScale > 1 else {
+                                        gestureOffset = .zero
+                                        return
+                                    }
+                                    committedOffset.width += value.translation.width
+                                    committedOffset.height += value.translation.height
+                                    gestureOffset = .zero
+                                }
+                        )
+                        .accessibilityElement()
+                        .accessibilityLabel(Text("\(resource.name)，图片"))
+                        .accessibilityValue(Text("可缩放和平移"))
+                }
+            } else {
+                ContentUnavailableView(
+                    "无法显示图片",
+                    systemImage: "photo",
+                    description: Text("文件内容不是有效的图片。")
+                )
             }
         }
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("收藏", systemImage: "star") {}
-                Button("信息", systemImage: "info.circle") {}
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("重置", systemImage: "arrow.counterclockwise") {
+                    committedScale = 1
+                    gestureScale = 1
+                    committedOffset = .zero
+                    gestureOffset = .zero
+                }
             }
         }
         .toolbarBackground(.hidden, for: .navigationBar)

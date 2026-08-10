@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import Testing
+import UIKit
 import UniformTypeIdentifiers
 
 @testable import iosRemoteFolder
@@ -601,6 +602,23 @@ struct ViewerResolutionTests {
         #expect(resolution.preparation == .pdf(maximumBytes: 50 * 1024 * 1024))
     }
 
+    @Test("图片解析使用显式预算并拒绝非图片字节")
+    func resolvesImageContent() {
+        let item = makeItem(path: "/photo.jpg", kind: .unknown)
+        let metadata = ResourceMetadata(
+            mimeType: "image/jpeg",
+            typeIdentifier: UTType.jpeg.identifier
+        )
+
+        let resolution = ViewerRegistry.resolve(resource: item, metadata: metadata)
+
+        #expect(resolution.kind == .imageViewer)
+        #expect(resolution.preparation == .image(maximumBytes: 50 * 1024 * 1024))
+        let imageData = UIImage(systemName: "photo")!.pngData()!
+        #expect(ViewerContentDecoder.isValidImageData(imageData))
+        #expect(!ViewerContentDecoder.isValidImageData(Data("not an image".utf8)))
+    }
+
     @Test("Markdown 与通用文本证据兼容，但真正冲突降级")
     func resolvesMarkdownAndRejectsConflict() {
         let markdown = makeItem(path: "/notes/readme.md", kind: .unknown)
@@ -671,5 +689,18 @@ struct SampleSourceContentTests {
         let pdfData = try await pdfSession.readData(maximumBytes: 50 * 1024 * 1024)
         #expect(pdfData.starts(with: Data("%PDF-1.4".utf8)))
         #expect(PDFDocument(data: pdfData) != nil)
+    }
+
+    @Test("演示来源经内容会话返回可解码图片字节")
+    func readsDemoImageThroughSession() async throws {
+        let imageSource = SampleData.sources.first { $0.id == SampleData.workSourceID }!
+        let imageItem = SampleData.resources.first { $0.path == "/产品/路线图封面.png" }!
+        let adapter = SampleSourceAdapter(source: imageSource)
+        let registry = try SourceRegistry(sources: [imageSource], adapters: [adapter])
+        let session = try await ResourceAccessService(registry: registry)
+            .makeSession(for: imageItem)
+        let imageData = try await session.readData(maximumBytes: 50 * 1024 * 1024)
+
+        #expect(UIImage(data: imageData) != nil)
     }
 }
