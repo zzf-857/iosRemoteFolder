@@ -1,4 +1,6 @@
 import SwiftUI
+import PDFKit
+import UIKit
 
 struct ResourceViewerHost: View {
     @Environment(AppModel.self) private var appModel
@@ -14,7 +16,7 @@ struct ResourceViewerHost: View {
 
     private enum LoadState: Equatable {
         case loading
-        case ready(ResourceIdentity, ResourceMetadata)
+        case ready(ResourceIdentity, ResourceMetadata, ViewerResolution, ViewerContentPayload?)
         case failed(ResourceIdentity, ResourceSourceError)
         case cancelled(ResourceIdentity)
     }
@@ -28,8 +30,8 @@ struct ResourceViewerHost: View {
             switch loadState {
             case .loading:
                 loadingView
-            case .ready(let identity, let metadata) where identity == resource.id:
-                readyView(metadata: metadata)
+            case .ready(let identity, let metadata, let resolution, let payload) where identity == resource.id:
+                readyView(metadata: metadata, resolution: resolution, payload: payload)
             case .failed(let identity, let error) where identity == resource.id:
                 failureView(error: error)
             case .cancelled(let identity) where identity == resource.id:
@@ -48,22 +50,37 @@ struct ResourceViewerHost: View {
     }
 
     @ViewBuilder
-    private func readyView(metadata: ResourceMetadata) -> some View {
+    private func readyView(
+        metadata: ResourceMetadata,
+        resolution: ViewerResolution,
+        payload: ViewerContentPayload?
+    ) -> some View {
         VStack(spacing: 0) {
             metadataSummary(metadata)
-            viewerView
+            viewerView(resolution: resolution, payload: payload)
         }
     }
 
     @ViewBuilder
-    private var viewerView: some View {
-        switch ViewerRegistry.viewer(for: resource) {
+    private func viewerView(
+        resolution: ViewerResolution,
+        payload: ViewerContentPayload?
+    ) -> some View {
+        switch resolution.kind {
         case .pdfReader:
-            PDFReaderView(resource: resource)
+            if case .pdf(let data) = payload {
+                PDFReaderView(resource: resource, data: data)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "PDF 内容读取无效")
+            }
         case .markdownReader:
             MarkdownReaderView(resource: resource)
         case .textReader:
-            TextReaderView(resource: resource)
+            if case .text(let text) = payload {
+                TextReaderView(resource: resource, text: text)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "文本内容读取无效")
+            }
         case .imageViewer:
             ImageViewerView(resource: resource)
         case .videoPlayer:
@@ -71,7 +88,7 @@ struct ResourceViewerHost: View {
         case .musicPlayer:
             MusicPlayerView(resource: resource)
         case .systemPreview:
-            UnsupportedViewerView(resource: resource)
+            UnsupportedViewerView(resource: resource, reason: resolution.fallbackDescription)
         }
     }
 
@@ -159,8 +176,25 @@ struct ResourceViewerHost: View {
             let createdSession = try await appModel.resourceAccessService.makeSession(for: resource)
             session = createdSession
             let metadata = try await createdSession.fetchMetadata()
+            let resolution = ViewerRegistry.resolve(resource: resource, metadata: metadata)
+            let payload: ViewerContentPayload?
+            switch resolution.preparation {
+            case .none:
+                payload = nil
+            case .text(let maximumBytes):
+                let data = try await createdSession.readData(maximumBytes: maximumBytes)
+                try Task.checkCancellation()
+                payload = .text(ViewerContentDecoder.decodeText(data))
+            case .pdf(let maximumBytes):
+                let data = try await createdSession.readData(maximumBytes: maximumBytes)
+                try Task.checkCancellation()
+                guard PDFDocument(data: data) != nil else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .pdf(data)
+            }
             try Task.checkCancellation()
-            result = .ready(request.identity, metadata)
+            result = .ready(request.identity, metadata, resolution, payload)
         } catch {
             result = state(for: error, identity: request.identity)
         }
@@ -187,37 +221,77 @@ struct ResourceViewerHost: View {
     }
 }
 
+enum ViewerContentPayload: Equatable, Sendable {
+    case text(String)
+    case pdf(Data)
+}
+
+enum ViewerContentDecoder {
+    static func decodeText(_ data: Data) -> String {
+        let bytes = Array(data)
+        let encodings: [String.Encoding]
+        if hasPrefix(bytes, [0xFF, 0xFE, 0x00, 0x00]) || hasPrefix(bytes, [0x00, 0x00, 0xFE, 0xFF]) {
+            encodings = [.utf32, .utf32LittleEndian, .utf32BigEndian, .utf8]
+        } else if hasPrefix(bytes, [0xFF, 0xFE]) || hasPrefix(bytes, [0xFE, 0xFF]) {
+            encodings = [.utf16, .utf16LittleEndian, .utf16BigEndian, .utf8]
+        } else if hasPrefix(bytes, [0xEF, 0xBB, 0xBF]) {
+            encodings = [.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian]
+        } else if looksLikeUTF16(bytes) {
+            encodings = [.utf16LittleEndian, .utf16BigEndian, .utf8]
+        } else {
+            encodings = [.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian]
+        }
+        for encoding in encodings {
+            if let text = String(data: data, encoding: encoding) {
+                return text
+            }
+        }
+        for encoding in [String.Encoding.ascii, .isoLatin1, .windowsCP1252] {
+            if let text = String(data: data, encoding: encoding) {
+                return text
+            }
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func hasPrefix(_ bytes: [UInt8], _ prefix: [UInt8]) -> Bool {
+        bytes.starts(with: prefix)
+    }
+
+    private static func looksLikeUTF16(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 4 else { return false }
+        let oddZeroes = stride(from: 1, to: bytes.count, by: 2).reduce(into: 0) { count, index in
+            if bytes[index] == 0 { count += 1 }
+        }
+        let evenZeroes = stride(from: 0, to: bytes.count, by: 2).reduce(into: 0) { count, index in
+            if bytes[index] == 0 { count += 1 }
+        }
+        let sampleCount = bytes.count / 2
+        return oddZeroes * 4 >= sampleCount || evenZeroes * 4 >= sampleCount
+    }
+}
+
 struct PDFReaderView: View {
     let resource: ResourceItem
-    @State private var page = 1
+    private let document: PDFDocument?
+
+    init(resource: ResourceItem, data: Data) {
+        self.resource = resource
+        self.document = PDFDocument(data: data)
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                ViewerHeader(icon: "doc.richtext.fill", eyebrow: "PDF READER", title: "纸张与分页")
-                ForEach(1...3, id: \.self) { index in
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color.white)
-                        .frame(height: 290)
-                        .overlay {
-                            VStack(alignment: .leading, spacing: 14) {
-                                Text("第 \(index) 页")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(resource.name.replacingOccurrences(of: ".pdf", with: ""))
-                                    .font(.title2.bold())
-                                Text("PDFKit 查看器将在此处承载分页、搜索、目录、缩放和远端 Range 读取。")
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                            }
-                            .padding(24)
-                        }
-                        .shadow(color: .black.opacity(0.14), radius: 12, y: 5)
-                }
+        Group {
+            if let document {
+                PDFDocumentView(document: document)
+            } else {
+                ContentUnavailableView(
+                    "无法显示 PDF",
+                    systemImage: "doc.richtext",
+                    description: Text("文件内容不是有效的 PDF 文档。")
+                )
             }
-            .padding()
         }
-        .background(Color(uiColor: .secondarySystemBackground))
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -273,12 +347,14 @@ struct MarkdownReaderView: View {
 
 struct TextReaderView: View {
     let resource: ResourceItem
+    let text: String
 
     var body: some View {
-        ScrollView([.vertical, .horizontal]) {
-            Text("001  server started\n002  loading remote source\n003  authenticated\n004  indexing directory\n005  ready\n\nTXT Reader 将在此处承载编码检测、换行、搜索、行号和长文本分段读取。")
+        ScrollView {
+            Text(text.isEmpty ? "（空文件）" : text)
                 .font(.system(.body, design: .monospaced))
                 .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
         }
         .toolbar {
@@ -401,18 +477,46 @@ struct MusicPlayerView: View {
 
 struct UnsupportedViewerView: View {
     let resource: ResourceItem
+    let reason: String?
+
+    init(resource: ResourceItem, reason: String? = nil) {
+        self.resource = resource
+        self.reason = reason
+    }
 
     var body: some View {
         ContentUnavailableView(
             "暂不支持此格式",
             systemImage: resource.kind.systemImage,
-            description: Text("可以下载文件后使用系统分享或其他 App 打开。")
+            description: Text(reason ?? "可以下载文件后使用系统分享或其他 App 打开。")
         )
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("分享", systemImage: "square.and.arrow.up") {}
             }
         }
+    }
+}
+
+private struct PDFDocumentView: UIViewRepresentable {
+    let document: PDFDocument
+
+    func makeUIView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.document = document
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.displayDirection = .vertical
+        view.usePageViewController(false)
+        view.backgroundColor = .secondarySystemBackground
+        return view
+    }
+
+    func updateUIView(_ view: PDFView, context: Context) {
+        if view.document !== document {
+            view.document = document
+        }
+        view.autoScales = true
     }
 }
 

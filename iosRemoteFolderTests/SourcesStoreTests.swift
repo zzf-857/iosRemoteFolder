@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import UniformTypeIdentifiers
 
 @testable import iosRemoteFolder
 
@@ -563,6 +564,81 @@ struct ResourceAccessServiceTests {
             kind: .text,
             metadata: ResourceMetadata(),
             capabilities: capabilities,
+            accent: .blue
+        )
+    }
+}
+
+@Suite("查看器解析与文本载荷")
+struct ViewerResolutionTests {
+    @Test("TXT 解析使用 typed 文本证据和显式预算")
+    func resolvesTextContent() {
+        let item = makeItem(path: "/notes/readme.txt", kind: .unknown)
+        let metadata = ResourceMetadata(
+            mimeType: "text/plain",
+            typeIdentifier: UTType.plainText.identifier
+        )
+
+        let resolution = ViewerRegistry.resolve(resource: item, metadata: metadata)
+
+        #expect(resolution.kind == .textReader)
+        #expect(resolution.preparation == .text(maximumBytes: 10 * 1024 * 1024))
+        #expect(resolution.fallbackDescription == nil)
+    }
+
+    @Test("PDF 解析保留 PDFKit 预算")
+    func resolvesPDFContent() {
+        let item = makeItem(path: "/manual.pdf", kind: .unknown)
+        let metadata = ResourceMetadata(
+            mimeType: "application/pdf",
+            typeIdentifier: UTType.pdf.identifier
+        )
+
+        let resolution = ViewerRegistry.resolve(resource: item, metadata: metadata)
+
+        #expect(resolution.kind == .pdfReader)
+        #expect(resolution.preparation == .pdf(maximumBytes: 50 * 1024 * 1024))
+    }
+
+    @Test("Markdown 与通用文本证据兼容，但真正冲突降级")
+    func resolvesMarkdownAndRejectsConflict() {
+        let markdown = makeItem(path: "/notes/readme.md", kind: .unknown)
+        let markdownResolution = ViewerRegistry.resolve(
+            resource: markdown,
+            metadata: ResourceMetadata(
+                mimeType: "text/markdown",
+                typeIdentifier: UTType.plainText.identifier
+            )
+        )
+        #expect(markdownResolution.kind == .markdownReader)
+
+        let conflict = makeItem(path: "/notes/readme.pdf", kind: .pdf)
+        let conflictResolution = ViewerRegistry.resolve(
+            resource: conflict,
+            metadata: ResourceMetadata(
+                mimeType: "text/plain",
+                typeIdentifier: UTType.plainText.identifier
+            )
+        )
+        #expect(conflictResolution.kind == .systemPreview)
+        #expect(conflictResolution.fallbackDescription?.contains("扩展名") == true)
+    }
+
+    @Test("文本解码优先 UTF-8 并支持 UTF-16")
+    func decodesTextPayloads() {
+        #expect(ViewerContentDecoder.decodeText(Data("你好".utf8)) == "你好")
+        let utf16 = "hello".data(using: .utf16LittleEndian)!
+        #expect(ViewerContentDecoder.decodeText(utf16) == "hello")
+    }
+
+    private func makeItem(path: String, kind: ResourceKind) -> ResourceItem {
+        ResourceItem(
+            sourceID: UUID(),
+            logicalPath: ResourcePath(rawValue: path)!,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: kind,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
             accent: .blue
         )
     }
