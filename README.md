@@ -1,64 +1,67 @@
 # iosRemoteFolder
 
-面向 iPhone/iPad 的统一资源查看器：集中浏览本地、HTTP/HTTPS、Alist、WebDAV 和局域网来源，按 PDF、Markdown、TXT、图片、视频、音乐分别提供内容体验。
+> **项目状态：已暂停。** 这是 2026-08-11 保存的 iOS 技术实验快照，不是生产可用的文件管理器，也不代表 Alist/WebDAV 大资源流程已经完成验收。暂停原因与后续改进见 [项目复盘](docs/retrospective-2026-08.md)。
 
-## 当前进展
+`iosRemoteFolder` 是一个 SwiftUI 统一资源查看器实验，目标是在 iPhone/iPad 中浏览本地、HTTP/HTTPS、Alist 和 WebDAV 资源，并按 PDF、Markdown、TXT、图片、视频和音频选择查看方式。
 
-已完成：
+## 为什么暂停
 
-- Swift 6 + SwiftUI App 壳，最低 iOS/iPadOS 17+，以 iOS 26 为主要验收环境
-- Home、Browse、Sources、Offline 四个顶层区域
-- `ResourceSource`、`ResourceItem`、`ResourceReference`、`ResourceCapability` 统一领域模型
-- `ResourceSourceAdapter` 协议 v2：连接、列举、引用、元数据、读取和统一错误映射
-- 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
-- HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
-- Sources 页面连接中、失败、重试状态
-- 101 个 Swift Testing fixture 测试和托管测试 target
-- PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口；演示来源的 PDF/Markdown/TXT/图片/音乐/视频均已接入受预算真实内容读取
-- D-035 自适应与无障碍壳已通过主程验收：辅助字号布局、VoiceOver 语义、Reduce Motion、方向声明和 disclosure 所有权均已收口
-- D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
-- D-028B 已通过主程复核：`ResourceViewerHost` 经 `ResourceAccessService` 创建会话并获取最新 typed metadata，加载、失败、取消和重试状态均有结构化生命周期
-- D-030A 已通过 Codex 主程复核：Local adapter 增加 bookmark 位置值、stale/失效重新授权错误、平衡 security-scoped lease 和 `NSFileCoordinator` 协调访问
-- D-030B 已实现，主程构建/测试基线复核通过，真实 Files Provider 生命周期待验证：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
-- D-033A/D-033B 已实现 WebDAV/Alist `/dav/` 读取与来源恢复闭环：Sources 页面可添加远端来源，非敏感 descriptor 通过版本化窄存储恢复，用户名/密码只通过 Keychain credential reference 关联；`PROPFIND Depth: 0/1` 解析 `DAV:` namespace、目录、typed metadata/revision，Basic Auth 只在运行时请求头中传递，GET/Range 复用现有 HTTP 传输与预算/取消/响应校验，Info.plist 声明本地网络用途并启用最小本地 ATS 例外
-- D-033C 已实现 WebDAV/Alist 重定向安全边界：PROPFIND、HEAD/Range 和完整 GET 只接受同源且仍位于规范化 endpoint 根路径内的跳转；跨 origin、路径逃逸、query/fragment、URL 凭证和 method 改写被拒绝，HTTP 直链保留既有行为；异常 `HEAD 206` 不会伪造完整大小或 Range 能力
-- iOS 26 AppIcon 基础资源已接入 Asset Catalog：无文字文件夹/远程入口符号、1024px marketing 图和 iPhone/iPad 多尺寸图标已加入 App target
-- D-036/D-037/D-038/D-039/D-040 功能闭环切片已实现：`ViewerRegistry` 按 typed metadata/UTType/MIME/扩展名解析，TXT 使用显式 10 MiB 预算和编码探测，PDF/图片/视频使用显式 50 MiB 预算，演示图片通过原生缩放/平移查看器呈现，演示音频通过 `AVAudioPlayer` 播放，演示视频通过内存资源加载器交给 `AVPlayer` 播放；D-030B 外部 Provider 证据、SwiftData/Keychain 和其他协议仍未提前视为完成
-- D-041 已实现：成功打开的资源按 `ResourceIdentity` 去重并恢复到 Home 的“继续/最近打开”，最多保留 20 条；临时存储不含 URL、请求头、Token、Cookie 或绝对路径，后续迁移到 SwiftData 不改变身份键语义
-- D-042 已实现：音频/视频查看器按 `ResourceIdentity + ResourceRevision` 保存和恢复播放时间点；unknown 或变化的 revision 不恢复，视频异步时长解析后再恢复
-- D-043 已实现：PDF 保存当前页，TXT/Markdown 保存规范化纵向阅读比例；仅在 identity 与已知 revision 同时匹配时恢复，未知或变化 revision 自动清理，持久记录不含 URL、凭证或正文
-- D-044 已实现：查看器先获取最新 typed metadata，再按 `ResourceIdentity + ResourceRevision + content variant` 读取持久缓存；缓存缺失、超预算、损坏或解码失败时受预算回源并原子写入，manifest 只保存非敏感 identity 映射，Offline 页面投影真实缓存内容并支持清理
-- D-045 已实现：Offline 已缓存资源通过同一 `ResourceAccessService` 创建缓存后端会话，在来源不可用时复用已知 revision 的完整内容进入现有查看器；缺失、损坏、unknown revision 和超预算保持明确失败
+项目进入大量实现后，才重新意识到市场上已有成熟的综合文件管理产品。这里并没有独立核验某个竞品的全部运行能力；触发暂停的是工作区所有者对 ES 文件浏览器的观察。真正的问题不是“已有竞品，所以不该做”，而是本项目在开始完整开发前没有证明以下三件事：
 
-当前阶段：
+- 哪一类用户的现有痛点仍未被满足；
+- 用户为什么会从成熟产品切换过来；
+- 本项目能用哪项可验证差异形成持续价值。
 
-- D-030B Files 来源配置生命周期已实现，主程构建/测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-032 非敏感来源配置已迁入共享 SwiftData 容器，旧 UserDefaults 仅保留一次性迁移路径，真实迁移 fixture 与重启恢复仍待专项复核；D-033A/D-033B/D-033C 已完成 WebDAV/Alist `/dav/` 的 adapter、来源添加、descriptor/Keychain 恢复、目录浏览、内容读取和重定向安全接线，真实 WebDAV/NAS/Alist 服务互操作和 DNS rebinding 仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复，D-044 已接通 revision-aware 内容缓存，D-045 已接通缓存内容离线查看。
+在这些问题没有答案时继续扩大功能和 Agent 并行度，只会更快地产生工程资产，不会自动产生产品价值。
 
-尚未完成：
+## 冻结快照包含什么
 
-- SMB/SFTP 等其他真实协议 adapter；WebDAV/Alist 的具体服务端互操作专项验证仍待完成
-- SwiftData 非敏感来源配置迁移已实现，仍需真实迁移 fixture 与重启恢复专项复核；真实 WebDAV/NAS/Alist 互操作、跨 origin/DNS rebinding 重定向专项证据、其他真实协议 adapter 和其余格式的生产级内容解码
-- 后台下载、缓存淘汰和完整离线下载；D-045 只覆盖已经缓存内容的离线打开
-- 真实远端视频流式/长视频策略、后台音频/Now Playing/队列、文档搜索/批注和 Files Provider 离线语义
+- Swift 6、SwiftUI、SwiftData 和 iOS 17+ App 基础结构；
+- Home、Browse、Sources、Offline 四个顶层区域；
+- 统一资源身份、typed metadata、revision、能力和内容会话模型；
+- 本地文件、HTTP/HTTPS、WebDAV/Alist 的连接、目录、认证、Range 和错误边界实验；
+- PDF、Markdown、TXT、图片、音频和视频的查看器切片；
+- 最近打开、阅读/播放位置、revision-aware 缓存和缓存内容离线打开实验；
+- 跨已浏览目录的 SwiftData 索引/搜索实验；
+- 基于 `AVAssetResourceLoader` 和有界 Range 会话的大音频/视频播放实验。
 
-## 打开工程
+## 当前验证证据
 
-使用 Xcode 打开 `iosRemoteFolder.xcodeproj`，选择 `iosRemoteFolder` scheme 后运行 iOS Simulator 或真机。
+2026-08-11，Codex 主程在 iPhone 17 Pro / iOS 26.5 Simulator 上完成：
 
-最低系统暂定 iOS/iPadOS 17+，开发验收以 iOS 26 为主。
+- HTTP、WebDAV、`ResourceAccessServiceTests`、`SessionMediaPlayerTests` 专项测试通过；
+- 完整 Swift Testing 测试 target 通过；
+- generic iOS Simulator Debug 构建通过；
+- `xcodebuild analyze` 退出码为 0；
+- `git diff --check` 通过。
 
-## 目录边界
+这些结果只证明当前受控 fixture 和模拟器快照没有已知失败，不等于真实 Alist、NAS、Files Provider 或大媒体真机流程已经完成产品验收。构建仍报告 PDFKit 相关的 Swift 6 actor-isolation warnings。
 
-```text
-iosRemoteFolder/
-  App/          App 入口和根导航
-  Domain/       资源领域模型与假数据
-  Sources/      来源适配器、读取和连接状态仓库
-  Indexing/     索引服务
-  Cache/        缓存状态与协调器
-  Viewers/      六类专属查看器和注册表
-  Playback/     播放引擎边界
-  UI/           主题、玻璃功能层和通用资源组件
-```
+## 未完成与已知风险
 
-当前主程记录位于工作区的 `Project/todolist/alist-media-player/`，实际仓库当前 `main` 包含尚未推送到 `origin/main` 的本地中文 commit；D-024、D-029、D-035、D-028A、D-028B 会话状态门、D-030A、D-033A/D-033B、D-036/D-037/D-038/D-039/D-040 内容闭环、D-041/D-042/D-043 恢复闭环和 D-044/D-045 缓存闭环均已完成主程复核，D-030B Files 配置生命周期已实现且主程基线通过，真实 Files Provider 生命周期、WebDAV/Alist 生产互操作、后台下载和完整离线语义仍待后续专项验证。
+### 搜索（D-050，未验收）
+
+- 来源删除或命名空间变化后的索引清理失败，可能留下旧记录；
+- 同一 source ID 更换 endpoint 后，旧路径可能被错误地用于新命名空间；
+- UI 未充分说明搜索范围仅限“已浏览目录”；
+- 查询和刷新存在全表读取的 O(N) 扩展风险；
+- 损坏记录可能被静默跳过。
+
+### Alist/WebDAV 大媒体（D-052，未验收）
+
+- 整个媒体 prepare 流程没有统一 deadline；
+- 完整 GET 路径仍可能在预算判断前形成较大内存数据；
+- 已知长度的完整正文没有统一执行精确长度校验；
+- 会话缺少强对象 validator，同长度替换可能混入不同版本的 Range；
+- WebDAV redirect rejection 的错误归属仍可能受并发请求影响；
+- 新下载热路径和真实 iPhone 大 MP3/MP4 播放、seek、取消、退出仍缺最终验收。
+
+其他未完成项包括真实外部 Files Provider 生命周期、SMB/SFTP、后台下载、完整离线任务、缓存容量治理、后台音频和 Now Playing。
+
+## 运行
+
+用 Xcode 打开 `iosRemoteFolder.xcodeproj`，选择 `iosRemoteFolder` scheme，在 iOS Simulator 或真机运行。远端来源需要由使用者自行填写；仓库不包含测试服务器、用户名或密码。明文 HTTP 是否可访问仍受 iOS App Transport Security 配置约束。
+
+## 仓库性质与许可
+
+本仓库作为学习和复盘快照公开。仓库未附带 `LICENSE`；公开可见不等于获得复制、修改、分发或商业使用授权。
