@@ -19,6 +19,10 @@ final class AppModel {
     var resources: [ResourceItem]
     /// 成功打开过的资源，按最近打开顺序投影给 Home。
     var recentResources: [ResourceItem]
+    /// 已经写入内容缓存、可在 Offline 页面展示的资源身份。
+    var offlineResourceIDs: Set<ResourceIdentity> = []
+    /// 当前内容缓存实际占用的字节数。
+    var offlineByteCount: Int64 = 0
     /// 来源连接与浏览状态的唯一仓库，由应用级状态持有。
     var sourcesStore: SourcesStore
     /// 来源列表是 Store 的实时投影，Home 与 Sources 不维护第二份来源状态。
@@ -27,6 +31,7 @@ final class AppModel {
     var sourceActionError: String?
 
     @ObservationIgnored let resourceAccessService: ResourceAccessService
+    @ObservationIgnored let cacheCoordinator: CacheCoordinator
     @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
     @ObservationIgnored private let recentResourceStore: RecentResourceStore
@@ -100,6 +105,7 @@ final class AppModel {
         self.registry = registry
         self.sourcesStore = SourcesStore(registry: registry)
         self.resourceAccessService = ResourceAccessService(registry: registry)
+        self.cacheCoordinator = CacheCoordinator()
         self.sourceActionError = startupError
         self.sourcesStore.synchronize(
             with: registry.initialSnapshots,
@@ -183,6 +189,41 @@ final class AppModel {
 
     func clearReadingPosition(for resource: ResourceItem) {
         resourceReadingStore.remove(for: resource)
+    }
+
+    /// Refreshes the Offline projection from the persistent content cache.
+    /// Only resources with a known revision can participate in the projection.
+    func refreshOfflineCache() async {
+        var candidates: [ResourceItem] = []
+        var seen = Set<ResourceIdentity>()
+        for resource in recentResources + resources where seen.insert(resource.id).inserted {
+            candidates.append(resource)
+        }
+
+        var available = Set<ResourceIdentity>()
+        for resource in candidates {
+            guard let key = ResourceCacheKey(
+                identity: resource.id,
+                revision: resource.metadata.revision,
+                variant: .content
+            ) else {
+                continue
+            }
+
+            if await cacheCoordinator.state(for: key) == .offlineAvailable {
+                available.insert(resource.id)
+            }
+        }
+
+        offlineResourceIDs = available
+        offlineByteCount = await cacheCoordinator.storedByteCount()
+    }
+
+    /// Removes only this app's managed content cache. Source files are untouched.
+    func clearOfflineCache() async {
+        await cacheCoordinator.removeAll()
+        offlineResourceIDs.removeAll()
+        offlineByteCount = 0
     }
 
     func resetFilters() {
@@ -322,6 +363,8 @@ final class AppModel {
         recentResources = recentResourceStore.items
         resourceProgressStore.retain(sourceIDs: Set(snapshots.map(\.id)))
         resourceReadingStore.retain(sourceIDs: Set(snapshots.map(\.id)))
+        await cacheCoordinator.retain(sourceIDs: Set(snapshots.map(\.id)))
+        await refreshOfflineCache()
     }
 
     private func reportSourceError(_ error: any Error) {

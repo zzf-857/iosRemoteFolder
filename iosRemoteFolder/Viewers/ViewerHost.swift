@@ -202,41 +202,61 @@ struct ResourceViewerHost: View {
             case .none:
                 payload = nil
             case .text(let maximumBytes):
-                let data = try await createdSession.readData(maximumBytes: maximumBytes)
-                try Task.checkCancellation()
+                let data = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes
+                ) { _ in }
                 payload = .text(ViewerContentDecoder.decodeText(data))
             case .pdf(let maximumBytes):
-                let data = try await createdSession.readData(maximumBytes: maximumBytes)
-                try Task.checkCancellation()
-                guard PDFDocument(data: data) != nil else {
-                    throw ResourceSourceError.invalidResponse
+                let data = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes
+                ) { data in
+                    guard PDFDocument(data: data) != nil else {
+                        throw ResourceSourceError.invalidResponse
+                    }
                 }
                 payload = .pdf(data)
             case .image(let maximumBytes):
-                let data = try await createdSession.readData(maximumBytes: maximumBytes)
-                try Task.checkCancellation()
-                guard ViewerContentDecoder.isValidImageData(data) else {
-                    throw ResourceSourceError.invalidResponse
+                let data = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes
+                ) { data in
+                    guard ViewerContentDecoder.isValidImageData(data) else {
+                        throw ResourceSourceError.invalidResponse
+                    }
                 }
                 payload = .image(data)
             case .audio(let maximumBytes):
-                let data = try await createdSession.readData(maximumBytes: maximumBytes)
-                try Task.checkCancellation()
-                guard ViewerContentDecoder.isValidAudioData(data) else {
-                    throw ResourceSourceError.invalidResponse
+                let data = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes
+                ) { data in
+                    guard ViewerContentDecoder.isValidAudioData(data) else {
+                        throw ResourceSourceError.invalidResponse
+                    }
                 }
                 payload = .audio(data)
             case .video(let maximumBytes):
-                let data = try await createdSession.readData(maximumBytes: maximumBytes)
-                try Task.checkCancellation()
-                guard await ViewerContentDecoder.isValidVideoData(data) else {
-                    throw ResourceSourceError.invalidResponse
+                let data = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes
+                ) { data in
+                    guard await ViewerContentDecoder.isValidVideoData(data) else {
+                        throw ResourceSourceError.invalidResponse
+                    }
                 }
                 payload = .video(data)
             }
             try Task.checkCancellation()
             if resolution.kind != .systemPreview {
                 appModel.recordRecent(resource: resource, metadata: metadata)
+                await appModel.refreshOfflineCache()
             }
             result = .ready(request.identity, metadata, resolution, payload)
         } catch {
@@ -251,6 +271,48 @@ struct ResourceViewerHost: View {
 
         guard request == loadRequest else { return }
         loadState = Task.isCancelled ? .cancelled(request.identity) : result
+    }
+
+    @MainActor
+    private func readContent(
+        from session: ResourceContentSession,
+        metadata: ResourceMetadata,
+        maximumBytes: Int64,
+        validate: (Data) async throws -> Void
+    ) async throws -> Data {
+        let key = ResourceCacheKey(
+            identity: resource.id,
+            revision: metadata.revision,
+            variant: .content
+        )
+
+        if let key,
+           let cached = try? await appModel.cacheCoordinator.data(
+               for: key,
+               maximumBytes: maximumBytes
+           ) {
+            do {
+                try await validate(cached)
+                return cached
+            } catch {
+                // A corrupt or stale byte entry is never handed to a viewer;
+                // remove it and make one bounded read from the source.
+                await appModel.cacheCoordinator.removeData(for: key)
+            }
+        }
+
+        let data = try await session.readData(maximumBytes: maximumBytes)
+        try Task.checkCancellation()
+        try await validate(data)
+        try Task.checkCancellation()
+        if let key {
+            _ = try? await appModel.cacheCoordinator.store(
+                data,
+                for: key,
+                maximumBytes: maximumBytes
+            )
+        }
+        return data
     }
 
     private func state(for error: any Error, identity: ResourceIdentity) -> LoadState {

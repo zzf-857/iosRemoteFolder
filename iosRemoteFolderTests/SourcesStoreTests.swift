@@ -994,6 +994,122 @@ struct ResourceReadingStoreTests {
     }
 }
 
+@Suite("内容缓存")
+struct CacheCoordinatorTests {
+    @Test("已知 revision 的内容可持久化并在新 coordinator 中恢复")
+    func persistsAndRestoresContent() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceID = UUID()
+        let key = ResourceCacheKey(
+            identity: makeIdentity(sourceID: sourceID, path: "/docs/guide.pdf"),
+            revision: .etag("\"v1\""),
+            variant: .content
+        )!
+        let data = Data("cached content".utf8)
+        let cache = CacheCoordinator(rootURL: root)
+
+        #expect(try await cache.store(data, for: key, maximumBytes: 1024))
+        #expect(await cache.state(for: key) == .offlineAvailable)
+        #expect(try await cache.data(for: key, maximumBytes: 1024) == data)
+
+        let manifestURL = root
+            .appendingPathComponent("iosRemoteFolder/content/manifest.json")
+        let manifestText = String(
+            data: try Data(contentsOf: manifestURL),
+            encoding: .utf8
+        )!
+        #expect(!manifestText.contains("http://"))
+        #expect(!manifestText.contains("headers"))
+        #expect(!manifestText.contains("Cookie"))
+
+        let restored = CacheCoordinator(rootURL: root)
+        #expect(try await restored.data(for: key, maximumBytes: 1024) == data)
+        #expect(await restored.state(for: key) == .offlineAvailable)
+    }
+
+    @Test("revision、variant 和未知 revision 彼此隔离")
+    func isolatesRevisionAndVariant() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let identity = makeIdentity(sourceID: UUID(), path: "/docs/guide.pdf")
+        let first = ResourceCacheKey(
+            identity: identity,
+            revision: .etag("\"first\""),
+            variant: .content
+        )!
+        let changed = ResourceCacheKey(
+            identity: identity,
+            revision: .etag("\"changed\""),
+            variant: .content
+        )!
+        let preview = ResourceCacheKey(
+            identity: identity,
+            revision: .etag("\"first\""),
+            variant: .preview
+        )!
+        let cache = CacheCoordinator(rootURL: root)
+
+        try await cache.store(Data("first".utf8), for: first, maximumBytes: 1024)
+        try await cache.store(Data("changed".utf8), for: changed, maximumBytes: 1024)
+        try await cache.store(Data("preview".utf8), for: preview, maximumBytes: 1024)
+
+        #expect(try await cache.data(for: first, maximumBytes: 1024) == Data("first".utf8))
+        #expect(try await cache.data(for: changed, maximumBytes: 1024) == Data("changed".utf8))
+        #expect(try await cache.data(for: preview, maximumBytes: 1024) == Data("preview".utf8))
+        #expect(ResourceCacheKey(
+            identity: identity,
+            revision: .unknown,
+            variant: .content
+        ) == nil)
+    }
+
+    @Test("超预算读取回源，来源移除清理持久内容")
+    func enforcesBudgetAndPrunesSources() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let retainedSource = UUID()
+        let removedSource = UUID()
+        let retained = ResourceCacheKey(
+            identity: makeIdentity(sourceID: retainedSource, path: "/keep.txt"),
+            revision: .serverVersion("v1"),
+            variant: .content
+        )!
+        let removed = ResourceCacheKey(
+            identity: makeIdentity(sourceID: removedSource, path: "/remove.txt"),
+            revision: .serverVersion("v1"),
+            variant: .content
+        )!
+        let cache = CacheCoordinator(rootURL: root)
+
+        try await cache.store(Data("12345".utf8), for: retained, maximumBytes: 1024)
+        try await cache.store(Data("removed".utf8), for: removed, maximumBytes: 1024)
+        #expect(try await cache.data(for: retained, maximumBytes: 4) == nil)
+        #expect(await cache.state(for: retained) == .online)
+
+        try await cache.store(Data("12345".utf8), for: retained, maximumBytes: 1024)
+        await cache.retain(sourceIDs: [retainedSource])
+        #expect(try await cache.data(for: retained, maximumBytes: 1024) == Data("12345".utf8))
+        #expect(try await cache.data(for: removed, maximumBytes: 1024) == nil)
+
+        let restored = CacheCoordinator(rootURL: root)
+        #expect(try await restored.data(for: removed, maximumBytes: 1024) == nil)
+    }
+
+    private func makeIdentity(sourceID: UUID, path: String) -> ResourceIdentity {
+        ResourceIdentity(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: path)!
+        )
+    }
+}
+
 @Suite("演示来源文档内容")
 struct SampleSourceContentTests {
     @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")

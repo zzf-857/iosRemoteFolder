@@ -3,23 +3,51 @@ import SwiftUI
 struct OfflineView: View {
     @Environment(AppModel.self) private var appModel
 
+    private var cachedResources: [ResourceItem] {
+        var seen = Set<ResourceIdentity>()
+        return (appModel.recentResources + appModel.resources).filter { resource in
+            appModel.offlineResourceIDs.contains(resource.id)
+                && seen.insert(resource.id).inserted
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
-                Section { OfflineStorageSummary() }
+                Section {
+                    OfflineStorageSummary(
+                        cachedByteCount: appModel.offlineByteCount,
+                        hasCachedContent: !appModel.offlineResourceIDs.isEmpty
+                    )
+                }
 
-                Section("可离线内容") {
-                    ForEach(appModel.resources.prefix(3)) { resource in
-                        OfflineResourceRow(resource: resource)
+                Section("已缓存内容") {
+                    if cachedResources.isEmpty {
+                        ContentUnavailableView(
+                            "暂无缓存内容",
+                            systemImage: "internaldrive",
+                            description: Text("打开资源后会在这里显示可复用的内容缓存")
+                        )
+                    } else {
+                        ForEach(cachedResources) { resource in
+                            OfflineResourceRow(resource: resource)
+                        }
                     }
                 }
             }
             .navigationTitle("离线")
+            .task {
+                await appModel.refreshOfflineCache()
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("清理预览缓存", systemImage: "sparkles") {}
-                        Button("管理存储", systemImage: "internaldrive") {}
+                        Button("清理预览缓存", systemImage: "trash") {
+                            Task {
+                                await appModel.clearOfflineCache()
+                            }
+                        }
+                        .disabled(appModel.offlineResourceIDs.isEmpty)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -30,7 +58,17 @@ struct OfflineView: View {
 }
 
 private struct OfflineStorageSummary: View {
+    let cachedByteCount: Int64
+    let hasCachedContent: Bool
+
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var cachedSizeDescription: String {
+        ByteCountFormatter.string(
+            fromByteCount: max(cachedByteCount, 0),
+            countStyle: .file
+        )
+    }
 
     var body: some View {
         Group {
@@ -45,46 +83,51 @@ private struct OfflineStorageSummary: View {
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text("设备空间"))
-        .accessibilityValue(Text("12.4 GB 可用，1.8 GB 缓存，已使用 14%"))
+        .accessibilityLabel(Text("内容缓存"))
+        .accessibilityValue(
+            Text(
+                hasCachedContent
+                    ? "已占用 \(cachedSizeDescription)"
+                    : "暂无缓存内容"
+            )
+        )
     }
 
     private var storageText: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("设备空间")
+            Text("内容缓存")
                 .font(.headline)
-            Text("12.4 GB 可用 · 1.8 GB 缓存")
+            Text(
+                hasCachedContent
+                    ? "已占用 \(cachedSizeDescription)"
+                    : "暂无缓存内容"
+            )
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private var progress: some View {
-        ProgressView(value: 0.14)
-            .tint(AppTheme.accent)
-            .frame(minWidth: 72, idealWidth: 96, maxWidth: 120)
-            .frame(minHeight: 44)
-            .accessibilityHidden(true)
-    }
-
     private var compactLayout: some View {
         HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "internaldrive")
+                .font(.title3)
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 44, height: 44)
+                .accessibilityHidden(true)
             storageText
                 .layoutPriority(1)
-            Spacer(minLength: 0)
-            progress
         }
     }
 
     private var stackedLayout: some View {
         VStack(alignment: .leading, spacing: 10) {
-            storageText
-            ProgressView(value: 0.14)
-                .tint(AppTheme.accent)
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: 44)
+            Image(systemName: "internaldrive")
+                .font(.title3)
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 44, height: 44)
                 .accessibilityHidden(true)
+            storageText
         }
     }
 }
@@ -106,14 +149,20 @@ private struct OfflineResourceRow: View {
         }
         .frame(minHeight: 44, alignment: .leading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text("\(resource.name)，\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))，已离线"))
+        .accessibilityLabel(
+            Text(
+                "\(resource.name)，\(resource.kind.title)，"
+                    + "\(ResourceMetadataFormatter.size(for: resource.metadata))，"
+                    + "\(ResourceMetadataFormatter.modified(for: resource.metadata))，已缓存"
+            )
+        )
     }
 
     private var offlineLabel: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Image(systemName: "checkmark.circle.fill")
                 .accessibilityHidden(true)
-            Text("已离线")
+            Text("已缓存")
                 .fixedSize(horizontal: false, vertical: true)
         }
             .foregroundStyle(AppTheme.accent)
