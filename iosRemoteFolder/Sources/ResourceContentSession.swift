@@ -5,6 +5,11 @@ import Foundation
 /// 会话只暴露 typed metadata、带显式预算的读取和幂等终态控制；adapter、
 /// ResourceItem、引用、请求头和 URL 只保留在 actor 私有实现中。
 actor ResourceContentSession {
+    private enum Backend: Sendable {
+        case source(SourceRegistry)
+        case cache(CacheCoordinator, ResourceMetadata)
+    }
+
     private enum Operation: Sendable {
         case metadata
         case full(maximumBytes: Int64)
@@ -17,13 +22,22 @@ actor ResourceContentSession {
         case failure(ResourceSourceError)
     }
 
-    private let registry: SourceRegistry
+    private let backend: Backend
     private let item: ResourceItem
     private var isTerminated = false
     private var activeOperations: [UUID: Task<Outcome, Never>] = [:]
 
     init(registry: SourceRegistry, item: ResourceItem) {
-        self.registry = registry
+        self.backend = .source(registry)
+        self.item = item
+    }
+
+    init(
+        cacheCoordinator: CacheCoordinator,
+        item: ResourceItem,
+        metadata: ResourceMetadata
+    ) {
+        self.backend = .cache(cacheCoordinator, metadata)
         self.item = item
     }
 
@@ -91,14 +105,14 @@ actor ResourceContentSession {
         guard !Task.isCancelled else { throw ResourceSourceError.cancelled }
 
         let operationID = UUID()
-        let registry = self.registry
+        let backend = self.backend
         let item = self.item
         let task = Task<Outcome, Never> {
             do {
                 try Task.checkCancellation()
                 let outcome = try await Self.execute(
                     operation,
-                    registry: registry,
+                    backend: backend,
                     item: item
                 )
                 try Task.checkCancellation()
@@ -126,22 +140,33 @@ actor ResourceContentSession {
 
     private static func execute(
         _ operation: Operation,
-        registry: SourceRegistry,
+        backend: Backend,
         item: ResourceItem
     ) async throws -> Outcome {
         switch operation {
         case .metadata:
-            let metadata = try await registry.fetchMetadata(
-                sourceID: item.sourceID,
-                for: item
-            )
-            return .metadata(metadata)
+            switch backend {
+            case .source(let registry):
+                let metadata = try await registry.fetchMetadata(
+                    sourceID: item.sourceID,
+                    for: item
+                )
+                return .metadata(metadata)
+            case .cache(_, let metadata):
+                return .metadata(metadata)
+            }
 
         case .full(let maximumBytes):
-            let metadata = try await registry.fetchMetadata(
-                sourceID: item.sourceID,
-                for: item
-            )
+            let metadata: ResourceMetadata
+            switch backend {
+            case .source(let registry):
+                metadata = try await registry.fetchMetadata(
+                    sourceID: item.sourceID,
+                    for: item
+                )
+            case .cache(_, let cachedMetadata):
+                metadata = cachedMetadata
+            }
             try Task.checkCancellation()
             guard !metadata.isDirectory else {
                 throw ResourceSourceError.capabilityUnavailable
@@ -152,11 +177,28 @@ actor ResourceContentSession {
                 throw ResourceSourceError.responseTooLarge
             }
 
-            let data = try await registry.readData(
-                sourceID: item.sourceID,
-                for: item,
-                range: nil
-            )
+            let data: Data
+            switch backend {
+            case .source(let registry):
+                data = try await registry.readData(
+                    sourceID: item.sourceID,
+                    for: item,
+                    range: nil
+                )
+            case .cache(let cacheCoordinator, _):
+                guard let key = ResourceCacheKey(
+                    identity: item.id,
+                    revision: metadata.revision,
+                    variant: .content
+                ),
+                let cachedData = try await cacheCoordinator.data(
+                    for: key,
+                    maximumBytes: maximumBytes
+                ) else {
+                    throw ResourceSourceError.capabilityUnavailable
+                }
+                data = cachedData
+            }
             try Task.checkCancellation()
             guard Int64(data.count) <= maximumBytes else {
                 throw ResourceSourceError.responseTooLarge
@@ -167,10 +209,16 @@ actor ResourceContentSession {
             return .data(data)
 
         case .range(let range, let maximumBytes):
-            let metadata = try await registry.fetchMetadata(
-                sourceID: item.sourceID,
-                for: item
-            )
+            let metadata: ResourceMetadata
+            switch backend {
+            case .source(let registry):
+                metadata = try await registry.fetchMetadata(
+                    sourceID: item.sourceID,
+                    for: item
+                )
+            case .cache:
+                throw ResourceSourceError.capabilityUnavailable
+            }
             try Task.checkCancellation()
             guard !metadata.isDirectory, metadata.acceptsRanges else {
                 throw ResourceSourceError.capabilityUnavailable
@@ -182,11 +230,17 @@ actor ResourceContentSession {
                 throw ResourceSourceError.invalidReference
             }
 
-            let data = try await registry.readData(
-                sourceID: item.sourceID,
-                for: item,
-                range: range
-            )
+            let data: Data
+            switch backend {
+            case .source(let registry):
+                data = try await registry.readData(
+                    sourceID: item.sourceID,
+                    for: item,
+                    range: range
+                )
+            case .cache:
+                throw ResourceSourceError.capabilityUnavailable
+            }
             try Task.checkCancellation()
             guard Int64(data.count) <= maximumBytes else {
                 throw ResourceSourceError.responseTooLarge

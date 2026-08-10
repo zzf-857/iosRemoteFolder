@@ -103,9 +103,13 @@ final class AppModel {
         readingStore.retain(sourceIDs: Set(allSources.map(\.id)))
         self.resourceReadingStore = readingStore
         self.registry = registry
+        let cacheCoordinator = CacheCoordinator()
+        self.cacheCoordinator = cacheCoordinator
         self.sourcesStore = SourcesStore(registry: registry)
-        self.resourceAccessService = ResourceAccessService(registry: registry)
-        self.cacheCoordinator = CacheCoordinator()
+        self.resourceAccessService = ResourceAccessService(
+            registry: registry,
+            cacheCoordinator: cacheCoordinator
+        )
         self.sourceActionError = startupError
         self.sourcesStore.synchronize(
             with: registry.initialSnapshots,

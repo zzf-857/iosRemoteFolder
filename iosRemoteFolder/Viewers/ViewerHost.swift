@@ -5,16 +5,23 @@ import UIKit
 import AVFoundation
 import AVKit
 
+enum ResourceViewerMode: Hashable, Sendable {
+    case online
+    case offline
+}
+
 struct ResourceViewerHost: View {
     @Environment(AppModel.self) private var appModel
 
     let resource: ResourceItem
+    let mode: ResourceViewerMode
     @State private var loadState: LoadState = .loading
     @State private var retryAttempt = 0
 
     private struct LoadRequest: Hashable, Sendable {
         let identity: ResourceIdentity
         let attempt: Int
+        let mode: ResourceViewerMode
     }
 
     private enum LoadState: Equatable {
@@ -25,7 +32,15 @@ struct ResourceViewerHost: View {
     }
 
     private var loadRequest: LoadRequest {
-        LoadRequest(identity: resource.id, attempt: retryAttempt)
+        LoadRequest(identity: resource.id, attempt: retryAttempt, mode: mode)
+    }
+
+    init(
+        resource: ResourceItem,
+        mode: ResourceViewerMode = .online
+    ) {
+        self.resource = resource
+        self.mode = mode
     }
 
     var body: some View {
@@ -193,7 +208,13 @@ struct ResourceViewerHost: View {
         var session: ResourceContentSession?
         let result: LoadState
         do {
-            let createdSession = try await appModel.resourceAccessService.makeSession(for: resource)
+            let createdSession: ResourceContentSession
+            switch mode {
+            case .online:
+                createdSession = try await appModel.resourceAccessService.makeSession(for: resource)
+            case .offline:
+                createdSession = try await appModel.resourceAccessService.makeOfflineSession(for: resource)
+            }
             session = createdSession
             let metadata = try await createdSession.fetchMetadata()
             let resolution = ViewerRegistry.resolve(resource: resource, metadata: metadata)
@@ -205,14 +226,16 @@ struct ResourceViewerHost: View {
                 let data = try await readContent(
                     from: createdSession,
                     metadata: metadata,
-                    maximumBytes: maximumBytes
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
                 ) { _ in }
                 payload = .text(ViewerContentDecoder.decodeText(data))
             case .pdf(let maximumBytes):
                 let data = try await readContent(
                     from: createdSession,
                     metadata: metadata,
-                    maximumBytes: maximumBytes
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
                 ) { data in
                     guard PDFDocument(data: data) != nil else {
                         throw ResourceSourceError.invalidResponse
@@ -223,7 +246,8 @@ struct ResourceViewerHost: View {
                 let data = try await readContent(
                     from: createdSession,
                     metadata: metadata,
-                    maximumBytes: maximumBytes
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
                 ) { data in
                     guard ViewerContentDecoder.isValidImageData(data) else {
                         throw ResourceSourceError.invalidResponse
@@ -234,7 +258,8 @@ struct ResourceViewerHost: View {
                 let data = try await readContent(
                     from: createdSession,
                     metadata: metadata,
-                    maximumBytes: maximumBytes
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
                 ) { data in
                     guard ViewerContentDecoder.isValidAudioData(data) else {
                         throw ResourceSourceError.invalidResponse
@@ -245,7 +270,8 @@ struct ResourceViewerHost: View {
                 let data = try await readContent(
                     from: createdSession,
                     metadata: metadata,
-                    maximumBytes: maximumBytes
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
                 ) { data in
                     guard await ViewerContentDecoder.isValidVideoData(data) else {
                         throw ResourceSourceError.invalidResponse
@@ -254,7 +280,7 @@ struct ResourceViewerHost: View {
                 payload = .video(data)
             }
             try Task.checkCancellation()
-            if resolution.kind != .systemPreview {
+            if mode == .online, resolution.kind != .systemPreview {
                 appModel.recordRecent(resource: resource, metadata: metadata)
                 await appModel.refreshOfflineCache()
             }
@@ -278,13 +304,16 @@ struct ResourceViewerHost: View {
         from session: ResourceContentSession,
         metadata: ResourceMetadata,
         maximumBytes: Int64,
+        usePersistentCache: Bool,
         validate: (Data) async throws -> Void
     ) async throws -> Data {
-        let key = ResourceCacheKey(
-            identity: resource.id,
-            revision: metadata.revision,
-            variant: .content
-        )
+        let key = usePersistentCache
+            ? ResourceCacheKey(
+                identity: resource.id,
+                revision: metadata.revision,
+                variant: .content
+            )
+            : nil
 
         if let key,
            let cached = try? await appModel.cacheCoordinator.data(

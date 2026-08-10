@@ -996,6 +996,60 @@ struct ResourceReadingStoreTests {
 
 @Suite("内容缓存")
 struct CacheCoordinatorTests {
+    @Test("来源不可用时缓存内容仍可经离线会话读取")
+    func readsCachedContentWithoutSourceAdapter() async throws {
+        let source = ResourceSource(
+            id: UUID(),
+            name: "离线会话来源",
+            kind: .http,
+            endpoint: "https://offline.example",
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+        let modifiedAt = Date(timeIntervalSince1970: 1_754_700_000)
+        let metadata = ResourceMetadata(
+            byteSize: 5,
+            modifiedAt: modifiedAt,
+            mimeType: "text/plain",
+            typeIdentifier: "public.plain-text",
+            revision: .modifiedAndSize(modifiedAt: modifiedAt, byteSize: 5)
+        )
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: ResourcePath(rawValue: "/offline.txt")!,
+            name: "offline.txt",
+            kind: .text,
+            metadata: metadata,
+            capabilities: [],
+            accent: .blue
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-offline-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cache = CacheCoordinator(rootURL: root)
+        let key = ResourceCacheKey(
+            identity: item.id,
+            revision: metadata.revision,
+            variant: .content
+        )!
+        try await cache.store(
+            Data("hello".utf8),
+            for: key,
+            maximumBytes: 1024
+        )
+
+        let registry = try SourceRegistry(sources: [source], adapters: [])
+        let service = ResourceAccessService(
+            registry: registry,
+            cacheCoordinator: cache
+        )
+        let session = try await service.makeOfflineSession(for: item)
+        #expect(try await session.fetchMetadata() == metadata)
+        #expect(try await session.readData(maximumBytes: 1024) == Data("hello".utf8))
+        await session.close()
+    }
+
     @Test("已知 revision 的内容可持久化并在新 coordinator 中恢复")
     func persistsAndRestoresContent() async throws {
         let root = FileManager.default.temporaryDirectory

@@ -30,7 +30,15 @@ struct OfflineView: View {
                         )
                     } else {
                         ForEach(cachedResources) { resource in
-                            OfflineResourceRow(resource: resource)
+                            NavigationLink {
+                                ResourceViewerHost(
+                                    resource: resource,
+                                    mode: .offline
+                                )
+                            } label: {
+                                OfflineResourceRow(resource: resource)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -153,16 +161,17 @@ private struct OfflineResourceRow: View {
             Text(
                 "\(resource.name)，\(resource.kind.title)，"
                     + "\(ResourceMetadataFormatter.size(for: resource.metadata))，"
-                    + "\(ResourceMetadataFormatter.modified(for: resource.metadata))，已缓存"
+                    + "\(ResourceMetadataFormatter.modified(for: resource.metadata))，已离线"
             )
         )
+        .accessibilityHint(Text("打开离线资源"))
     }
 
     private var offlineLabel: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Image(systemName: "checkmark.circle.fill")
                 .accessibilityHidden(true)
-            Text("已缓存")
+            Text("已离线")
                 .fixedSize(horizontal: false, vertical: true)
         }
             .foregroundStyle(AppTheme.accent)
@@ -174,8 +183,8 @@ private struct OfflineResourceRow: View {
         HStack(alignment: .top, spacing: 10) {
             ResourceRowView(
                 resource: resource,
-                interaction: .staticContent,
-                disclosureOwnership: .none
+                interaction: .actionable(resultHint: "打开离线资源"),
+                disclosureOwnership: .container
             )
                 .layoutPriority(1)
             offlineLabel
@@ -186,8 +195,8 @@ private struct OfflineResourceRow: View {
         VStack(alignment: .leading, spacing: 4) {
             ResourceRowView(
                 resource: resource,
-                interaction: .staticContent,
-                disclosureOwnership: .none
+                interaction: .actionable(resultHint: "打开离线资源"),
+                disclosureOwnership: .container
             )
             offlineLabel
         }

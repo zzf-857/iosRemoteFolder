@@ -6,9 +6,14 @@ import Foundation
 /// `.read` 能力；上层不需要也不能取得 adapter、引用或请求细节。
 final class ResourceAccessService: Sendable {
     private let registry: SourceRegistry
+    private let cacheCoordinator: CacheCoordinator?
 
-    init(registry: SourceRegistry) {
+    init(
+        registry: SourceRegistry,
+        cacheCoordinator: CacheCoordinator? = nil
+    ) {
         self.registry = registry
+        self.cacheCoordinator = cacheCoordinator
     }
 
     func makeSession(for item: ResourceItem) async throws -> ResourceContentSession {
@@ -34,6 +39,40 @@ final class ResourceAccessService: Sendable {
         } catch {
             // A failed creation probe must not leave an unowned operation or
             // a usable session behind; close is idempotent for all failures.
+            await session.close()
+            throw error
+        }
+    }
+
+    /// Creates a session backed only by a previously persisted complete-content
+    /// cache entry. This path deliberately skips the source adapter so a cached
+    /// resource remains openable while its source is unavailable.
+    func makeOfflineSession(for item: ResourceItem) async throws -> ResourceContentSession {
+        guard Self.isCanonicalResource(item) else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard item.kind != .folder,
+              !item.metadata.isDirectory,
+              item.metadata.revision.isKnown,
+              let cacheCoordinator,
+              let key = ResourceCacheKey(
+                  identity: item.id,
+                  revision: item.metadata.revision,
+                  variant: .content
+              ),
+              await cacheCoordinator.state(for: key) == .offlineAvailable else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
+
+        let session = ResourceContentSession(
+            cacheCoordinator: cacheCoordinator,
+            item: item,
+            metadata: item.metadata
+        )
+        do {
+            _ = try await session.fetchMetadata()
+            return session
+        } catch {
             await session.close()
             throw error
         }
