@@ -38,11 +38,13 @@
 		B00000000000000000000029 /* ResourceContentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000029 /* ResourceContentSession.swift */; };
 		B00000000000000000000035 /* LocalSourceLocation.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000035 /* LocalSourceLocation.swift */; };
 		B00000000000000000000036 /* LocalSourceConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000036 /* LocalSourceConfiguration.swift */; };
+		B00000000000000000000037 /* WebDAVSourceAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000037 /* WebDAVSourceAdapter.swift */; };
 		B00000000000000000000030 /* MockURLProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000030 /* MockURLProtocol.swift */; };
 		B00000000000000000000031 /* ResourceReferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000031 /* ResourceReferenceTests.swift */; };
 		B00000000000000000000032 /* LocalFilesSourceAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000032 /* LocalFilesSourceAdapterTests.swift */; };
 		B00000000000000000000033 /* HTTPSourceAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000033 /* HTTPSourceAdapterTests.swift */; };
 		B00000000000000000000034 /* SourcesStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000034 /* SourcesStoreTests.swift */; };
+		B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -87,11 +89,13 @@
 		C00000000000000000000029 /* ResourceContentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceContentSession.swift; sourceTree = "<group>"; };
 		C00000000000000000000035 /* LocalSourceLocation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSourceLocation.swift; sourceTree = "<group>"; };
 		C00000000000000000000036 /* LocalSourceConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSourceConfiguration.swift; sourceTree = "<group>"; };
+		C00000000000000000000037 /* WebDAVSourceAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebDAVSourceAdapter.swift; sourceTree = "<group>"; };
 		C00000000000000000000030 /* MockURLProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockURLProtocol.swift; sourceTree = "<group>"; };
 		C00000000000000000000031 /* ResourceReferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceReferenceTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000032 /* LocalFilesSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalFilesSourceAdapterTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000033 /* HTTPSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPSourceAdapterTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000034 /* SourcesStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourcesStoreTests.swift; sourceTree = "<group>"; };
+		C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebDAVSourceAdapterTests.swift; sourceTree = "<group>"; };
 		D00000000000000000000001 /* iosRemoteFolder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosRemoteFolder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D00000000000000000000002 /* iosRemoteFolderTests.xctest */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.wrapper.cfbundle"; includeInIndex = 0; path = iosRemoteFolderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -149,7 +153,7 @@
 		};
 		A00000000000000000000010 /* App */ = {isa = PBXGroup; children = (C00000000000000000000001, C00000000000000000000002, C00000000000000000000003, C00000000000000000000004, C00000000000000000000005, C00000000000000000000006, C00000000000000000000007, ); path = App; sourceTree = "<group>"; };
 		A00000000000000000000011 /* Domain */ = {isa = PBXGroup; children = (C00000000000000000000008, C00000000000000000000009, C00000000000000000000020, C00000000000000000000021, C00000000000000000000025, ); path = Domain; sourceTree = "<group>"; };
-		A00000000000000000000012 /* Sources */ = {isa = PBXGroup; children = (C00000000000000000000010, C00000000000000000000022, C00000000000000000000023, C00000000000000000000024, C00000000000000000000027, C00000000000000000000028, C00000000000000000000029, C00000000000000000000035, C00000000000000000000036, ); path = Sources; sourceTree = "<group>"; };
+		A00000000000000000000012 /* Sources */ = {isa = PBXGroup; children = (C00000000000000000000010, C00000000000000000000022, C00000000000000000000023, C00000000000000000000024, C00000000000000000000027, C00000000000000000000028, C00000000000000000000029, C00000000000000000000035, C00000000000000000000036, C00000000000000000000037, ); path = Sources; sourceTree = "<group>"; };
 		A00000000000000000000013 /* Indexing */ = {isa = PBXGroup; children = (C00000000000000000000011, ); path = Indexing; sourceTree = "<group>"; };
 		A00000000000000000000014 /* Cache */ = {isa = PBXGroup; children = (C00000000000000000000012, ); path = Cache; sourceTree = "<group>"; };
 		A00000000000000000000015 /* Playback */ = {isa = PBXGroup; children = (C00000000000000000000013, ); path = Playback; sourceTree = "<group>"; };
@@ -163,6 +167,7 @@
 				C00000000000000000000032 /* LocalFilesSourceAdapterTests.swift */,
 				C00000000000000000000033 /* HTTPSourceAdapterTests.swift */,
 				C00000000000000000000034 /* SourcesStoreTests.swift */,
+				C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */,
 			);
 			path = iosRemoteFolderTests;
 			sourceTree = "<group>";
@@ -294,6 +299,7 @@
 				B00000000000000000000029 /* ResourceContentSession.swift in Sources */,
 				B00000000000000000000035 /* LocalSourceLocation.swift in Sources */,
 				B00000000000000000000036 /* LocalSourceConfiguration.swift in Sources */,
+				B00000000000000000000037 /* WebDAVSourceAdapter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -306,6 +312,7 @@
 				B00000000000000000000032 /* LocalFilesSourceAdapterTests.swift in Sources */,
 				B00000000000000000000033 /* HTTPSourceAdapterTests.swift in Sources */,
 				B00000000000000000000034 /* SourcesStoreTests.swift in Sources */,
+				B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

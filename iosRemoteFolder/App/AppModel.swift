@@ -37,6 +37,9 @@ final class AppModel {
     @ObservationIgnored private let recentResourceStore: RecentResourceStore
     @ObservationIgnored private let resourceProgressStore: ResourceProgressStore
     @ObservationIgnored private let resourceReadingStore: ResourceReadingStore
+    /// Temporary in-memory ownership for WebDAV/Alist sources. D-032 will move
+    /// the non-sensitive descriptor to SwiftData and credentials to Keychain.
+    @ObservationIgnored private var managedRemoteSourceIDs: Set<UUID> = []
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
     @ObservationIgnored private var sourceMutationTask: Task<Void, Never>?
@@ -243,6 +246,10 @@ final class AppModel {
         configurationStore.configuration(for: sourceID) != nil
     }
 
+    func isManagedSource(_ sourceID: UUID) -> Bool {
+        isManagedLocalSource(sourceID) || managedRemoteSourceIDs.contains(sourceID)
+    }
+
     /// 添加 Files 目录。目录 bookmark 与配置先在 composition root 创建，UI 不接触
     /// adapter 或绝对路径；完成 registry 注册后才让 Store 连接并列举根目录。
     func addLocalSource(directoryURL: URL) {
@@ -262,6 +269,34 @@ final class AppModel {
 
     /// 只移除应用配置、registry 与 Store 状态，不调用任何文件删除 API。
     func removeLocalSource(sourceID: UUID) {
+        scheduleMutation { [weak self] in
+            guard let self else { return }
+            await self.performRemove(sourceID: sourceID)
+        }
+    }
+
+    /// Adds a temporary WebDAV or Alist `/dav/` source. Credentials stay in the
+    /// adapter's memory until D-032 supplies Keychain-backed persistence.
+    func addRemoteSource(
+        name: String,
+        endpoint: String,
+        kind: ResourceSource.SourceKind,
+        username: String,
+        password: String
+    ) {
+        scheduleMutation { [weak self] in
+            guard let self else { return }
+            await self.performAddRemoteSource(
+                name: name,
+                endpoint: endpoint,
+                kind: kind,
+                username: username,
+                password: password
+            )
+        }
+    }
+
+    func removeManagedSource(sourceID: UUID) {
         scheduleMutation { [weak self] in
             guard let self else { return }
             await self.performRemove(sourceID: sourceID)
@@ -297,6 +332,47 @@ final class AppModel {
                 _ = try? configurationStore.remove(sourceID: source.id)
                 throw error
             }
+            await synchronizeStore()
+            guard !Task.isCancelled else { return }
+            sourcesStore.connect(source.id)
+        } catch {
+            reportSourceError(error)
+        }
+    }
+
+    private func performAddRemoteSource(
+        name: String,
+        endpoint: String,
+        kind: ResourceSource.SourceKind,
+        username: String,
+        password: String
+    ) async {
+        sourceActionError = nil
+        do {
+            try Task.checkCancellation()
+            let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !displayName.isEmpty,
+                  kind == .webdav || kind == .alist,
+                  let endpointURL = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw ResourceSourceError.invalidReference
+            }
+            let source = ResourceSource(
+                id: UUID(),
+                name: displayName,
+                kind: kind,
+                endpoint: endpointURL.absoluteString,
+                status: .disconnected,
+                itemCountDescription: ""
+            )
+            let adapter = try WebDAVSourceAdapter(
+                source: source,
+                endpoint: endpointURL,
+                username: username,
+                password: password
+            )
+            try Task.checkCancellation()
+            try await registry.register(source: source, adapter: adapter)
+            managedRemoteSourceIDs.insert(source.id)
             await synchronizeStore()
             guard !Task.isCancelled else { return }
             sourcesStore.connect(source.id)
@@ -343,16 +419,23 @@ final class AppModel {
         sourceActionError = nil
         do {
             try Task.checkCancellation()
-            let removedConfiguration = try configurationStore.remove(sourceID: sourceID)
-            do {
-                // Complete the paired removal after persistence begins. If the
-                // registry rejects it, restore the configuration below.
+            if configurationStore.configuration(for: sourceID) != nil {
+                let removedConfiguration = try configurationStore.remove(sourceID: sourceID)
+                do {
+                    // Complete the paired removal after persistence begins. If the
+                    // registry rejects it, restore the configuration below.
+                    try await registry.remove(sourceID: sourceID)
+                } catch {
+                    // Persisted configuration is restored if registry mutation is
+                    // rejected, keeping the two ownership boundaries consistent.
+                    _ = try? configurationStore.insert(removedConfiguration)
+                    throw error
+                }
+            } else if managedRemoteSourceIDs.contains(sourceID) {
                 try await registry.remove(sourceID: sourceID)
-            } catch {
-                // Persisted configuration is restored if registry mutation is
-                // rejected, keeping the two ownership boundaries consistent.
-                _ = try? configurationStore.insert(removedConfiguration)
-                throw error
+                managedRemoteSourceIDs.remove(sourceID)
+            } else {
+                throw LocalSourceConfigurationError.sourceNotFound(sourceID)
             }
             await synchronizeStore()
         } catch {

@@ -5,6 +5,7 @@ struct SourcesView: View {
     @Environment(AppModel.self) private var appModel
 
     @State private var isShowingFolderImporter = false
+    @State private var isShowingRemoteForm = false
     @State private var reauthorizationSourceID: UUID?
     @State private var pendingAction: SourceAction?
 
@@ -26,6 +27,15 @@ struct SourcesView: View {
                         isShowingFolderImporter = true
                     } label: {
                         Label("添加本地文件夹", systemImage: "folder.badge.plus")
+                            .font(.headline)
+                    }
+                    .tint(AppTheme.accent)
+
+                    Button {
+                        appModel.dismissSourceError()
+                        isShowingRemoteForm = true
+                    } label: {
+                        Label("添加 WebDAV / Alist", systemImage: "server.rack")
                             .font(.headline)
                     }
                     .tint(AppTheme.accent)
@@ -61,7 +71,7 @@ struct SourcesView: View {
                                 reauthorizationSourceID = entry.id
                                 isShowingFolderImporter = true
                             } : nil,
-                            remove: appModel.isManagedLocalSource(entry.id) ? {
+                            remove: appModel.isManagedSource(entry.id) ? {
                                 pendingAction = .remove(entry.id)
                             } : nil
                         )
@@ -81,6 +91,18 @@ struct SourcesView: View {
             ) { result in
                 handleFolderImportResult(result)
             }
+            .sheet(isPresented: $isShowingRemoteForm) {
+                RemoteSourceFormView { name, endpoint, kind, username, password in
+                    isShowingRemoteForm = false
+                    appModel.addRemoteSource(
+                        name: name,
+                        endpoint: endpoint,
+                        kind: kind,
+                        username: username,
+                        password: password
+                    )
+                }
+            }
             .task {
                 store.connectAll()
             }
@@ -93,7 +115,7 @@ struct SourcesView: View {
                 case .reauthorize(let sourceID, let url):
                     appModel.reauthorizeLocalSource(sourceID: sourceID, directoryURL: url)
                 case .remove(let sourceID):
-                    appModel.removeLocalSource(sourceID: sourceID)
+                    appModel.removeManagedSource(sourceID: sourceID)
                 }
             }
         }
@@ -147,6 +169,89 @@ struct SourcesView: View {
         let nsError = error as NSError
         return (nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError)
             || (nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled)
+    }
+}
+
+/// Temporary WebDAV/Alist source form. The password is passed directly to the
+/// composition root and is not stored in view state beyond this presentation.
+private struct RemoteSourceFormView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name = ""
+    @State private var endpoint = ""
+    @State private var username = ""
+    @State private var password = ""
+    @State private var kind: ResourceSource.SourceKind = .webdav
+
+    let submit: (String, String, ResourceSource.SourceKind, String, String) -> Void
+
+    private var canSubmit: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && validEndpoint
+    }
+
+    private var validEndpoint: Bool {
+        guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              url.host != nil,
+              url.query == nil,
+              url.fragment == nil else {
+            return false
+        }
+        return true
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("来源类型") {
+                    Picker("协议", selection: $kind) {
+                        Text("WebDAV").tag(ResourceSource.SourceKind.webdav)
+                        Text("Alist / OpenList").tag(ResourceSource.SourceKind.alist)
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Section("连接") {
+                    TextField("名称", text: $name)
+                        .textContentType(.organizationName)
+                    TextField("WebDAV 地址", text: $endpoint)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    Text("例如 https://example.com/dav/")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("认证（可选）") {
+                    TextField("用户名", text: $username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField("密码", text: $password)
+                }
+            }
+            .navigationTitle("添加远端来源")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("连接") {
+                        submit(
+                            name.trimmingCharacters(in: .whitespacesAndNewlines),
+                            endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
+                            kind,
+                            username,
+                            password
+                        )
+                    }
+                    .disabled(!canSubmit)
+                }
+            }
+        }
     }
 }
 
