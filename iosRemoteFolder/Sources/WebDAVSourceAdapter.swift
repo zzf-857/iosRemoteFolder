@@ -123,8 +123,14 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
         let path = try validatedFilePath(for: item)
         let entries = try await propfind(path: path, depth: 0)
-        guard let entry = entries.first(where: { (try? logicalPath(from: $0.href)) == path }) else {
-            throw ResourceSourceError.notFound
+        let matchingEntries = try entries.filter { entry in
+            try logicalPath(from: entry.href) == path
+        }
+        guard matchingEntries.count == 1, let entry = matchingEntries.first else {
+            if matchingEntries.isEmpty {
+                throw ResourceSourceError.notFound
+            }
+            throw ResourceSourceError.invalidReference
         }
         guard !entry.isCollection else {
             throw ResourceSourceError.invalidReference
@@ -267,9 +273,12 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         path: ResourcePath,
         metadata: ResourceMetadata
     ) -> ResourceItem {
+        let displayName = entry.name.isEmpty
+            ? (path.components.last ?? path.normalized)
+            : entry.name
         let kind: ResourceKind = entry.isCollection
             ? .folder
-            : Self.kind(for: entry.name, mimeType: entry.mimeType)
+            : Self.kind(for: displayName, mimeType: entry.mimeType)
         var capabilities: ResourceCapability = entry.isCollection
             ? [.list]
             : [.read, .download, .directURL]
@@ -279,7 +288,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         return ResourceItem(
             sourceID: source.id,
             logicalPath: path,
-            name: entry.name,
+            name: displayName,
             kind: kind,
             metadata: metadata,
             capabilities: capabilities,
