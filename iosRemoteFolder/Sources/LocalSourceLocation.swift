@@ -96,4 +96,26 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
         }
         return try body(resolvedURL.standardizedFileURL)
     }
+
+    /// 判断两个位置是否指向同一个目录，但不向调用方暴露解析后的 URL。
+    ///
+    /// Bookmark bytes 不是稳定的目录身份：同一目录在不同选择或系统版本下
+    /// 可能生成不同数据。解析成功时使用规范化、解析符号链接后的 URL；任何
+    /// 一方无法解析时保守回退到原始 bytes equality，避免把两个未知位置误合并。
+    func isSameResolvedLocation(as other: LocalSourceLocation) -> Bool {
+        guard let lhs = comparisonURL, let rhs = other.comparisonURL else {
+            return self == other
+        }
+        return lhs == rhs
+    }
+
+    private var comparisonURL: URL? {
+        do {
+            return try withResolvedURL { url in
+                url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+            }
+        } catch {
+            return nil
+        }
+    }
 }

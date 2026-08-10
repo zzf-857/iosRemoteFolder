@@ -109,7 +109,7 @@ final class LocalSourceConfigurationStore {
     }
 
     func contains(location: LocalSourceLocation) -> Bool {
-        configurations.contains { $0.location == location }
+        configurations.contains { $0.location.isSameResolvedLocation(as: location) }
     }
 
     /// 仅在新来源插入时使用；不会静默覆盖同 ID 配置。
@@ -134,7 +134,7 @@ final class LocalSourceConfigurationStore {
             throw LocalSourceConfigurationError.sourceNotFound(configuration.id)
         }
         guard !configurations.enumerated().contains(where: { offset, existing in
-            offset != index && existing.location == configuration.location
+            offset != index && existing.location.isSameResolvedLocation(as: configuration.location)
         }) else {
             throw LocalSourceConfigurationError.duplicateLocation
         }
@@ -179,15 +179,18 @@ final class LocalSourceConfigurationStore {
 
     private func validate(_ configurations: [LocalSourceConfiguration]) throws {
         var sourceIDs = Set<UUID>()
-        var locations = Set<LocalSourceLocation>()
+        var locations: [LocalSourceLocation] = []
         for configuration in configurations {
             try validate(configuration)
             guard sourceIDs.insert(configuration.id).inserted else {
                 throw LocalSourceConfigurationError.duplicateSourceID(configuration.id)
             }
-            guard locations.insert(configuration.location).inserted else {
+            guard !locations.contains(where: {
+                $0.isSameResolvedLocation(as: configuration.location)
+            }) else {
                 throw LocalSourceConfigurationError.duplicateLocation
             }
+            locations.append(configuration.location)
         }
     }
 
