@@ -16,6 +16,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
     private let timeout: TimeInterval
     private var metadataByPath: [String: ResourceMetadata] = [:]
     private var serverAdvertisesRanges = false
+    private static let maxPropfindResponseBytes = 2 * 1024 * 1024
 
     init(
         source: ResourceSource,
@@ -201,6 +202,14 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         guard (200..<300).contains(httpResponse.statusCode) else {
             throw ResourceSourceError.http(statusCode: httpResponse.statusCode)
         }
+        if let contentLength = Self.headerValue("Content-Length", in: httpResponse)
+            .flatMap(Int64.init),
+           contentLength > Int64(Self.maxPropfindResponseBytes) {
+            throw ResourceSourceError.responseTooLarge
+        }
+        guard data.count <= Self.maxPropfindResponseBytes else {
+            throw ResourceSourceError.responseTooLarge
+        }
         if let ranges = Self.headerValue("Accept-Ranges", in: httpResponse) {
             serverAdvertisesRanges = ranges.caseInsensitiveCompare("bytes") == .orderedSame
         }
@@ -341,7 +350,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         return path
     }
 
-    private static func normalizedEndpoint(_ endpoint: URL) throws -> URL {
+    nonisolated static func normalizedEndpoint(_ endpoint: URL) throws -> URL {
         guard let scheme = endpoint.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               endpoint.host != nil,
@@ -474,14 +483,23 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
     private var activeProperty: String?
     private var propertyText = ""
     private var parseError: Error?
+    private var sawMultistatus = false
+    private var elementStack: [String] = []
     private(set) var entries: [WebDAVSourceAdapter.DAVEntry] = []
 
     func parse(_ data: Data) throws -> [WebDAVSourceAdapter.DAVEntry] {
+        current = nil
+        activeProperty = nil
+        propertyText = ""
+        parseError = nil
+        sawMultistatus = false
+        elementStack = []
+        entries = []
         let parser = XMLParser(data: data)
         parser.delegate = self
-        parser.shouldProcessNamespaces = false
+        parser.shouldProcessNamespaces = true
         parser.shouldResolveExternalEntities = false
-        guard parser.parse(), parseError == nil else {
+        guard parser.parse(), parseError == nil, sawMultistatus, elementStack.isEmpty else {
             throw parseError ?? ResourceSourceError.invalidResponse
         }
         return entries
@@ -495,6 +513,27 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
         attributes attributeDict: [String: String] = [:]
     ) {
         let local = Self.localName(qName ?? elementName)
+        elementStack.append(local)
+        guard namespaceURI == Self.davNamespace else {
+            // DAV response elements are namespace-sensitive. Provider-specific
+            // extension elements are ignored, while lookalike roots/responses fail.
+            if local == "multistatus" || local == "response" {
+                parseError = ResourceSourceError.invalidResponse
+            }
+            return
+        }
+        if local == "multistatus" {
+            guard elementStack.count == 1, !sawMultistatus else {
+                parseError = ResourceSourceError.invalidResponse
+                return
+            }
+            sawMultistatus = true
+            return
+        }
+        guard sawMultistatus else {
+            parseError = ResourceSourceError.invalidResponse
+            return
+        }
         if local == "response" {
             guard current == nil else {
                 parseError = ResourceSourceError.invalidResponse
@@ -526,6 +565,7 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
         qualifiedName qName: String?
     ) {
         let local = Self.localName(qName ?? elementName)
+        defer { _ = elementStack.popLast() }
         if activeProperty == local {
             assign(property: local, text: propertyText)
             activeProperty = nil
@@ -576,6 +616,8 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
     private static func localName(_ name: String) -> String {
         String(name.split(separator: ":").last ?? Substring(name)).lowercased()
     }
+
+    private static let davNamespace = "DAV:"
 
     private static func parseStatusCode(_ value: String) -> Int? {
         let fields = value.split(whereSeparator: { $0 == " " || $0 == "\t" })

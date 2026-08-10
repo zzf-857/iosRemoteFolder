@@ -223,6 +223,16 @@ private struct RemoteSourceFormView: View {
                     Text("例如 https://example.com/dav/")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Text("优先使用 HTTPS；HTTP 仅用于你明确信任的局域网服务。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if kind == .alist {
+                        Text("请为 Alist 创建限制在目标目录的只读账户，不要在应用中使用管理员账户。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 Section("认证（可选）") {

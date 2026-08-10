@@ -34,11 +34,12 @@ final class AppModel {
     @ObservationIgnored let cacheCoordinator: CacheCoordinator
     @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
+    @ObservationIgnored private let remoteConfigurationStore: RemoteSourceConfigurationStore
+    @ObservationIgnored private let credentialStore: RemoteCredentialStore
     @ObservationIgnored private let recentResourceStore: RecentResourceStore
     @ObservationIgnored private let resourceProgressStore: ResourceProgressStore
     @ObservationIgnored private let resourceReadingStore: ResourceReadingStore
-    /// Temporary in-memory ownership for WebDAV/Alist sources. D-032 will move
-    /// the non-sensitive descriptor to SwiftData and credentials to Keychain.
+    /// 只保存可管理来源的 ID；adapter 仍由唯一 SourceRegistry 持有。
     @ObservationIgnored private var managedRemoteSourceIDs: Set<UUID> = []
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
@@ -46,9 +47,17 @@ final class AppModel {
     /// mutation 任务代数；旧任务结束时不能清理已替换的新任务引用。
     @ObservationIgnored private var sourceMutationGeneration = 0
 
-    init(configurationStore: LocalSourceConfigurationStore? = nil) {
+    init(
+        configurationStore: LocalSourceConfigurationStore? = nil,
+        remoteConfigurationStore: RemoteSourceConfigurationStore? = nil,
+        credentialStore: RemoteCredentialStore? = nil
+    ) {
         let store = configurationStore ?? LocalSourceConfigurationStore()
+        let remoteStore = remoteConfigurationStore ?? RemoteSourceConfigurationStore()
+        let resolvedCredentialStore = credentialStore ?? RemoteCredentialStore()
         self.configurationStore = store
+        self.remoteConfigurationStore = remoteStore
+        self.credentialStore = resolvedCredentialStore
 
         var restoredConfigurations: [LocalSourceConfiguration] = []
         var startupError: String?
@@ -58,11 +67,19 @@ final class AppModel {
             startupError = error.localizedDescription
         }
 
+        var restoredRemoteConfigurations: [RemoteSourceConfiguration] = []
+        do {
+            restoredRemoteConfigurations = try remoteStore.load()
+        } catch {
+            startupError = startupError ?? error.localizedDescription
+        }
+
         let demoSources = SampleData.sources
         var allSources = demoSources
         var adapters = Self.makeDemoAdapters(for: demoSources)
         var startupFailures: [UUID: ResourceSourceError] = [:]
         var sourceIDs = Set(demoSources.map(\.id))
+        var restoredRemoteIDs: Set<UUID> = []
 
         for configuration in restoredConfigurations {
             // demo 来源与持久化来源不能共享 ID；保留 demo 并把冲突显示为配置错误，
@@ -82,6 +99,44 @@ final class AppModel {
             } catch {
                 let mapped = ResourceSourceError.mapping(error)
                 startupFailures[configuration.id] = mapped
+            }
+        }
+
+        for configuration in restoredRemoteConfigurations {
+            guard sourceIDs.insert(configuration.id).inserted else {
+                startupError = RemoteSourceConfigurationError.duplicateSourceID(configuration.id)
+                    .localizedDescription
+                continue
+            }
+
+            let source = configuration.resourceSource
+            allSources.append(source)
+            restoredRemoteIDs.insert(configuration.id)
+
+            var storedCredentials: RemoteCredentials?
+            if let reference = configuration.credentialReference {
+                do {
+                    storedCredentials = try resolvedCredentialStore.load(reference: reference)
+                    if storedCredentials == nil {
+                        startupFailures[configuration.id] = .authenticationRequired
+                    }
+                } catch {
+                    storedCredentials = nil
+                    startupFailures[configuration.id] = .authenticationRequired
+                }
+            }
+
+            do {
+                adapters.append(
+                    try WebDAVSourceAdapter(
+                        source: source,
+                        endpoint: URL(string: configuration.endpoint)!,
+                        username: storedCredentials?.username,
+                        password: storedCredentials?.password
+                    )
+                )
+            } catch {
+                startupFailures[configuration.id] = ResourceSourceError.mapping(error)
             }
         }
 
@@ -113,6 +168,7 @@ final class AppModel {
             registry: registry,
             cacheCoordinator: cacheCoordinator
         )
+        self.managedRemoteSourceIDs = restoredRemoteIDs
         self.sourceActionError = startupError
         self.sourcesStore.synchronize(
             with: registry.initialSnapshots,
@@ -247,7 +303,9 @@ final class AppModel {
     }
 
     func isManagedSource(_ sourceID: UUID) -> Bool {
-        isManagedLocalSource(sourceID) || managedRemoteSourceIDs.contains(sourceID)
+        isManagedLocalSource(sourceID)
+            || remoteConfigurationStore.configuration(for: sourceID) != nil
+            || managedRemoteSourceIDs.contains(sourceID)
     }
 
     /// 添加 Files 目录。目录 bookmark 与配置先在 composition root 创建，UI 不接触
@@ -275,8 +333,8 @@ final class AppModel {
         }
     }
 
-    /// Adds a temporary WebDAV or Alist `/dav/` source. Credentials stay in the
-    /// adapter's memory until D-032 supplies Keychain-backed persistence.
+    /// Adds a WebDAV or Alist `/dav/` source. The descriptor is persisted without
+    /// secrets; credentials are written to Keychain before registry registration.
     func addRemoteSource(
         name: String,
         endpoint: String,
@@ -353,25 +411,62 @@ final class AppModel {
             let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !displayName.isEmpty,
                   kind == .webdav || kind == .alist,
-                  let endpointURL = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                throw ResourceSourceError.invalidReference
+                  let rawEndpoint = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw RemoteSourceConfigurationError.invalidEndpoint
             }
+            let endpointURL = try WebDAVSourceAdapter.normalizedEndpoint(rawEndpoint)
+            let sourceID = UUID()
+            let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            let credentialReference = (trimmedUsername.isEmpty && password.isEmpty)
+                ? nil
+                : sourceID.uuidString.lowercased()
             let source = ResourceSource(
-                id: UUID(),
+                id: sourceID,
                 name: displayName,
                 kind: kind,
                 endpoint: endpointURL.absoluteString,
                 status: .disconnected,
                 itemCountDescription: ""
             )
+            let configuration = RemoteSourceConfiguration(
+                id: sourceID,
+                displayName: displayName,
+                endpoint: endpointURL,
+                kind: kind,
+                credentialReference: credentialReference
+            )
             let adapter = try WebDAVSourceAdapter(
                 source: source,
                 endpoint: endpointURL,
-                username: username,
+                username: trimmedUsername,
                 password: password
             )
             try Task.checkCancellation()
-            try await registry.register(source: source, adapter: adapter)
+            if let credentialReference {
+                try credentialStore.save(
+                    RemoteCredentials(username: trimmedUsername, password: password),
+                    reference: credentialReference
+                )
+            }
+            do {
+                try remoteConfigurationStore.insert(configuration)
+            } catch {
+                if let credentialReference {
+                    try? credentialStore.remove(reference: credentialReference)
+                }
+                throw error
+            }
+            do {
+                // After descriptor persistence starts, finish paired registry
+                // registration before honoring cancellation.
+                try await registry.register(source: source, adapter: adapter)
+            } catch {
+                _ = try? remoteConfigurationStore.remove(sourceID: sourceID)
+                if let credentialReference {
+                    try? credentialStore.remove(reference: credentialReference)
+                }
+                throw error
+            }
             managedRemoteSourceIDs.insert(source.id)
             await synchronizeStore()
             guard !Task.isCancelled else { return }
@@ -431,9 +526,22 @@ final class AppModel {
                     _ = try? configurationStore.insert(removedConfiguration)
                     throw error
                 }
-            } else if managedRemoteSourceIDs.contains(sourceID) {
-                try await registry.remove(sourceID: sourceID)
+            } else if remoteConfigurationStore.configuration(for: sourceID) != nil {
+                let removedConfiguration = try remoteConfigurationStore.remove(sourceID: sourceID)
+                do {
+                    try await registry.remove(sourceID: sourceID)
+                } catch {
+                    _ = try? remoteConfigurationStore.insert(removedConfiguration)
+                    throw error
+                }
                 managedRemoteSourceIDs.remove(sourceID)
+                if let reference = removedConfiguration.credentialReference {
+                    do {
+                        try credentialStore.remove(reference: reference)
+                    } catch {
+                        sourceActionError = "来源已移除，但系统凭证清理失败"
+                    }
+                }
             } else {
                 throw LocalSourceConfigurationError.sourceNotFound(sourceID)
             }
