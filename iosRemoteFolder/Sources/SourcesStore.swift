@@ -164,6 +164,9 @@ final class SourcesStore {
         transition(sourceID, to: .connecting)
         let registry = self.registry
         let task = Task {
+            defer {
+                self.finishConnectionTask(sourceID: sourceID, generation: generation)
+            }
             do {
                 try await registry.connect(sourceID: sourceID)
                 let resources = try await registry.listResources(sourceID: sourceID, at: .root)
@@ -251,6 +254,9 @@ final class SourcesStore {
         }
         let registry = self.registry
         let task = Task {
+            defer {
+                self.finishBrowseTask(sourceID: sourceID, generation: generation)
+            }
             do {
                 let items = try await registry.listResources(sourceID: sourceID, at: path)
                 try Task.checkCancellation()
@@ -362,6 +368,11 @@ final class SourcesStore {
         connectionGenerations[sourceID] == generation
     }
 
+    private func finishConnectionTask(sourceID: UUID, generation: Int) {
+        guard isCurrentConnectionGeneration(sourceID, generation) else { return }
+        connectionTasks.removeValue(forKey: sourceID)
+    }
+
     private func nextBrowseGeneration(for sourceID: UUID) -> Int {
         let generation = (browseGenerations[sourceID] ?? 0) + 1
         browseGenerations[sourceID] = generation
@@ -370,6 +381,11 @@ final class SourcesStore {
 
     private func isCurrentBrowseGeneration(_ sourceID: UUID, _ generation: Int) -> Bool {
         browseGenerations[sourceID] == generation
+    }
+
+    private func finishBrowseTask(sourceID: UUID, generation: Int) {
+        guard isCurrentBrowseGeneration(sourceID, generation) else { return }
+        browseTasks.removeValue(forKey: sourceID)
     }
 
     private func update(_ sourceID: UUID, _ mutation: (inout Entry) -> Void) {
