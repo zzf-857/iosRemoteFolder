@@ -19,8 +19,10 @@ struct HomeView: View {
             .navigationTitle("首页")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("搜索", systemImage: "magnifyingglass") {
-                        appModel.currentTab = .browse
+                    NavigationLink {
+                        ResourceSearchView()
+                    } label: {
+                        Label("搜索", systemImage: "magnifyingglass")
                     }
                 }
             }
@@ -29,7 +31,262 @@ struct HomeView: View {
             .navigationDestination(for: ResourceItem.self) { resource in
                 ResourceViewerHost(resource: resource)
             }
+            .glassNavigationBar()
         }
+    }
+}
+
+struct ResourceSearchView: View {
+    @Environment(AppModel.self) private var appModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var query = ""
+    @State private var selectedKind: ResourceKind?
+    @State private var selectedSourceID: UUID?
+    @State private var results: [ResourceItem] = []
+    @State private var indexedResourceCount = 0
+    @State private var isSearching = false
+    @State private var errorMessage: String?
+    @State private var retryRevision = 0
+
+    private var request: ResourceSearchRequest {
+        ResourceSearchRequest(
+            query: query,
+            kind: selectedKind,
+            sourceID: selectedSourceID,
+            retryRevision: retryRevision
+        )
+    }
+
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        Group {
+            if let errorMessage {
+                ContentUnavailableView {
+                    Label("搜索不可用", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(errorMessage)
+                } actions: {
+                    Button("重试") { retryRevision += 1 }
+                }
+            } else if trimmedQuery.isEmpty {
+                ContentUnavailableView {
+                    Label(
+                        indexedResourceCount == 0 ? "暂无已浏览资源" : "搜索资源",
+                        systemImage: "doc.text.magnifyingglass"
+                    )
+                } description: {
+                    if let indexWarning = appModel.resourceIndexError {
+                        Text("\(indexWarning)。返回浏览页刷新对应目录后会再次更新。")
+                    } else if indexedResourceCount > 0 {
+                        Text("已索引 \(indexedResourceCount) 个资源")
+                    }
+                }
+            } else if isSearching {
+                ProgressView("正在搜索…")
+            } else if results.isEmpty {
+                ContentUnavailableView.search(text: trimmedQuery)
+            } else {
+                List(results) { resource in
+                    resultRow(for: resource)
+                }
+            }
+        }
+        .navigationTitle("搜索")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $query, prompt: "名称或路径")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                filterMenu
+            }
+        }
+        .task(id: request) {
+            await performSearch()
+        }
+        .onChange(of: appModel.sources.map(\.id)) { _, sourceIDs in
+            if let selectedSourceID, !sourceIDs.contains(selectedSourceID) {
+                self.selectedSourceID = nil
+            }
+            retryRevision += 1
+        }
+    }
+
+    @ViewBuilder
+    private func resultRow(for resource: ResourceItem) -> some View {
+        let row = ResourceSearchResultRow(
+            resource: resource,
+            sourceName: appModel.sourceName(for: resource.sourceID)
+        )
+
+        if resource.kind == .folder {
+            Button {
+                dismiss()
+                appModel.openIndexedFolder(resource)
+            } label: {
+                row
+            }
+            .buttonStyle(.plain)
+        } else {
+            NavigationLink(value: resource) {
+                row
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var filterMenu: some View {
+        Menu {
+            Picker("来源", selection: $selectedSourceID) {
+                Text("全部来源").tag(UUID?.none)
+                ForEach(appModel.sources) { source in
+                    Text(source.name).tag(UUID?.some(source.id))
+                }
+            }
+            Picker("类型", selection: $selectedKind) {
+                Text("全部类型").tag(ResourceKind?.none)
+                ForEach(ResourceKind.allCases) { kind in
+                    Text(kind.title).tag(ResourceKind?.some(kind))
+                }
+            }
+        } label: {
+            Image(
+                systemName: selectedKind == nil && selectedSourceID == nil
+                    ? "line.3.horizontal.decrease.circle"
+                    : "line.3.horizontal.decrease.circle.fill"
+            )
+        }
+        .accessibilityLabel("筛选搜索结果")
+    }
+
+    private func refreshIndexedResourceCount() async {
+        do {
+            indexedResourceCount = try await appModel.resourceIndexStore.indexedResourceCount()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func performSearch() async {
+        let term = trimmedQuery
+        guard !term.isEmpty else {
+            results = []
+            isSearching = false
+            await refreshIndexedResourceCount()
+            return
+        }
+
+        isSearching = true
+        errorMessage = nil
+        do {
+            try await Task.sleep(for: .milliseconds(180))
+            try Task.checkCancellation()
+            let matches = try await appModel.resourceIndexStore.search(
+                term,
+                kind: selectedKind,
+                sourceID: selectedSourceID
+            )
+            try Task.checkCancellation()
+            results = matches
+            indexedResourceCount = try await appModel.resourceIndexStore.indexedResourceCount()
+            isSearching = false
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            results = []
+            isSearching = false
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct ResourceSearchRequest: Hashable {
+    let query: String
+    let kind: ResourceKind?
+    let sourceID: UUID?
+    let retryRevision: Int
+}
+
+private struct ResourceSearchResultRow: View {
+    let resource: ResourceItem
+    let sourceName: String
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                stackedLayout
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    compactLayout
+                    stackedLayout
+                }
+            }
+        }
+        .frame(minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(resource.name)
+        .accessibilityValue("\(resource.kind.title)，\(sourceName)，\(resource.path)")
+        .accessibilityHint(resource.kind == .folder ? "打开文件夹" : "打开资源")
+    }
+
+    private var compactLayout: some View {
+        HStack(alignment: .top, spacing: 12) {
+            icon
+            details
+                .layoutPriority(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var stackedLayout: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                icon
+                Text(resource.name)
+                    .font(.body.weight(.medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
+            }
+            contextText
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var icon: some View {
+        Image(systemName: resource.kind.systemImage)
+            .font(.title3)
+            .foregroundStyle(AppTheme.accent)
+            .frame(width: 36, height: 36)
+            .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityHidden(true)
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(resource.name)
+                .font(.body.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            contextText
+        }
+    }
+
+    private var contextText: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(sourceName) · \(resource.kind.title)")
+            Text(resource.path)
+                .lineLimit(2)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

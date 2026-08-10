@@ -7,6 +7,174 @@ import UniformTypeIdentifiers
 /// more specific source error back to the request boundary.
 protocol HTTPRedirectFailureReporting: AnyObject, Sendable {
     func consumeUnsafeRedirect() -> Bool
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    )
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    )
+}
+
+/// Per-task delegate for strict, snapshot-backed Range reads.
+///
+/// `download(for:delegate:)` only guarantees task-level callbacks for its
+/// delegate argument. `didCreateTask` is synchronous and runs before resume, so
+/// observing the task's documented `Progress` object here catches a bad final
+/// response or an oversized transfer without relying on download-only delegate
+/// callbacks. The response body itself stays in URLSession's temporary file.
+private final class BoundedRangeTaskDelegate: NSObject,
+    URLSessionTaskDelegate,
+    HTTPRedirectFailureReporting,
+    @unchecked Sendable {
+    private struct State {
+        var responseWasChecked = false
+        var failure: ResourceSourceError?
+        var invalidatesRangeCapability = false
+        var observations: [NSKeyValueObservation] = []
+    }
+
+    private let maximumBytes: Int64
+    private let forwardingDelegate: (any HTTPRedirectFailureReporting)?
+    private let validateResponse: @Sendable (HTTPURLResponse) -> ResourceSourceError?
+    private let lock = NSLock()
+    private var state = State()
+
+    init(
+        maximumBytes: Int64,
+        forwardingDelegate: (any URLSessionTaskDelegate)?,
+        validateResponse: @escaping @Sendable (HTTPURLResponse) -> ResourceSourceError?
+    ) {
+        self.maximumBytes = maximumBytes
+        self.forwardingDelegate = forwardingDelegate as? any HTTPRedirectFailureReporting
+        self.validateResponse = validateResponse
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didCreateTask task: URLSessionTask
+    ) {
+        let progress = task.progress
+        let totalObservation = progress.observe(
+            \.totalUnitCount,
+            options: [.initial, .new]
+        ) { [weak self, weak task] _, _ in
+            guard let self, let task else { return }
+            inspect(task)
+        }
+        let completedObservation = progress.observe(
+            \.completedUnitCount,
+            options: [.initial, .new]
+        ) { [weak self, weak task] _, _ in
+            guard let self, let task else { return }
+            inspect(task)
+        }
+
+        lock.lock()
+        state.observations = [totalObservation, completedObservation]
+        lock.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard let forwardingDelegate else {
+            completionHandler(request)
+            return
+        }
+        forwardingDelegate.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request,
+            completionHandler: completionHandler
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        forwardingDelegate?.urlSession(
+            session,
+            task: task,
+            didCompleteWithError: error
+        )
+    }
+
+    func consumeUnsafeRedirect() -> Bool {
+        forwardingDelegate?.consumeUnsafeRedirect() ?? false
+    }
+
+    func failure() -> ResourceSourceError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.failure
+    }
+
+    func invalidatesRangeCapability() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.invalidatesRangeCapability
+    }
+
+    func stopObserving() {
+        let observations: [NSKeyValueObservation]
+        lock.lock()
+        observations = state.observations
+        state.observations.removeAll()
+        lock.unlock()
+        observations.forEach { $0.invalidate() }
+    }
+
+    private func inspect(_ task: URLSessionTask) {
+        let response = task.response as? HTTPURLResponse
+        let bytesReceived = task.countOfBytesReceived
+        let bytesExpected = task.countOfBytesExpectedToReceive
+        var shouldCancel = false
+
+        lock.lock()
+        if state.failure == nil,
+           !state.responseWasChecked,
+           let response,
+           !Self.isIntermediateResponse(response.statusCode) {
+            state.responseWasChecked = true
+            state.failure = validateResponse(response)
+            if state.failure != nil,
+               response.statusCode == 200 {
+                state.invalidatesRangeCapability = true
+            }
+        }
+        if state.failure == nil,
+           (bytesReceived > maximumBytes
+                || (state.responseWasChecked
+                    && bytesExpected >= 0
+                    && bytesExpected > maximumBytes)) {
+            state.failure = .invalidResponse
+        }
+        shouldCancel = state.failure != nil
+        lock.unlock()
+
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    private static func isIntermediateResponse(_ statusCode: Int) -> Bool {
+        (300..<400).contains(statusCode) || statusCode == 401 || statusCode == 407
+    }
 }
 
 /// HTTP/HTTPS 资源描述：一个来源由一组预先配置的远端 URL 组成。
@@ -42,8 +210,8 @@ struct HTTPResourceDescriptor: Hashable, Sendable {
 
 /// HTTP/HTTPS 直链来源 adapter。
 ///
-/// 能力边界：支持连接探测（HEAD，405/501 时降级为 1 字节 Range GET，并把
-/// 有效证据回写能力缓存）、HEAD 元数据（206 探测时从 `Content-Range` 解析
+/// 能力边界：支持连接探测（HEAD 未声明 Range 或返回 405/501 时，降级为
+/// 1 字节 Range GET 并把有效证据回写能力缓存）、HEAD 元数据（206 探测时从 `Content-Range` 解析
 /// 总长度）、GET 数据读取和可选 Range。服务器未确认支持 Range 前不声称
 /// `rangeRead`；Range 能力按“逻辑路径 + 直链 URL”缓存已验证证据。
 /// 206 分片必须通过 `Content-Range` 单位/起止/总长度与响应体长度校验才会
@@ -153,20 +321,26 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         let key = capabilityKey(for: descriptor)
         do {
             let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
-            // HEAD 成功时，Accept-Ranges: bytes 是唯一有效证据；缺失或其他值
-            // 明确写入 false，避免陈旧的 true 证据残留在缓存中。
-            verifiedRangeCapability.set(Self.acceptsByteRanges(response), for: key)
+            if Self.acceptsByteRanges(response) {
+                verifiedRangeCapability.set(true, for: key)
+                return
+            }
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
-            // 服务器不支持 HEAD：降级为 1 字节 Range GET 探测。
-            // 探测只看状态与响应头，不消费响应体。
-            let response = try await probeResponse(
-                method: "GET",
-                descriptor: descriptor,
-                headers: ["Range": "bytes=0-0"]
-            )
-            // 与 fetchMetadata 共用同一证据规则：只有 Content-Range 完整校验通过的
-            // 206 才算有效证据；malformed 206 一律不得缓存为支持 Range。
-            verifiedRangeCapability.set(Self.verifiedRangeProbeEvidence(from: response), for: key)
+            // HEAD is optional. Continue with the same real Range probe used
+            // when HEAD succeeds without advertising byte ranges.
+        } catch ResourceSourceError.httpStatus(let code) where code == 416 {
+            verifiedRangeCapability.set(false, for: key)
+            return
+        }
+
+        // A number of gateways answer HEAD themselves but only reveal byte-range
+        // support after redirecting a real GET.
+        do {
+            _ = try await probeRangeMetadata(descriptor: descriptor, key: key)
+        } catch ResourceSourceError.httpStatus(let code) where code == 416 {
+            // A reachable endpoint that rejects bytes=0-0 can still connect, but
+            // it has not proved a usable random-read contract.
+            verifiedRangeCapability.set(false, for: key)
         }
     }
 
@@ -243,20 +417,25 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         do {
             let response = try await probeResponse(method: "HEAD", descriptor: descriptor)
             let metadata = Self.headMetadata(from: response, descriptor: descriptor)
-            verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
-            return metadata
+            if metadata.acceptsRanges {
+                verifiedRangeCapability.set(true, for: key)
+                return metadata
+            }
+            do {
+                let rangeMetadata = try await probeRangeMetadata(
+                    descriptor: descriptor,
+                    key: key
+                )
+                return Self.mergingRangeEvidence(base: metadata, probe: rangeMetadata)
+            } catch ResourceSourceError.httpStatus(let code) where code == 416 {
+                verifiedRangeCapability.set(false, for: key)
+                return metadata
+            }
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
-            // 服务器不支持 HEAD：用 1 字节 Range GET 探测，同时确认 Range 支持。
-            let response = try await probeResponse(
-                method: "GET",
+            return try await probeRangeMetadata(
                 descriptor: descriptor,
-                headers: ["Range": "bytes=0-0"]
+                key: key
             )
-            let metadata = Self.partialGetMetadata(from: response, descriptor: descriptor)
-            // 与 connect() 共用同一证据规则：malformed 206 不声明、不缓存 Range
-            // 支持，也不把不可信的 Content-Range 总长度带入 metadata revision。
-            verifiedRangeCapability.set(metadata.acceptsRanges, for: key)
-            return metadata
         }
     }
 
@@ -272,15 +451,42 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         }
 
         let key = capabilityKey(for: descriptor)
+        let expectedTotalLength = item.metadata.acceptsRanges
+            ? item.metadata.byteSize.flatMap { $0 > 0 ? $0 : nil }
+            : nil
+
+        if let expectedTotalLength {
+            return try await readStrictRange(
+                descriptor: descriptor,
+                range: range,
+                expectedTotalLength: expectedTotalLength,
+                key: key
+            )
+        }
+
         let (response, bytes) = try await performStreamingRequest(
             method: "GET",
             descriptor: descriptor,
-            headers: ["Range": range.httpHeaderValue]
+            headers: [
+                "Range": range.httpHeaderValue,
+                "Accept-Encoding": "identity"
+            ]
         )
         switch response.statusCode {
         case 206:
-            return try await validatedPartialData(from: bytes, response: response, requested: range, key: key)
+            return try await validatedPartialData(
+                from: bytes,
+                response: response,
+                requested: range,
+                key: key,
+                expectedTotalLength: expectedTotalLength
+            )
         case 200:
+            if expectedTotalLength != nil {
+                bytes.task.cancel()
+                verifiedRangeCapability.set(false, for: key)
+                throw ResourceSourceError.invalidResponse
+            }
             // 明确降级：只有 200 才视为服务器忽略 Range 的全量回退。
             // 只流式消费请求区间，不把完整响应载入内存。
             verifiedRangeCapability.set(false, for: key)
@@ -405,11 +611,185 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         return (httpResponse, bytes)
     }
 
+    /// Strict session Range path. The response body is written by URLSession to
+    /// a temporary file, with the task delegate cancelling at the first
+    /// documented progress update that proves a bad response or an oversized
+    /// requested fragment.
+    private func readStrictRange(
+        descriptor: HTTPResourceDescriptor,
+        range: ResourceByteRange,
+        expectedTotalLength: Int64,
+        key: CapabilityKey
+    ) async throws -> Data {
+        guard let expectedLength = range.validatedLength,
+              expectedLength > 0,
+              range.upperBound < expectedTotalLength else {
+            throw ResourceSourceError.invalidReference
+        }
+
+        let boundedDelegate = BoundedRangeTaskDelegate(
+            maximumBytes: expectedLength,
+            forwardingDelegate: taskDelegate
+        ) { response in
+            if !(200..<300).contains(response.statusCode) {
+                return .http(statusCode: response.statusCode)
+            }
+            guard response.statusCode == 206 else {
+                return .invalidResponse
+            }
+            do {
+                try Self.validateStrictPartialResponse(
+                    response,
+                    requested: range,
+                    expectedTotalLength: expectedTotalLength,
+                    expectedLength: expectedLength
+                )
+                return nil
+            } catch let error as ResourceSourceError {
+                return error
+            } catch {
+                return .invalidResponse
+            }
+        }
+        defer { boundedDelegate.stopObserving() }
+        let request = makeRequest(
+            method: "GET",
+            descriptor: descriptor,
+            headers: [
+                "Range": range.httpHeaderValue,
+                "Accept-Encoding": "identity"
+            ]
+        )
+
+        let temporaryURL: URL
+        let response: URLResponse
+        do {
+            (temporaryURL, response) = try await session.download(
+                for: request,
+                delegate: boundedDelegate
+            )
+        } catch {
+            if Task.isCancelled {
+                throw ResourceSourceError.cancelled
+            }
+            if boundedDelegate.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
+            if let failure = boundedDelegate.failure() {
+                if boundedDelegate.invalidatesRangeCapability() {
+                    verifiedRangeCapability.set(false, for: key)
+                }
+                throw failure
+            }
+            throw ResourceSourceError.mapping(error)
+        }
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        guard !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ResourceSourceError.unavailable
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw responseError(for: httpResponse)
+        }
+        guard httpResponse.statusCode == 206 else {
+            if httpResponse.statusCode == 200 {
+                verifiedRangeCapability.set(false, for: key)
+            }
+            throw ResourceSourceError.invalidResponse
+        }
+        try Self.validateStrictPartialResponse(
+            httpResponse,
+            requested: range,
+            expectedTotalLength: expectedTotalLength,
+            expectedLength: expectedLength
+        )
+        guard boundedDelegate.failure() == nil else {
+            if boundedDelegate.invalidatesRangeCapability() {
+                verifiedRangeCapability.set(false, for: key)
+            }
+            throw boundedDelegate.failure() ?? ResourceSourceError.invalidResponse
+        }
+
+        let data: Data
+        do {
+            data = try Self.readBoundedTemporaryFile(
+                at: temporaryURL,
+                expectedLength: expectedLength
+            )
+        } catch let error as ResourceSourceError {
+            throw error
+        } catch {
+            throw ResourceSourceError.mapping(error)
+        }
+        guard !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
+        verifiedRangeCapability.set(true, for: key)
+        return data
+    }
+
     private func responseError(for response: HTTPURLResponse) -> ResourceSourceError {
         if taskDelegate != nil, (300..<400).contains(response.statusCode) {
             return .unsafeRedirect
         }
         return .http(statusCode: response.statusCode)
+    }
+
+    /// Performs a real one-byte GET so gateways that omit `Accept-Ranges` from
+    /// HEAD can still prove support. A 206 response is body-validated through
+    /// the same path as ordinary reads; a 200 response is cancelled immediately
+    /// and contributes only response headers, never Range capability.
+    private func probeRangeMetadata(
+        descriptor: HTTPResourceDescriptor,
+        key: CapabilityKey
+    ) async throws -> ResourceMetadata {
+        let range = ResourceByteRange(lowerBound: 0, upperBound: 0)
+        let stream: (HTTPURLResponse, URLSession.AsyncBytes)
+        do {
+            stream = try await performStreamingRequest(
+                method: "GET",
+                descriptor: descriptor,
+                headers: [
+                    "Range": range.httpHeaderValue,
+                    "Accept-Encoding": "identity"
+                ]
+            )
+        } catch ResourceSourceError.httpStatus(let code) where code == 416 {
+            verifiedRangeCapability.set(false, for: key)
+            throw ResourceSourceError.httpStatus(code)
+        }
+        let (response, bytes) = stream
+        switch response.statusCode {
+        case 206:
+            guard Self.verifiedRangeProbeEvidence(from: response) else {
+                bytes.task.cancel()
+                verifiedRangeCapability.set(false, for: key)
+                throw ResourceSourceError.invalidResponse
+            }
+            do {
+                _ = try await validatedPartialData(
+                    from: bytes,
+                    response: response,
+                    requested: range,
+                    key: key
+                )
+            } catch {
+                verifiedRangeCapability.set(false, for: key)
+                throw error
+            }
+            return Self.partialGetMetadata(from: response, descriptor: descriptor)
+        case 200:
+            bytes.task.cancel()
+            verifiedRangeCapability.set(false, for: key)
+            return Self.partialGetMetadata(from: response, descriptor: descriptor)
+        default:
+            bytes.task.cancel()
+            verifiedRangeCapability.set(false, for: key)
+            throw ResourceSourceError.invalidResponse
+        }
     }
 
     /// 探测请求：只消费状态与响应头，立即取消任务释放连接，避免拉取全量内容。
@@ -450,9 +830,15 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         from bytes: URLSession.AsyncBytes,
         response: HTTPURLResponse,
         requested: ResourceByteRange,
-        key: CapabilityKey
+        key: CapabilityKey,
+        expectedTotalLength: Int64? = nil
     ) async throws -> Data {
         guard let contentRange = Self.parseContentRange(from: response) else {
+            bytes.task.cancel()
+            throw ResourceSourceError.invalidResponse
+        }
+        if let expectedTotalLength,
+           contentRange.total != expectedTotalLength {
             bytes.task.cancel()
             throw ResourceSourceError.invalidResponse
         }
@@ -491,6 +877,64 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         }
         verifiedRangeCapability.set(true, for: key)
         return collected
+    }
+
+    private static func validateStrictPartialResponse(
+        _ response: HTTPURLResponse,
+        requested: ResourceByteRange,
+        expectedTotalLength: Int64,
+        expectedLength: Int64
+    ) throws {
+        guard response.statusCode == 206,
+              let contentRange = parseContentRange(from: response),
+              contentRange.first == requested.lowerBound,
+              contentRange.last == requested.upperBound,
+              contentRange.total == expectedTotalLength,
+              contentRange.last < expectedTotalLength else {
+            throw ResourceSourceError.invalidResponse
+        }
+        if response.expectedContentLength >= 0,
+           response.expectedContentLength != expectedLength {
+            throw ResourceSourceError.invalidResponse
+        }
+        if let contentEncoding = headerValue("Content-Encoding", in: response),
+           contentEncoding.caseInsensitiveCompare("identity") != .orderedSame {
+            throw ResourceSourceError.invalidResponse
+        }
+    }
+
+    /// Reads at most one byte beyond the expected fragment. This keeps the
+    /// in-process allocation bounded even if download progress reporting was
+    /// delayed or the temporary file changed unexpectedly.
+    private static func readBoundedTemporaryFile(
+        at url: URL,
+        expectedLength: Int64
+    ) throws -> Data {
+        guard expectedLength > 0,
+              expectedLength < Int64.max,
+              let expectedCount = Int(exactly: expectedLength),
+              let readLimit = Int(exactly: expectedLength + 1) else {
+            throw ResourceSourceError.invalidResponse
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var data = Data()
+        data.reserveCapacity(expectedCount)
+
+        while data.count < readLimit {
+            let remaining = readLimit - data.count
+            let chunkSize = min(256 * 1024, remaining)
+            guard let chunk = try handle.read(upToCount: chunkSize),
+                  !chunk.isEmpty else {
+                break
+            }
+            data.append(chunk)
+        }
+        guard data.count == expectedCount else {
+            throw ResourceSourceError.invalidResponse
+        }
+        return data
     }
 
     /// 服务器忽略 Range 时的流式切片：跳过区间前的字节，只收集请求区间。
@@ -562,7 +1006,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         )
     }
 
-    /// 405/501 后的探测元数据：206 的 `Content-Length` 是单字节分片大小，
+    /// Range GET 探测元数据：206 的 `Content-Length` 是单字节分片大小，
     /// 所以完整大小只能来自合法 `Content-Range` 总长度。若服务端忽略 Range
     /// 返回 200，则其 Content-Length 才可能代表完整响应大小。
     private static func partialGetMetadata(
@@ -591,6 +1035,21 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             isDirectory: false,
             acceptsRanges: verifiedRangeProbeEvidence(from: response),
             revision: revision(from: response, modifiedAt: modifiedAt, byteSize: byteSize)
+        )
+    }
+
+    private static func mergingRangeEvidence(
+        base: ResourceMetadata,
+        probe: ResourceMetadata
+    ) -> ResourceMetadata {
+        ResourceMetadata(
+            byteSize: probe.byteSize ?? base.byteSize,
+            modifiedAt: base.modifiedAt ?? probe.modifiedAt,
+            mimeType: base.mimeType ?? probe.mimeType,
+            typeIdentifier: base.typeIdentifier ?? probe.typeIdentifier,
+            isDirectory: false,
+            acceptsRanges: probe.acceptsRanges,
+            revision: probe.revision.isKnown ? probe.revision : base.revision
         )
     }
 
@@ -699,21 +1158,20 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
     }
 
-    /// HEAD 405/501 降级探测的统一证据规则，`connect()` 与 `fetchMetadata()` 共用。
+    /// 动态 Range 探测的统一证据规则，`connect()` 与 `fetchMetadata()` 共用。
     ///
     /// 只有同时满足以下条件的 206 才确认 Range 支持：
-    /// - `Content-Range` 为合法的 `bytes 0-0/<total|*>`，与探测区间 `bytes=0-0` 对齐；
-    /// - 声明总长度时必须覆盖终点（total > last）；
-    /// - 响应携带 `Content-Length` 时必须等于探测分片大小，缺失则不猜测。
+    /// - `Content-Range` 为合法的 `bytes 0-0/<total>`，与探测区间 `bytes=0-0` 对齐；
+    /// - 总长度必须已知且覆盖终点（total > last）；
+    /// - 响应携带 `Content-Length` 时必须等于探测分片大小，正文仍必须实际校验为 1 字节。
     /// malformed 206 不是有效证据，绝不能据此把能力缓存为支持 Range。
     private static func verifiedRangeProbeEvidence(from response: HTTPURLResponse) -> Bool {
         guard response.statusCode == 206,
               let contentRange = parseContentRange(from: response),
               contentRange.first == 0,
-              contentRange.last == 0 else {
-            return false
-        }
-        if let total = contentRange.total, total <= contentRange.last {
+              contentRange.last == 0,
+              let total = contentRange.total,
+              total > contentRange.last else {
             return false
         }
         let fragmentLength = contentRange.last - contentRange.first + 1

@@ -12,8 +12,8 @@ actor ResourceContentSession {
 
     private enum Operation: Sendable {
         case metadata
-        case full(maximumBytes: Int64)
-        case range(ResourceByteRange, maximumBytes: Int64)
+        case full(ResourceMetadata, maximumBytes: Int64)
+        case range(ResourceByteRange, ResourceMetadata, maximumBytes: Int64)
     }
 
     private enum Outcome: Sendable {
@@ -24,12 +24,14 @@ actor ResourceContentSession {
 
     private let backend: Backend
     private let item: ResourceItem
+    private var metadataSnapshot: ResourceMetadata?
     private var isTerminated = false
     private var activeOperations: [UUID: Task<Outcome, Never>] = [:]
 
     init(registry: SourceRegistry, item: ResourceItem) {
         self.backend = .source(registry)
         self.item = item
+        self.metadataSnapshot = nil
     }
 
     init(
@@ -39,12 +41,21 @@ actor ResourceContentSession {
     ) {
         self.backend = .cache(cacheCoordinator, metadata)
         self.item = item
+        self.metadataSnapshot = metadata
     }
 
-    /// 获取该位置的最新 typed metadata。
+    /// 获取本次打开的 typed metadata 快照。首次来源探测成功后保持不变。
     func fetchMetadata() async throws -> ResourceMetadata {
+        guard !isTerminated, !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
+        if let metadataSnapshot {
+            return metadataSnapshot
+        }
+
         let outcome = try await perform(.metadata)
         if case .metadata(let metadata) = outcome {
+            metadataSnapshot = metadata
             return metadata
         }
         if case .failure(let error) = outcome { throw error }
@@ -54,7 +65,8 @@ actor ResourceContentSession {
     /// 在获取最新 metadata 并确认完整大小不超过预算后读取完整内容。
     func readData(maximumBytes: Int64) async throws -> Data {
         guard maximumBytes > 0 else { throw ResourceSourceError.invalidReference }
-        let outcome = try await perform(.full(maximumBytes: maximumBytes))
+        let metadata = try await fetchMetadata()
+        let outcome = try await perform(.full(metadata, maximumBytes: maximumBytes))
         if case .data(let data) = outcome {
             return data
         }
@@ -75,7 +87,8 @@ actor ResourceContentSession {
             throw ResourceSourceError.responseTooLarge
         }
 
-        let outcome = try await perform(.range(range, maximumBytes: maximumBytes))
+        let metadata = try await fetchMetadata()
+        let outcome = try await perform(.range(range, metadata, maximumBytes: maximumBytes))
         if case .data(let data) = outcome {
             return data
         }
@@ -156,18 +169,7 @@ actor ResourceContentSession {
                 return .metadata(metadata)
             }
 
-        case .full(let maximumBytes):
-            let metadata: ResourceMetadata
-            switch backend {
-            case .source(let registry):
-                metadata = try await registry.fetchMetadata(
-                    sourceID: item.sourceID,
-                    for: item
-                )
-            case .cache(_, let cachedMetadata):
-                metadata = cachedMetadata
-            }
-            try Task.checkCancellation()
+        case .full(let metadata, let maximumBytes):
             guard !metadata.isDirectory else {
                 throw ResourceSourceError.capabilityUnavailable
             }
@@ -180,9 +182,10 @@ actor ResourceContentSession {
             let data: Data
             switch backend {
             case .source(let registry):
+                let snapshotItem = try snapshotItem(for: item, metadata: metadata)
                 data = try await registry.readData(
-                    sourceID: item.sourceID,
-                    for: item,
+                    sourceID: snapshotItem.sourceID,
+                    for: snapshotItem,
                     range: nil
                 )
             case .cache(let cacheCoordinator, _):
@@ -208,23 +211,18 @@ actor ResourceContentSession {
             }
             return .data(data)
 
-        case .range(let range, let maximumBytes):
-            let metadata: ResourceMetadata
-            switch backend {
-            case .source(let registry):
-                metadata = try await registry.fetchMetadata(
-                    sourceID: item.sourceID,
-                    for: item
-                )
-            case .cache:
+        case .range(let range, let metadata, let maximumBytes):
+            guard case .source = backend else {
                 throw ResourceSourceError.capabilityUnavailable
             }
-            try Task.checkCancellation()
             guard !metadata.isDirectory, metadata.acceptsRanges else {
                 throw ResourceSourceError.capabilityUnavailable
             }
-            guard item.capabilities.contains(.rangeRead) else {
-                throw ResourceSourceError.capabilityUnavailable
+            guard let byteSize = metadata.byteSize,
+                  byteSize > 0,
+                  range.lowerBound < byteSize,
+                  range.upperBound < byteSize else {
+                throw ResourceSourceError.invalidReference
             }
             guard let requestedLength = checkedLength(of: range) else {
                 throw ResourceSourceError.invalidReference
@@ -233,9 +231,10 @@ actor ResourceContentSession {
             let data: Data
             switch backend {
             case .source(let registry):
+                let snapshotItem = try snapshotItem(for: item, metadata: metadata)
                 data = try await registry.readData(
-                    sourceID: item.sourceID,
-                    for: item,
+                    sourceID: snapshotItem.sourceID,
+                    for: snapshotItem,
                     range: range
                 )
             case .cache:
@@ -245,7 +244,7 @@ actor ResourceContentSession {
             guard Int64(data.count) <= maximumBytes else {
                 throw ResourceSourceError.responseTooLarge
             }
-            guard Int64(data.count) <= requestedLength else {
+            guard Int64(data.count) == requestedLength else {
                 throw ResourceSourceError.invalidResponse
             }
             return .data(data)
@@ -254,6 +253,24 @@ actor ResourceContentSession {
 
     private static func checkedLength(of range: ResourceByteRange) -> Int64? {
         range.validatedLength
+    }
+
+    private static func snapshotItem(
+        for item: ResourceItem,
+        metadata: ResourceMetadata
+    ) throws -> ResourceItem {
+        guard let logicalPath = ResourcePath(rawValue: item.path) else {
+            throw ResourceSourceError.invalidReference
+        }
+        return ResourceItem(
+            sourceID: item.sourceID,
+            logicalPath: logicalPath,
+            name: item.name,
+            kind: item.kind,
+            metadata: metadata,
+            capabilities: item.capabilities,
+            accent: item.accent
+        )
     }
 
 }

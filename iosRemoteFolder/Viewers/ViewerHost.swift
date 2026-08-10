@@ -24,7 +24,7 @@ struct ResourceViewerHost: View {
         let mode: ResourceViewerMode
     }
 
-    private enum LoadState: Equatable {
+    private enum LoadState {
         case loading
         case ready(ResourceIdentity, ResourceMetadata, ViewerResolution, ViewerContentPayload?)
         case failed(ResourceIdentity, ResourceSourceError)
@@ -111,14 +111,24 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "图片内容读取无效")
             }
         case .videoPlayer:
-            if case .video(let data) = payload {
-                VideoPlayerView(resource: resource, metadata: metadata, data: data)
+            if case .video(let engine) = payload {
+                VideoPlayerView(
+                    resource: resource,
+                    metadata: metadata,
+                    engine: engine,
+                    onRetry: { retryMedia(engine) }
+                )
             } else {
                 UnsupportedViewerView(resource: resource, reason: "视频内容读取无效")
             }
         case .musicPlayer:
-            if case .audio(let data) = payload {
-                MusicPlayerView(resource: resource, metadata: metadata, data: data)
+            if case .audio(let engine) = payload {
+                MusicPlayerView(
+                    resource: resource,
+                    metadata: metadata,
+                    engine: engine,
+                    onRetry: { retryMedia(engine) }
+                )
             } else {
                 UnsupportedViewerView(resource: resource, reason: "音乐内容读取无效")
             }
@@ -200,12 +210,19 @@ struct ResourceViewerHost: View {
         retryAttempt += 1
     }
 
+    private func retryMedia(_ engine: AVMediaPlayerEngine) {
+        engine.stop()
+        retry()
+    }
+
     @MainActor
     private func load(request: LoadRequest, resource: ResourceItem) async {
         guard request == loadRequest else { return }
         loadState = .loading
 
         var session: ResourceContentSession?
+        var preparedMediaEngine: AVMediaPlayerEngine?
+        var mediaEngineOwnsSession = false
         let result: LoadState
         do {
             let createdSession: ResourceContentSession
@@ -255,29 +272,25 @@ struct ResourceViewerHost: View {
                 }
                 payload = .image(data)
             case .audio(let maximumBytes):
-                let data = try await readContent(
+                let prepared = try await prepareMedia(
                     from: createdSession,
                     metadata: metadata,
                     maximumBytes: maximumBytes,
-                    usePersistentCache: mode == .online
-                ) { data in
-                    guard ViewerContentDecoder.isValidAudioData(data) else {
-                        throw ResourceSourceError.invalidResponse
-                    }
-                }
-                payload = .audio(data)
+                    expectedMediaType: .audio
+                )
+                preparedMediaEngine = prepared.engine
+                mediaEngineOwnsSession = prepared.ownsSession
+                payload = .audio(prepared.engine)
             case .video(let maximumBytes):
-                let data = try await readContent(
+                let prepared = try await prepareMedia(
                     from: createdSession,
                     metadata: metadata,
                     maximumBytes: maximumBytes,
-                    usePersistentCache: mode == .online
-                ) { data in
-                    guard await ViewerContentDecoder.isValidVideoData(data) else {
-                        throw ResourceSourceError.invalidResponse
-                    }
-                }
-                payload = .video(data)
+                    expectedMediaType: .video
+                )
+                preparedMediaEngine = prepared.engine
+                mediaEngineOwnsSession = prepared.ownsSession
+                payload = .video(prepared.engine)
             }
             try Task.checkCancellation()
             if mode == .online, resolution.kind != .systemPreview {
@@ -289,14 +302,96 @@ struct ResourceViewerHost: View {
             result = state(for: error, identity: request.identity)
         }
 
-        // A session may outlive the metadata probe. Closing it here covers
-        // normal completion, retries, identity changes and task cancellation.
+        let shouldPublish = request == loadRequest && !Task.isCancelled
+        if shouldPublish {
+            loadState = result
+        }
+
+        let publishedMediaEngine: Bool
+        if shouldPublish, preparedMediaEngine != nil, case .ready = result {
+            publishedMediaEngine = true
+            preparedMediaEngine = nil
+            if mediaEngineOwnsSession {
+                session = nil
+            }
+        } else {
+            publishedMediaEngine = false
+        }
+        if !publishedMediaEngine {
+            preparedMediaEngine?.stop()
+        }
+
+        // Full-data viewers release their source session after preparation.
+        // Streaming media transfers the session to its resource loader.
         if let session {
             await session.close()
         }
+    }
 
-        guard request == loadRequest else { return }
-        loadState = Task.isCancelled ? .cancelled(request.identity) : result
+    @MainActor
+    private func prepareMedia(
+        from session: ResourceContentSession,
+        metadata: ResourceMetadata,
+        maximumBytes: Int64,
+        expectedMediaType: AVMediaType
+    ) async throws -> (engine: AVMediaPlayerEngine, ownsSession: Bool) {
+        let shouldStream = mode == .online
+            && metadata.acceptsRanges
+            && (metadata.byteSize ?? 0) > maximumBytes
+        if shouldStream {
+            let engine = try AVMediaPlayerEngine(
+                session: session,
+                metadata: metadata,
+                resourcePath: resource.path
+            )
+            try await prepareEngine(engine, expectedMediaType: expectedMediaType)
+            return (engine, true)
+        }
+
+        var preparedDataEngine: AVMediaPlayerEngine?
+        do {
+            _ = try await readContent(
+                from: session,
+                metadata: metadata,
+                maximumBytes: maximumBytes,
+                usePersistentCache: mode == .online
+            ) { data in
+                let candidate = try AVMediaPlayerEngine(
+                    data: data,
+                    metadata: metadata,
+                    resourcePath: resource.path
+                )
+                try await prepareEngine(candidate, expectedMediaType: expectedMediaType)
+                preparedDataEngine = candidate
+            }
+            guard let preparedDataEngine else {
+                throw ResourceSourceError.invalidResponse
+            }
+            return (preparedDataEngine, false)
+        } catch {
+            preparedDataEngine?.stop()
+            throw error
+        }
+    }
+
+    @MainActor
+    private func prepareEngine(
+        _ engine: AVMediaPlayerEngine,
+        expectedMediaType: AVMediaType
+    ) async throws {
+        do {
+            try await withTaskCancellationHandler {
+                try await engine.prepare(expectedMediaType: expectedMediaType)
+            } onCancel: {
+                Task { @MainActor in
+                    engine.stop()
+                }
+            }
+            try Task.checkCancellation()
+        } catch {
+            engine.stop()
+            throw error
+        }
     }
 
     @MainActor
@@ -321,11 +416,20 @@ struct ResourceViewerHost: View {
                maximumBytes: maximumBytes
            ) {
             do {
+                try Task.checkCancellation()
                 try await validate(cached)
+                try Task.checkCancellation()
                 return cached
             } catch {
-                // A corrupt or stale byte entry is never handed to a viewer;
-                // remove it and make one bounded read from the source.
+                if Task.isCancelled || error is CancellationError {
+                    throw ResourceSourceError.cancelled
+                }
+                let sourceError = ResourceSourceError.mapping(error)
+                guard sourceError == .invalidResponse else {
+                    throw sourceError
+                }
+                // Only deterministic content invalidity evicts the entry. A
+                // transient playback or network error must preserve valid cache.
                 await appModel.cacheCoordinator.removeData(for: key)
             }
         }
@@ -356,12 +460,12 @@ struct ResourceViewerHost: View {
     }
 }
 
-enum ViewerContentPayload: Equatable, Sendable {
+enum ViewerContentPayload {
     case text(String)
     case pdf(Data)
     case image(Data)
-    case audio(Data)
-    case video(Data)
+    case audio(AVMediaPlayerEngine)
+    case video(AVMediaPlayerEngine)
 }
 
 enum ViewerContentDecoder {
@@ -375,9 +479,20 @@ enum ViewerContentDecoder {
 
     @MainActor
     static func isValidVideoData(_ data: Data) async -> Bool {
-        let engine = AVVideoPlayerEngine(data: data)
+        let metadata = ResourceMetadata(
+            byteSize: Int64(data.count),
+            mimeType: "video/mp4",
+            typeIdentifier: "public.mpeg-4"
+        )
+        guard let engine = try? AVMediaPlayerEngine(
+            data: data,
+            metadata: metadata,
+            resourcePath: "/fixture.mp4"
+        ) else {
+            return false
+        }
         do {
-            try await engine.prepare()
+            try await engine.prepare(expectedMediaType: .video)
             engine.stop()
             return true
         } catch {
@@ -832,101 +947,52 @@ struct VideoPlayerView: View {
     @Environment(AppModel.self) private var appModel
     let resource: ResourceItem
     let metadata: ResourceMetadata
-    let data: Data
-    @State private var engine: AVVideoPlayerEngine?
+    let engine: AVMediaPlayerEngine
+    let onRetry: () -> Void
     @State private var restoredPosition = false
 
-    init(resource: ResourceItem, metadata: ResourceMetadata, data: Data) {
+    init(
+        resource: ResourceItem,
+        metadata: ResourceMetadata,
+        engine: AVMediaPlayerEngine,
+        onRetry: @escaping () -> Void
+    ) {
         self.resource = resource
         self.metadata = metadata
-        self.data = data
-        _engine = State(initialValue: AVVideoPlayerEngine(data: data))
+        self.engine = engine
+        self.onRetry = onRetry
     }
 
     var body: some View {
-        Group {
-            if let engine {
-                TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-                    ScrollView {
-                        VStack(spacing: 18) {
-                            VideoPlayer(player: engine.player)
-                                .aspectRatio(16 / 9, contentMode: .fit)
-                                .clipShape(RoundedRectangle(cornerRadius: 14))
-                                .accessibilityLabel(Text("\(resource.name)，视频播放器"))
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            ScrollView {
+                VStack(spacing: 18) {
+                    VideoPlayer(player: engine.player)
+                        .aspectRatio(16 / 9, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .disabled(engine.playbackState.disablesControls)
+                        .allowsHitTesting(!engine.playbackState.disablesControls)
+                        .accessibilityLabel(Text("\(resource.name)，视频播放器"))
 
-                            Slider(
-                                value: Binding(
-                                    get: { engine.currentTime },
-                                    set: { engine.seek(to: $0) }
-                                ),
-                                in: 0...max(engine.duration, 0.001)
-                            )
-                            .accessibilityLabel("播放进度")
-
-                            HStack {
-                                Text(Self.timeLabel(engine.currentTime))
-                                Spacer()
-                                Text(Self.timeLabel(engine.duration))
-                            }
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-
-                            HStack(spacing: 32) {
-                                Button("后退 10 秒", systemImage: "gobackward.10") {
-                                    engine.seek(to: engine.currentTime - 10)
-                                }
-                                Button(
-                                    engine.isPlaying ? "暂停" : "播放",
-                                    systemImage: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill"
-                                ) {
-                                    if engine.isPlaying {
-                                        engine.pause()
-                                    } else {
-                                        _ = engine.play()
-                                    }
-                                }
-                                .font(.largeTitle)
-                                Button("前进 10 秒", systemImage: "goforward.10") {
-                                    engine.seek(to: engine.currentTime + 10)
-                                }
-                            }
-                            .labelStyle(.iconOnly)
-                            .accessibilityElement(children: .contain)
-                        }
-                        .frame(maxWidth: 900)
-                        .padding()
+                    MediaPlaybackControls(engine: engine) {
+                        savePosition(engine)
+                        onRetry()
                     }
                 }
-            } else {
-                ContentUnavailableView(
-                    "无法播放视频",
-                    systemImage: "film",
-                    description: Text("文件内容不是有效的视频。")
-                )
+                .frame(maxWidth: 900)
+                .padding()
             }
         }
         .onAppear {
-            if let engine {
-                restorePositionIfNeeded(engine)
-            }
-        }
-        .task {
-            guard let engine else { return }
-            if engine.duration <= 0 {
-                try? await engine.prepare()
-            }
-            guard !Task.isCancelled else { return }
             restorePositionIfNeeded(engine)
         }
         .onDisappear {
-            if let engine {
-                savePosition(engine)
-                engine.stop()
-            }
+            savePosition(engine)
+            engine.stop()
         }
     }
 
-    private func restorePositionIfNeeded(_ engine: AVVideoPlayerEngine) {
+    private func restorePositionIfNeeded(_ engine: AVMediaPlayerEngine) {
         guard !restoredPosition else { return }
         guard case .seconds(let seconds) = appModel.resumePosition(
             for: resource,
@@ -942,7 +1008,8 @@ struct VideoPlayerView: View {
         engine.seek(to: seconds)
     }
 
-    private func savePosition(_ engine: AVVideoPlayerEngine) {
+    private func savePosition(_ engine: AVMediaPlayerEngine) {
+        guard engine.playbackState != .stopped else { return }
         let duration = engine.duration
         let currentTime = engine.currentTime
         guard duration.isFinite, duration > 0, currentTime.isFinite else { return }
@@ -957,10 +1024,6 @@ struct VideoPlayerView: View {
         }
     }
 
-    private static func timeLabel(_ time: TimeInterval) -> String {
-        let totalSeconds = max(0, Int(time.rounded(.down)))
-        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
-    }
 }
 
 @MainActor
@@ -968,98 +1031,57 @@ struct MusicPlayerView: View {
     @Environment(AppModel.self) private var appModel
     let resource: ResourceItem
     let metadata: ResourceMetadata
-    let data: Data
-    @State private var engine: AVAudioPlayerEngine?
+    let engine: AVMediaPlayerEngine
+    let onRetry: () -> Void
     @State private var restoredPosition = false
 
-    init(resource: ResourceItem, metadata: ResourceMetadata, data: Data) {
+    init(
+        resource: ResourceItem,
+        metadata: ResourceMetadata,
+        engine: AVMediaPlayerEngine,
+        onRetry: @escaping () -> Void
+    ) {
         self.resource = resource
         self.metadata = metadata
-        self.data = data
-        _engine = State(initialValue: try? AVAudioPlayerEngine(data: data))
+        self.engine = engine
+        self.onRetry = onRetry
     }
 
     var body: some View {
-        Group {
-            if let engine {
-                TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-                    ScrollView {
-                        VStack(spacing: 24) {
-                            ViewerHeader(icon: "music.note", eyebrow: "MUSIC PLAYER", title: resource.name)
-                            RoundedRectangle(cornerRadius: 26)
-                                .fill(AppTheme.accent.opacity(0.18))
-                                .aspectRatio(1, contentMode: .fit)
-                                .overlay {
-                                    Image(systemName: "music.note.list")
-                                        .font(.system(size: 72))
-                                        .foregroundStyle(AppTheme.accent)
-                                }
-                            Text(resource.name)
-                                .font(.title2.bold())
-                                .multilineTextAlignment(.center)
-                            Slider(
-                                value: Binding(
-                                    get: { engine.currentTime },
-                                    set: { engine.seek(to: $0) }
-                                ),
-                                in: 0...max(engine.duration, 0.001)
-                            )
-                            .accessibilityLabel("播放进度")
-                            HStack {
-                                Text(Self.timeLabel(engine.currentTime))
-                                Spacer()
-                                Text(Self.timeLabel(engine.duration))
-                            }
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            HStack(spacing: 32) {
-                                Button("后退 10 秒", systemImage: "gobackward.10") {
-                                    engine.seek(to: engine.currentTime - 10)
-                                }
-                                Button(
-                                    engine.isPlaying ? "暂停" : "播放",
-                                    systemImage: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill"
-                                ) {
-                                    if engine.isPlaying {
-                                        engine.pause()
-                                    } else {
-                                        _ = engine.play()
-                                    }
-                                }
-                                .font(.largeTitle)
-                                Button("前进 10 秒", systemImage: "goforward.10") {
-                                    engine.seek(to: engine.currentTime + 10)
-                                }
-                            }
-                            .labelStyle(.iconOnly)
-                            .accessibilityElement(children: .contain)
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            ScrollView {
+                VStack(spacing: 24) {
+                    ViewerHeader(icon: "music.note", eyebrow: "MUSIC PLAYER", title: resource.name)
+                    RoundedRectangle(cornerRadius: 26)
+                        .fill(AppTheme.accent.opacity(0.18))
+                        .aspectRatio(1, contentMode: .fit)
+                        .overlay {
+                            Image(systemName: "music.note.list")
+                                .font(.system(size: 72))
+                                .foregroundStyle(AppTheme.accent)
                         }
-                        .frame(maxWidth: 620)
-                        .padding()
+                    Text(resource.name)
+                        .font(.title2.bold())
+                        .multilineTextAlignment(.center)
+                    MediaPlaybackControls(engine: engine) {
+                        savePosition(engine)
+                        onRetry()
                     }
                 }
-            } else {
-                ContentUnavailableView(
-                    "无法播放音乐",
-                    systemImage: "music.note",
-                    description: Text("文件内容不是有效的音频。")
-                )
+                .frame(maxWidth: 620)
+                .padding()
             }
         }
         .onAppear {
-            if let engine {
-                restorePositionIfNeeded(engine)
-            }
+            restorePositionIfNeeded(engine)
         }
         .onDisappear {
-            if let engine {
-                savePosition(engine)
-                engine.stop()
-            }
+            savePosition(engine)
+            engine.stop()
         }
     }
 
-    private func restorePositionIfNeeded(_ engine: AVAudioPlayerEngine) {
+    private func restorePositionIfNeeded(_ engine: AVMediaPlayerEngine) {
         guard !restoredPosition else { return }
         restoredPosition = true
         guard case .seconds(let seconds) = appModel.resumePosition(
@@ -1071,7 +1093,8 @@ struct MusicPlayerView: View {
         engine.seek(to: seconds)
     }
 
-    private func savePosition(_ engine: AVAudioPlayerEngine) {
+    private func savePosition(_ engine: AVMediaPlayerEngine) {
+        guard engine.playbackState != .stopped else { return }
         let duration = engine.duration
         let currentTime = engine.currentTime
         guard duration.isFinite, duration > 0, currentTime.isFinite else { return }
@@ -1086,9 +1109,128 @@ struct MusicPlayerView: View {
         }
     }
 
+}
+
+@MainActor
+private struct MediaPlaybackControls: View {
+    let engine: AVMediaPlayerEngine
+    let onRetry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            runtimeStatus
+
+            Slider(
+                value: Binding(
+                    get: { engine.currentTime },
+                    set: { engine.seek(to: $0) }
+                ),
+                in: 0...max(engine.duration, 0.001)
+            )
+            .disabled(engine.playbackState.disablesControls)
+            .accessibilityLabel("播放进度")
+            .accessibilityValue(
+                Text("\(Self.timeLabel(engine.currentTime)) / \(Self.timeLabel(engine.duration))")
+            )
+
+            HStack {
+                Text(Self.timeLabel(engine.currentTime))
+                Spacer()
+                Text(Self.timeLabel(engine.duration))
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 32) {
+                Button("后退 10 秒", systemImage: "gobackward.10") {
+                    engine.seek(to: engine.currentTime - 10)
+                }
+                Button(
+                    engine.playbackState.showsPauseControl ? "暂停" : "播放",
+                    systemImage: engine.playbackState.showsPauseControl
+                        ? "pause.circle.fill"
+                        : "play.circle.fill"
+                ) {
+                    if engine.playbackState.showsPauseControl {
+                        engine.pause()
+                    } else {
+                        _ = engine.play()
+                    }
+                }
+                .font(.largeTitle)
+                Button("前进 10 秒", systemImage: "goforward.10") {
+                    engine.seek(to: engine.currentTime + 10)
+                }
+            }
+            .disabled(engine.playbackState.disablesControls)
+            .labelStyle(.iconOnly)
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    @ViewBuilder
+    private var runtimeStatus: some View {
+        switch engine.playbackState {
+        case .preparing:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("正在准备播放")
+            }
+            .accessibilityElement(children: .combine)
+        case .waiting:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("正在缓冲")
+            }
+            .accessibilityElement(children: .combine)
+        case .failed(let error):
+            VStack(spacing: 10) {
+                Label("播放失败", systemImage: "exclamationmark.triangle")
+                    .font(.headline)
+                Text(error.localizedDescription)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("重试", systemImage: "arrow.clockwise") {
+                    onRetry()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .frame(maxWidth: .infinity)
+        case .ended:
+            Label("播放结束", systemImage: "checkmark.circle")
+                .foregroundStyle(.secondary)
+        case .stopped:
+            Label("播放已停止", systemImage: "stop.circle")
+                .foregroundStyle(.secondary)
+        case .playing, .paused:
+            EmptyView()
+        }
+    }
+
     private static func timeLabel(_ time: TimeInterval) -> String {
         let totalSeconds = max(0, Int(time.rounded(.down)))
         return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+private extension AVMediaPlayerEngine.PlaybackState {
+    var disablesControls: Bool {
+        switch self {
+        case .preparing, .failed, .stopped:
+            true
+        case .waiting, .playing, .paused, .ended:
+            false
+        }
+    }
+
+    var showsPauseControl: Bool {
+        switch self {
+        case .waiting, .playing:
+            true
+        case .preparing, .paused, .failed, .ended, .stopped:
+            false
+        }
     }
 }
 

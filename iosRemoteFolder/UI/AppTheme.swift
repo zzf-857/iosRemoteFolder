@@ -24,3 +24,30 @@ struct GlassSurface<Content: View>: View {
     }
 }
 
+extension View {
+    /// 将导航栏背景设置为 iOS 26 Liquid Glass，旧系统回退到 `ultraThinMaterial`。
+    @ViewBuilder
+    func glassNavigationBar() -> some View {
+        if #available(iOS 26.0, *) {
+            self
+                .toolbarBackground(.visible, for: .navigationBar)
+        } else {
+            self
+                .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+        }
+    }
+
+    /// 将标签栏背景设置为 iOS 26 Liquid Glass，旧系统回退到 `ultraThinMaterial`。
+    @ViewBuilder
+    func glassTabBar() -> some View {
+        if #available(iOS 26.0, *) {
+            self
+                .toolbarBackground(.visible, for: .tabBar)
+        } else {
+            self
+                .toolbarBackground(.ultraThinMaterial, for: .tabBar)
+                .toolbarBackground(.visible, for: .tabBar)
+        }
+    }
+}

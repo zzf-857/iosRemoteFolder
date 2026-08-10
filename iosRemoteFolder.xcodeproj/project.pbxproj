@@ -48,6 +48,7 @@
 		B00000000000000000000033 /* HTTPSourceAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000033 /* HTTPSourceAdapterTests.swift */; };
 		B00000000000000000000034 /* SourcesStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000034 /* SourcesStoreTests.swift */; };
 		B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */; };
+		B00000000000000000000042 /* ResourceIndexStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000042 /* ResourceIndexStoreTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -102,6 +103,7 @@
 		C00000000000000000000033 /* HTTPSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPSourceAdapterTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000034 /* SourcesStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourcesStoreTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebDAVSourceAdapterTests.swift; sourceTree = "<group>"; };
+		C00000000000000000000042 /* ResourceIndexStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceIndexStoreTests.swift; sourceTree = "<group>"; };
 		D00000000000000000000001 /* iosRemoteFolder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosRemoteFolder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D00000000000000000000002 /* iosRemoteFolderTests.xctest */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.wrapper.cfbundle"; includeInIndex = 0; path = iosRemoteFolderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -175,6 +177,7 @@
 				C00000000000000000000033 /* HTTPSourceAdapterTests.swift */,
 				C00000000000000000000034 /* SourcesStoreTests.swift */,
 				C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */,
+				C00000000000000000000042 /* ResourceIndexStoreTests.swift */,
 			);
 			path = iosRemoteFolderTests;
 			sourceTree = "<group>";
@@ -322,7 +325,8 @@
 				B00000000000000000000032 /* LocalFilesSourceAdapterTests.swift in Sources */,
 				B00000000000000000000033 /* HTTPSourceAdapterTests.swift in Sources */,
 				B00000000000000000000034 /* SourcesStoreTests.swift in Sources */,
-				B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */,
+					B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */,
+					B00000000000000000000042 /* ResourceIndexStoreTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -61,6 +61,7 @@ struct OfflineView: View {
                     }
                 }
             }
+            .glassNavigationBar()
         }
     }
 }

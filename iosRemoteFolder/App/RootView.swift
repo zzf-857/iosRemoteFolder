@@ -24,6 +24,7 @@ struct RootView: View {
                 .tag(AppTab.offline)
         }
         .tint(AppTheme.accent)
+        .glassTabBar()
     }
 }
 

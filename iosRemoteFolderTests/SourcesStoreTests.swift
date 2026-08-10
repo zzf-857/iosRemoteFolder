@@ -15,6 +15,8 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
     private let lock = NSLock()
     private var released = false
     private var failure: ResourceSourceError?
+    private var listFailure: ResourceSourceError?
+    private var listDelay: Duration?
     private var connectCount = 0
     private var requestedListPaths: [ResourcePath] = []
 
@@ -41,6 +43,18 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         failure = error
     }
 
+    func setListFailure(_ error: ResourceSourceError?) {
+        lock.lock()
+        defer { lock.unlock() }
+        listFailure = error
+    }
+
+    func setListDelay(_ delay: Duration?) {
+        lock.lock()
+        defer { lock.unlock() }
+        listDelay = delay
+    }
+
     /// 释放所有等待中的 connect，使连接任务继续执行。
     func release() {
         lock.lock()
@@ -61,7 +75,13 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
     }
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
-        recordListPath(path)
+        let behavior = beginList(path)
+        if let delay = behavior.delay {
+            try await Task.sleep(for: delay)
+        }
+        if let failure = behavior.failure {
+            throw failure
+        }
         return items
     }
 
@@ -86,10 +106,13 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         return failure
     }
 
-    private func recordListPath(_ path: ResourcePath) {
+    private func beginList(
+        _ path: ResourcePath
+    ) -> (failure: ResourceSourceError?, delay: Duration?) {
         lock.lock()
         defer { lock.unlock() }
         requestedListPaths.append(path)
+        return (listFailure, listDelay)
     }
 
     private var isReleasedSnapshot: Bool {
@@ -226,6 +249,67 @@ struct SourcesStoreTests {
         // 状态最终稳定在就绪，而不是被取消任务覆写。
         try await Task.sleep(for: .milliseconds(50))
         #expect(store.entries.first?.state == .ready)
+    }
+
+    @Test("只有成功且当前代数的目录列举发布快照")
+    func snapshotCallbackOnlyPublishesCurrentSuccess() async throws {
+        let source = makeSource()
+        let stub = StubSourceAdapter(source: source, items: [sampleItem(source.id)])
+        let store = try makeStore(sources: [source], adapters: [stub])
+        var snapshotPaths: [ResourcePath] = []
+        store.onDirectorySnapshot = { snapshotSourceID, path, _ in
+            #expect(snapshotSourceID == source.id)
+            snapshotPaths.append(path)
+        }
+
+        store.connect(source.id)
+        stub.release()
+        try await waitUntil { snapshotPaths == [.root] }
+
+        let supersededPath = try #require(ResourcePath(rawValue: "/superseded"))
+        let currentPath = try #require(ResourcePath(rawValue: "/current"))
+        stub.setListDelay(.milliseconds(80))
+        store.loadDirectory(source.id, at: supersededPath)
+        try await waitUntil { stub.listPaths.contains(supersededPath) }
+        store.loadDirectory(source.id, at: currentPath)
+        try await waitUntil {
+            store.entries.first?.browse.currentPath == currentPath
+                && store.entries.first?.browse.isLoading == false
+        }
+        #expect(!snapshotPaths.contains(supersededPath))
+        #expect(snapshotPaths.filter { $0 == currentPath }.count == 1)
+
+        let failedPath = try #require(ResourcePath(rawValue: "/failed"))
+        stub.setListDelay(nil)
+        stub.setListFailure(.timedOut)
+        store.loadDirectory(source.id, at: failedPath)
+        try await waitUntil { store.entries.first?.browse.error == .timedOut }
+        #expect(!snapshotPaths.contains(failedPath))
+    }
+
+    @Test("断线来源从搜索结果直接连接目标目录")
+    func openDirectoryConnectsAtTargetPath() async throws {
+        let source = makeSource()
+        let stub = StubSourceAdapter(source: source, items: [sampleItem(source.id)])
+        stub.setFailure(.networkUnavailable)
+        let store = try makeStore(sources: [source], adapters: [stub])
+        let targetPath = try #require(ResourcePath(rawValue: "/资料/项目"))
+        var snapshotPaths: [ResourcePath] = []
+        store.onDirectorySnapshot = { _, path, _ in snapshotPaths.append(path) }
+
+        store.openDirectory(source.id, at: targetPath)
+        #expect(store.entries.first?.state == .connecting)
+        stub.release()
+        try await waitUntil { store.entries.first?.state == .failed(.networkUnavailable) }
+        #expect(store.entries.first?.browse.currentPath == targetPath)
+
+        stub.setFailure(nil)
+        store.retry(source.id)
+        try await waitUntil { snapshotPaths == [targetPath] }
+
+        #expect(store.entries.first?.state == .ready)
+        #expect(store.entries.first?.browse.currentPath == targetPath)
+        #expect(stub.listPaths == [targetPath])
     }
 
     // MARK: - Helpers
@@ -537,6 +621,11 @@ struct SourceConfigurationMigrationTests {
             for: cacheKey,
             maximumBytes: 1_024
         )
+        try await model.resourceIndexStore.replaceDirectory(
+            sourceID: sourceID,
+            parentPath: try #require(ResourcePath(rawValue: "/notes")),
+            items: [resource]
+        )
 
         model.editRemoteSource(
             sourceID: sourceID,
@@ -553,6 +642,10 @@ struct SourceConfigurationMigrationTests {
         #expect(model.resumePosition(for: audio, metadata: metadata) == .seconds(12))
         #expect(model.readingPosition(for: resource, metadata: metadata) == .text(fraction: 0.4))
         #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) != nil)
+        let indexCountAfterRename = try await model.resourceIndexStore.indexedResourceCount(
+            sourceID: sourceID
+        )
+        #expect(indexCountAfterRename == 1)
 
         model.editRemoteSource(
             sourceID: sourceID,
@@ -570,6 +663,10 @@ struct SourceConfigurationMigrationTests {
         #expect(model.resumePosition(for: audio, metadata: metadata) == nil)
         #expect(model.readingPosition(for: resource, metadata: metadata) == nil)
         #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) == nil)
+        let indexCountAfterEndpointChange = try await model.resourceIndexStore.indexedResourceCount(
+            sourceID: sourceID
+        )
+        #expect(indexCountAfterEndpointChange == 0)
     }
 
     /// The stores and their shared container leave scope before a second
@@ -617,6 +714,7 @@ private final class ContentStubAdapter: ResourceSourceAdapter, @unchecked Sendab
     private let lock = NSLock()
     private var metadataCallCount = 0
     private var readCallCount = 0
+    private var requestedRanges: [ResourceByteRange?] = []
 
     init(
         source: ResourceSource,
@@ -644,6 +742,12 @@ private final class ContentStubAdapter: ResourceSourceAdapter, @unchecked Sendab
         return readCallCount
     }
 
+    var readRanges: [ResourceByteRange?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestedRanges
+    }
+
     func connect() async throws {}
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
@@ -660,7 +764,7 @@ private final class ContentStubAdapter: ResourceSourceAdapter, @unchecked Sendab
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        incrementReadCalls()
+        recordRead(range: range)
         if let delay {
             try await Task.sleep(for: delay)
         }
@@ -682,9 +786,10 @@ private final class ContentStubAdapter: ResourceSourceAdapter, @unchecked Sendab
         lock.unlock()
     }
 
-    private func incrementReadCalls() {
+    private func recordRead(range: ResourceByteRange?) {
         lock.lock()
         readCallCount += 1
+        requestedRanges.append(range)
         lock.unlock()
     }
 }
@@ -731,8 +836,10 @@ struct ResourceAccessServiceTests {
             .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
 
         let result = try await session.readData(maximumBytes: 5)
+        let cachedMetadata = try await session.fetchMetadata()
         #expect(result == content)
-        #expect(adapter.metadataCalls == 2)
+        #expect(cachedMetadata.byteSize == 5)
+        #expect(adapter.metadataCalls == 1)
         #expect(adapter.readCalls == 1)
 
         let tooSmall = try await makeService(
@@ -760,8 +867,8 @@ struct ResourceAccessServiceTests {
         #expect(unknownAdapter.readCalls == 0)
     }
 
-    @Test("区间读取同时校验 capability、metadata Range 和请求预算")
-    func rangeReadChecksCapabilitiesAndBudget() async throws {
+    @Test("区间读取采用会话 metadata 快照并校验 Range 证据与预算")
+    func rangeReadUsesMetadataSnapshotAndChecksBudget() async throws {
         let source = makeSource()
         let content = Data("0123456789".utf8)
         let adapter = ContentStubAdapter(
@@ -773,16 +880,16 @@ struct ResourceAccessServiceTests {
             content: content
         )
         let service = try makeService(source: source, adapter: adapter)
-        let noRange = try await service.makeSession(
+        let staleCapabilities = try await service.makeSession(
             for: makeItem(sourceID: source.id, capabilities: [.read])
         )
-        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
-            _ = try await noRange.readData(
-                range: ResourceByteRange(lowerBound: 0, upperBound: 1),
-                maximumBytes: 2
-            )
-        }
-        #expect(adapter.readCalls == 0)
+        let rangeData = try await staleCapabilities.readData(
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1),
+            maximumBytes: 2
+        )
+        #expect(rangeData == Data("01".utf8))
+        #expect(adapter.metadataCalls == 1)
+        #expect(adapter.readCalls == 1)
 
         let tooLarge = try await service.makeSession(
             for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead])
@@ -793,6 +900,7 @@ struct ResourceAccessServiceTests {
                 maximumBytes: 2
             )
         }
+        #expect(adapter.readCalls == 1)
 
         let noMetadataRangeAdapter = ContentStubAdapter(
             source: source,
@@ -836,6 +944,25 @@ struct ResourceAccessServiceTests {
                 maximumBytes: 20
             )
         }
+
+        let shortAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: true
+            ),
+            content: content,
+            rangeResponse: Data("0".utf8)
+        )
+        let shortSession = try await makeService(source: source, adapter: shortAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead]))
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await shortSession.readData(
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1),
+                maximumBytes: 2
+            )
+        }
+        await shortSession.close()
 
         await session.cancel()
         await session.close()
@@ -898,6 +1025,218 @@ struct ResourceAccessServiceTests {
             capabilities: capabilities,
             accent: .blue
         )
+    }
+}
+
+@Suite("AVPlayer 内容会话桥接")
+@MainActor
+struct SessionMediaPlayerTests {
+    @Test("音频通过有界 Range 会话完成准备并在停止后关闭会话")
+    func preparesAudioThroughBoundedRanges() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.workSourceID }
+        )
+        let item = try #require(
+            SampleData.resources.first { $0.path == "/产品/路线图演示.wav" }
+        )
+        let bytes = try await SampleSourceAdapter(source: source).readData(for: item, range: nil)
+        try await assertSessionPlayback(
+            bytes: bytes,
+            path: "/stream.wav",
+            kind: .audio,
+            mimeType: "audio/wav",
+            typeIdentifier: "com.microsoft.waveform-audio",
+            expectedMediaType: .audio
+        )
+    }
+
+    @Test("大 MP3 通过有界 Range 准备且覆盖高位分片")
+    func preparesLargeMP3ThroughBoundedHighRanges() async throws {
+        let bytes = try makeLargeMP3()
+        #expect(bytes.count > 5 * 1024 * 1024)
+
+        try await assertSessionPlayback(
+            bytes: bytes,
+            path: "/stream.mp3",
+            kind: .audio,
+            mimeType: "audio/mpeg",
+            typeIdentifier: UTType.mp3.identifier,
+            expectedMediaType: .audio,
+            assertHighRangeCoverage: true
+        )
+    }
+
+    @Test("prepare 在途停止会取消分片并关闭会话")
+    func stoppingInFlightPreparationCancelsSession() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.workSourceID }
+        )
+        let sampleItem = try #require(
+            SampleData.resources.first { $0.path == "/产品/路线图演示.wav" }
+        )
+        let bytes = try await SampleSourceAdapter(source: source).readData(for: sampleItem, range: nil)
+        let metadata = ResourceMetadata(
+            byteSize: Int64(bytes.count),
+            mimeType: "audio/wav",
+            typeIdentifier: "com.microsoft.waveform-audio",
+            acceptsRanges: true
+        )
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: metadata,
+            content: bytes,
+            delay: .seconds(10)
+        )
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: ResourcePath(rawValue: "/cancel.wav")!,
+            name: "cancel.wav",
+            kind: .audio,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
+            accent: .pink
+        )
+        let session = try await ResourceAccessService(registry: registry).makeSession(for: item)
+        let engine = try AVMediaPlayerEngine(
+            session: session,
+            metadata: metadata,
+            resourcePath: item.path
+        )
+        let preparation = Task {
+            try await engine.prepare(expectedMediaType: .audio)
+        }
+
+        try await waitUntil { adapter.readCalls > 0 }
+        engine.stop()
+        preparation.cancel()
+        do {
+            try await preparation.value
+            Issue.record("停止后的 prepare 不应迟到成功")
+        } catch {
+            // Cancellation may surface from AVFoundation or the content session.
+        }
+        let readsAtStop = adapter.readCalls
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(adapter.readCalls == readsAtStop)
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await session.fetchMetadata()
+        }
+    }
+
+    @Test("视频通过有界 Range 会话完成准备并支持 seek")
+    func preparesVideoThroughBoundedRanges() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.workSourceID }
+        )
+        let item = try #require(
+            SampleData.resources.first { $0.path == "/产品/路线图演示.mp4" }
+        )
+        let bytes = try await SampleSourceAdapter(source: source).readData(for: item, range: nil)
+        try await assertSessionPlayback(
+            bytes: bytes,
+            path: "/stream.mp4",
+            kind: .video,
+            mimeType: "video/mp4",
+            typeIdentifier: UTType.mpeg4Movie.identifier,
+            expectedMediaType: .video
+        )
+    }
+
+    private func assertSessionPlayback(
+        bytes: Data,
+        path: String,
+        kind: ResourceKind,
+        mimeType: String,
+        typeIdentifier: String,
+        expectedMediaType: AVMediaType,
+        assertHighRangeCoverage: Bool = false
+    ) async throws {
+        let source = ResourceSource(
+            id: UUID(),
+            name: "媒体会话测试来源",
+            kind: .http,
+            endpoint: "https://media.test",
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+        let metadata = ResourceMetadata(
+            byteSize: Int64(bytes.count),
+            mimeType: mimeType,
+            typeIdentifier: typeIdentifier,
+            acceptsRanges: true,
+            revision: .serverVersion("media-v1")
+        )
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: metadata,
+            content: bytes
+        )
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: ResourcePath(rawValue: path)!,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: kind,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
+            accent: .recommended(for: kind)
+        )
+        let session = try await ResourceAccessService(registry: registry).makeSession(for: item)
+        let engine = try AVMediaPlayerEngine(
+            session: session,
+            metadata: metadata,
+            resourcePath: path
+        )
+
+        try await engine.prepare(expectedMediaType: expectedMediaType)
+        #expect(engine.duration > 0)
+        #expect(adapter.metadataCalls == 1)
+        try await Task.sleep(for: .milliseconds(100))
+        let rangesBeforeSeek = adapter.readRanges.compactMap { $0 }
+        if assertHighRangeCoverage {
+            engine.seek(to: engine.duration * 0.8)
+            #expect(engine.play())
+            if !rangesBeforeSeek.contains(where: { $0.upperBound >= Int64(bytes.count / 2) }) {
+                try await waitUntil {
+                    adapter.readRanges
+                        .compactMap { $0 }
+                        .contains { $0.upperBound >= Int64(bytes.count / 2) }
+                }
+            }
+            engine.pause()
+        } else {
+            engine.seek(to: engine.duration / 2)
+        }
+
+        let ranges = adapter.readRanges.compactMap { $0 }
+        #expect(!ranges.isEmpty)
+        #expect(ranges.allSatisfy { ($0.validatedLength ?? .max) <= 4 * 1024 * 1024 })
+        if assertHighRangeCoverage {
+            #expect(ranges.contains { $0.upperBound >= Int64(bytes.count / 2) })
+        }
+
+        engine.stop()
+        try await Task.sleep(for: .milliseconds(50))
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await session.fetchMetadata()
+        }
+    }
+
+    private func makeLargeMP3() throws -> Data {
+        // A 0.25-second CBR MP3 frame block without ID3/Xing metadata. Repeating
+        // complete MPEG frames creates a deterministic media stream large enough
+        // to force AVFoundation to request more than one remote region.
+        let encodedBlock = "//sQxAAABHQTVVSQgDCmCa83GiACAAGtOUAAAVk6PVBQCAYJAfB8HwfKAgCAYRB8H9QIOxOH+INwBJP2wGA4HA4AAAAAACiJKpkUZAjpAkgWo/eFAfATG/AilC+oGhL8JA0qAAAA4An/+xLEAoKFHB0vvdAAIJuDpXWO4EyAAADguCBABSUEYDGw+EmlhTmJQTmCgEgkAiyQKAJr3d3/r9QAEsAFO1hCWZGGGIwm6XJm44wmGQIGkZd9CQFTsTsH/7////9N36Yw0OMOHTHTgz7/+xDEBIIFBB8YDfsiQLKDpGmfZEyDMK8b41DOHDTrG0MJ4G01zAIGbqh1fmsGyaWhz9f0AFRQGAA/iRZiCG/OYNAVhmcruGZIFcYNYF5xLGMUYY5hPIOS8E/7M/+3//+qAAAAwAFgAP/7EsQDggVYHyes+4IgowOm9G5sDgCgKCYGDmPIYGAU5jxren1FGYrDiRLOkAJgEDKXTvdX//IfqLogEDbAFhDlqAGCQybQuZ5YyECCm7W3YZG5eBSGfs/3f6fuwx+fTGjaMLEDDB8xk//7EMQDgAUAHxgN+yJAq4Ondc2whsM4iTCfHSNKTrQ0hRyDCMB1M1QDCnCgd3JsAs2nQ5+n6AQAE7gJaIgBynZwgHMAAo07CjmAoOAwGCQSwUAg+K35D+p2xStVn+rfu9MwoRMNHjFj//sSxAOABPwfGA37IkB/A6i0HTAW0zWMMJQd00b++zROHTMIUHgyGQcUcRp46ALJfs8G/0/YCASxwAMBQAII2zhL843UJDskA+SyQHYJuYD//2///PoCADI0eFFwAAAYK0pBCMgBkWIA//sQxAmABJwdReHvIHCRA2e0zbBOwn9ZFAr9M5abaMwMkUTs9T/eAAAhcAKBGAOfMAPgQCONzDiAJEcDhIJYoBA/u3//Uz//ZT/01QoAA/rhLxEYjAAQzKWwznkECgDcYGdVdzbWegj/+xLEDgBDXB8yrHdiIHqDaPQdPBYIu/4AYQS93FhzeVw7u2gmZb2BFnOcOX16//6UtqUABAgaUCAAAPmFFCyiEOGTs8c04pisp5Ys/sC3/Hcz//9jHQwWZoQcVaYXgYBqpsvGpgGEYXr/+xDEGwDENB07p/NCMI8D44GvaE0HpxFRlDxizphogMCP/ULKMECzAxgwg3MbgDBeG5Mwve0y9BsTBNByGHSZIBenW0EVNBnjP6AAAYo5NYHLdt5woCGFFR+mie+nmPhqEZe8BA5adv/7EsQhgES4HxoN+yJg9w3nNrZgBVbgNcsfomTT1jCCDgAIy09iHIABDnkyabH34x7tiY/gigAALBIIxYKBAGAAAAAGCgFDLv+DlmtY7/zHlNRCQ03+FKB5GSeFxCei4r4Ose4kBfrr8f/7EMQZgAiMg1W5loAQAAA0g4AABBoT0aCoef/mhqXjExOfLmlC1UxBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+        let block = try #require(Data(base64Encoded: encodedBlock))
+        let targetSize = 5 * 1024 * 1024
+        let repetitions = targetSize / block.count + 2
+        var data = Data()
+        data.reserveCapacity(repetitions * block.count)
+        for _ in 0..<repetitions {
+            data.append(block)
+        }
+        return data
     }
 }
 
@@ -1495,6 +1834,35 @@ struct CacheCoordinatorTests {
 
 @Suite("演示来源文档内容")
 struct SampleSourceContentTests {
+    @Test("演示来源根目录与子目录只列举直接子项")
+    func listsOnlyDirectChildrenAtEveryDepth() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.personalSourceID }
+        )
+        let adapter = SampleSourceAdapter(source: source)
+
+        let rootItems = try await adapter.listResources(at: .root)
+        #expect(Set(rootItems.map(\.path)) == Set(["/知识库", "/视频"]))
+        #expect(rootItems.allSatisfy { $0.kind == .folder && $0.metadata.isDirectory })
+        #expect(rootItems.allSatisfy { ResourcePath(rawValue: $0.path)?.parent == .root })
+
+        let knowledgePath = try #require(ResourcePath(rawValue: "/知识库"))
+        let knowledgeItems = try await adapter.listResources(at: knowledgePath)
+        #expect(knowledgeItems.map(\.path) == ["/知识库/设计"])
+        #expect(knowledgeItems.first?.kind == .folder)
+        #expect(knowledgeItems.allSatisfy {
+            ResourcePath(rawValue: $0.path)?.parent == knowledgePath
+        })
+
+        let designPath = try #require(ResourcePath(rawValue: "/知识库/设计"))
+        let designItems = try await adapter.listResources(at: designPath)
+        #expect(designItems.map(\.path) == ["/知识库/设计/设计系统与组件规范.pdf"])
+        #expect(designItems.first?.kind == .pdf)
+        #expect(designItems.allSatisfy {
+            ResourcePath(rawValue: $0.path)?.parent == designPath
+        })
+    }
+
     @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")
     func readsDemoDocumentsThroughSession() async throws {
         let markdownSource = SampleData.sources.first { $0.id == SampleData.workSourceID }!

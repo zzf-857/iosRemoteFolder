@@ -1,5 +1,7 @@
 import AVFoundation
 import Foundation
+import Observation
+import UniformTypeIdentifiers
 
 @MainActor
 protocol PlayerEngine: AnyObject {
@@ -26,66 +28,94 @@ final class AVPlayerEngine: PlayerEngine {
     }
 }
 
-/// Data-backed audio playback used by the content viewer.
-///
-/// The viewer receives already-bounded bytes from `ResourceContentSession`; this
-/// engine owns the AVFoundation object and keeps playback controls on the main
-/// actor without exposing a source adapter or URL to the UI.
-@MainActor
-final class AVAudioPlayerEngine {
-    let player: AVAudioPlayer
+/// Owns Foundation notification tokens without exposing their non-Sendable
+/// representation to `AVMediaPlayerEngine`'s nonisolated deinitializer.
+private final class NotificationObserverBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observers: [NSObjectProtocol] = []
 
-    init(data: Data) throws {
-        player = try AVAudioPlayer(data: data)
-        player.prepareToPlay()
+    func append(_ observer: NSObjectProtocol) {
+        lock.lock()
+        observers.append(observer)
+        lock.unlock()
     }
 
-    var duration: TimeInterval { player.duration }
-    var currentTime: TimeInterval {
-        get { player.currentTime }
-        set { seek(to: newValue) }
-    }
-    var isPlaying: Bool { player.isPlaying }
+    func removeAll() {
+        let removedObservers: [NSObjectProtocol]
+        lock.lock()
+        removedObservers = observers
+        observers.removeAll()
+        lock.unlock()
 
-    @discardableResult
-    func play() -> Bool {
-        player.play()
-    }
-
-    func pause() {
-        player.pause()
+        for observer in removedObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
-    func seek(to time: TimeInterval) {
-        let upperBound = max(player.duration, 0)
-        player.currentTime = min(max(time, 0), upperBound)
-    }
-
-    func stop() {
-        player.stop()
-        player.currentTime = 0
+    deinit {
+        removeAll()
     }
 }
 
-/// Data-backed video playback used by the content viewer.
-///
-/// AVPlayer normally needs a URL. The resource loader keeps the URL private to
-/// Playback and serves the already-bounded session bytes by byte range, so the
-/// viewer never reaches an adapter, request header, or file-system path.
+/// AVPlayer bridge for both bounded in-memory media and session-backed Range media.
+/// Source adapters, URLs and credentials remain behind `ResourceContentSession`.
 @MainActor
-final class AVVideoPlayerEngine {
-    let player: AVPlayer
+@Observable
+final class AVMediaPlayerEngine {
+    enum PlaybackState: Equatable, Sendable {
+        case preparing
+        case waiting
+        case playing
+        case paused
+        case failed(ResourceSourceError)
+        case ended
+        case stopped
+    }
 
-    private let asset: AVURLAsset
-    private let resourceLoader: InMemoryAssetResourceLoader
-    private var isStopped = false
+    private(set) var playbackState: PlaybackState = .preparing
 
-    init(data: Data) {
-        let loader = InMemoryAssetResourceLoader(
+    @ObservationIgnored let player: AVPlayer
+
+    @ObservationIgnored private let asset: AVURLAsset
+    @ObservationIgnored private let resourceLoader: SessionAssetResourceLoader
+    @ObservationIgnored private var preparedDuration: TimeInterval = 0
+    @ObservationIgnored private var isPrepared = false
+    @ObservationIgnored private var isStopped = false
+    @ObservationIgnored private var didReachEnd = false
+    @ObservationIgnored private var runtimeFailure: ResourceSourceError?
+    @ObservationIgnored private var monitoringGeneration = UUID()
+    @ObservationIgnored private var monitoringTask: Task<Void, Never>?
+    @ObservationIgnored private let notificationObservers = NotificationObserverBag()
+
+    convenience init(data: Data, metadata: ResourceMetadata, resourcePath: String) throws {
+        guard !data.isEmpty else { throw ResourceSourceError.invalidResponse }
+        let loader = SessionAssetResourceLoader(
             data: data,
-            contentType: "public.mpeg-4"
+            contentTypes: Self.contentTypes(metadata: metadata, resourcePath: resourcePath)
         )
-        let url = URL(string: "iosremotefolder-video://asset/\(UUID().uuidString).mp4")!
+        try self.init(loader: loader, resourcePath: resourcePath)
+    }
+
+    convenience init(
+        session: ResourceContentSession,
+        metadata: ResourceMetadata,
+        resourcePath: String
+    ) throws {
+        guard let byteSize = metadata.byteSize,
+              byteSize > 0,
+              metadata.acceptsRanges else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
+        let loader = SessionAssetResourceLoader(
+            session: session,
+            contentLength: byteSize,
+            contentTypes: Self.contentTypes(metadata: metadata, resourcePath: resourcePath)
+        )
+        try self.init(loader: loader, resourcePath: resourcePath)
+    }
+
+    private init(loader: SessionAssetResourceLoader, resourcePath: String) throws {
+        let url = try Self.assetURL(resourcePath: resourcePath)
         let asset = AVURLAsset(url: url)
         asset.resourceLoader.setDelegate(loader, queue: loader.queue)
 
@@ -93,9 +123,11 @@ final class AVVideoPlayerEngine {
         self.resourceLoader = loader
         self.player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         self.player.automaticallyWaitsToMinimizeStalling = false
+        startRuntimeMonitoring()
     }
 
     var duration: TimeInterval {
+        if preparedDuration > 0 { return preparedDuration }
         guard let duration = player.currentItem?.duration,
               duration.isNumeric else { return 0 }
         return max(0, duration.seconds)
@@ -107,82 +139,380 @@ final class AVVideoPlayerEngine {
     }
 
     var isPlaying: Bool {
-        player.timeControlStatus == .playing
+        playbackState == .playing
     }
 
-    func prepare() async throws {
-        let tracks = try await asset.load(.tracks)
-        guard tracks.contains(where: { $0.mediaType == .video }) else {
-            throw ResourceSourceError.invalidResponse
-        }
-        let duration = try await asset.load(.duration)
-        guard duration.isNumeric, duration.seconds > 0 else {
-            throw ResourceSourceError.invalidResponse
+    func prepare(expectedMediaType: AVMediaType) async throws {
+        playbackState = .preparing
+        do {
+            try ensureActive()
+            let isPlayable = try await asset.load(.isPlayable)
+            try ensureActive()
+            guard isPlayable else { throw ResourceSourceError.invalidResponse }
+            let tracks = try await asset.load(.tracks)
+            try ensureActive()
+            guard tracks.contains(where: { $0.mediaType == expectedMediaType }) else {
+                throw ResourceSourceError.invalidResponse
+            }
+            let duration = try await asset.load(.duration)
+            try ensureActive()
+            guard duration.isNumeric, duration.seconds > 0 else {
+                throw ResourceSourceError.invalidResponse
+            }
+            preparedDuration = duration.seconds
+            try await waitUntilReadyToPlay()
+            try ensureActive()
+            isPrepared = true
+            refreshPlaybackState()
+        } catch {
+            let mapped = ResourceSourceError.mapping(error)
+            if mapped == .cancelled || Task.isCancelled || isStopped {
+                stop()
+                throw ResourceSourceError.cancelled
+            }
+            runtimeFailure = mapped
+            playbackState = .failed(mapped)
+            throw mapped
         }
     }
 
     @discardableResult
     func play() -> Bool {
-        guard !isStopped else { return false }
+        guard isPrepared, !isStopped else { return false }
+        if case .failed = playbackState { return false }
+        if playbackState == .ended {
+            didReachEnd = false
+            player.seek(to: .zero)
+        }
         player.play()
+        refreshPlaybackState()
         return true
     }
 
     func pause() {
+        guard isPrepared, !isStopped else { return }
+        if case .failed = playbackState { return }
         player.pause()
+        refreshPlaybackState()
     }
 
     func seek(to time: TimeInterval) {
-        guard !isStopped, duration > 0 else { return }
+        guard isPrepared, !isStopped, duration > 0 else { return }
+        if case .failed = playbackState { return }
         let clamped = min(max(time, 0), duration)
+        if clamped < duration {
+            didReachEnd = false
+        }
         player.seek(
             to: CMTime(seconds: clamped, preferredTimescale: 600),
             toleranceBefore: .zero,
             toleranceAfter: .zero
         )
+        refreshPlaybackState()
     }
 
     func stop() {
         guard !isStopped else { return }
         isStopped = true
+        isPrepared = false
+        didReachEnd = false
+        runtimeFailure = nil
+        monitoringGeneration = UUID()
+        monitoringTask?.cancel()
+        monitoringTask = nil
+        removeNotificationObservers()
+        asset.cancelLoading()
         resourceLoader.invalidate()
         player.pause()
         player.replaceCurrentItem(with: nil)
+        playbackState = .stopped
+    }
+
+    deinit {
+        monitoringTask?.cancel()
+        notificationObservers.removeAll()
+        asset.cancelLoading()
+        resourceLoader.invalidate()
+    }
+
+    private func ensureActive() throws {
+        guard !isStopped, !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
+    }
+
+    private func waitUntilReadyToPlay() async throws {
+        guard let item = player.currentItem else {
+            throw ResourceSourceError.invalidResponse
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(15)
+
+        while clock.now < deadline {
+            try ensureActive()
+            guard player.currentItem === item else {
+                throw ResourceSourceError.cancelled
+            }
+            switch item.status {
+            case .readyToPlay:
+                try ensureActive()
+                return
+            case .failed:
+                throw mappedItemError(item)
+            case .unknown:
+                break
+            @unknown default:
+                throw ResourceSourceError.invalidResponse
+            }
+
+            do {
+                try await clock.sleep(for: .milliseconds(100))
+            } catch {
+                try ensureActive()
+                throw ResourceSourceError.mapping(error)
+            }
+        }
+
+        try ensureActive()
+        throw ResourceSourceError.timedOut
+    }
+
+    private func startRuntimeMonitoring() {
+        guard let item = player.currentItem else { return }
+        let generation = UUID()
+        monitoringGeneration = generation
+
+        notificationObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.didPlayToEndTimeNotification,
+                object: item,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self,
+                          !self.isStopped,
+                          self.monitoringGeneration == generation,
+                          self.runtimeFailure == nil else { return }
+                    self.didReachEnd = true
+                    self.playbackState = .ended
+                }
+            }
+        )
+        notificationObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.failedToPlayToEndTimeNotification,
+                object: item,
+                queue: .main
+            ) { [weak self] notification in
+                let underlyingError = notification.userInfo?[
+                    AVPlayerItemFailedToPlayToEndTimeErrorKey
+                ] as? any Error
+                let mapped = underlyingError.map {
+                    ResourceSourceError.mapping($0)
+                } ?? .invalidResponse
+                MainActor.assumeIsolated {
+                    guard let self,
+                          !self.isStopped,
+                          self.monitoringGeneration == generation else { return }
+                    self.runtimeFailure = mapped
+                    self.playbackState = .failed(mapped)
+                }
+            }
+        )
+
+        monitoringTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(100))
+                } catch {
+                    return
+                }
+                guard let self,
+                      !self.isStopped,
+                      self.monitoringGeneration == generation else { return }
+                self.refreshPlaybackState()
+            }
+        }
+    }
+
+    private func refreshPlaybackState() {
+        guard !isStopped else {
+            playbackState = .stopped
+            return
+        }
+        guard let item = player.currentItem else {
+            playbackState = .failed(.invalidResponse)
+            return
+        }
+        if item.status == .failed {
+            let mapped = mappedItemError(item)
+            runtimeFailure = mapped
+            playbackState = .failed(mapped)
+            return
+        }
+        if let runtimeFailure {
+            playbackState = .failed(runtimeFailure)
+            return
+        }
+        guard isPrepared else {
+            playbackState = .preparing
+            return
+        }
+        if didReachEnd {
+            playbackState = .ended
+            return
+        }
+
+        switch player.timeControlStatus {
+        case .waitingToPlayAtSpecifiedRate:
+            playbackState = .waiting
+        case .playing:
+            playbackState = .playing
+        case .paused:
+            playbackState = .paused
+        @unknown default:
+            playbackState = .paused
+        }
+    }
+
+    private func mappedItemError(_ item: AVPlayerItem) -> ResourceSourceError {
+        item.error.map { ResourceSourceError.mapping($0) } ?? .invalidResponse
+    }
+
+    private func removeNotificationObservers() {
+        notificationObservers.removeAll()
+    }
+
+    private static func contentTypes(
+        metadata: ResourceMetadata,
+        resourcePath: String
+    ) -> [String] {
+        var identifiers: [String] = []
+        func append(_ type: UTType?) {
+            guard let identifier = type?.identifier,
+                  !identifiers.contains(identifier) else { return }
+            identifiers.append(identifier)
+        }
+
+        if let identifier = metadata.typeIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !identifier.isEmpty {
+            append(UTType(identifier))
+        }
+        if let mimeType = metadata.mimeType?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !mimeType.isEmpty {
+            append(UTType(mimeType: mimeType))
+        }
+        let pathExtension = URL(fileURLWithPath: resourcePath).pathExtension
+        if !pathExtension.isEmpty {
+            append(UTType(filenameExtension: pathExtension))
+        }
+        if identifiers.isEmpty {
+            identifiers.append(UTType.data.identifier)
+        }
+        return identifiers
+    }
+
+    private static func assetURL(resourcePath: String) throws -> URL {
+        let pathExtension = URL(fileURLWithPath: resourcePath)
+            .pathExtension
+            .lowercased()
+            .filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        let suffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
+        var components = URLComponents()
+        components.scheme = "iosremotefolder-media"
+        components.host = "asset"
+        components.path = "/\(UUID().uuidString)\(suffix)"
+        guard let url = components.url else {
+            throw ResourceSourceError.invalidReference
+        }
+        return url
     }
 }
 
-private final class InMemoryAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
-    let queue = DispatchQueue(label: "iosRemoteFolder.video-resource-loader")
+private final class SessionAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    static let chunkByteBudget: Int64 = 4 * 1024 * 1024
 
-    private let data: Data
-    private let contentType: String
-    private let lock = NSLock()
+    private enum Backing: Sendable {
+        case memory(Data)
+        case session(ResourceContentSession)
+    }
+
+    /// Queue-confined state. The Objective-C request never crosses into a Swift Task.
+    private final class LoadingState {
+        let token = UUID()
+        let request: AVAssetResourceLoadingRequest
+        let endOffset: Int64
+        var nextOffset: Int64
+        var task: Task<Void, Never>?
+        var isTerminal = false
+
+        init(
+            request: AVAssetResourceLoadingRequest,
+            nextOffset: Int64,
+            endOffset: Int64
+        ) {
+            self.request = request
+            self.nextOffset = nextOffset
+            self.endOffset = endOffset
+        }
+    }
+
+    let queue = DispatchQueue(label: "iosRemoteFolder.media-resource-loader")
+
+    private let backing: Backing
+    private let contentLength: Int64
+    private let contentTypes: [String]
     private var invalidated = false
+    private var loadingStates: [ObjectIdentifier: LoadingState] = [:]
 
-    init(data: Data, contentType: String) {
-        self.data = data
-        self.contentType = contentType
+    init(data: Data, contentTypes: [String]) {
+        self.backing = .memory(data)
+        self.contentLength = Int64(data.count)
+        self.contentTypes = contentTypes
+    }
+
+    init(
+        session: ResourceContentSession,
+        contentLength: Int64,
+        contentTypes: [String]
+    ) {
+        self.backing = .session(session)
+        self.contentLength = contentLength
+        self.contentTypes = contentTypes
+    }
+
+    var isSessionBacked: Bool {
+        if case .session = backing { return true }
+        return false
     }
 
     func invalidate() {
-        lock.lock()
-        invalidated = true
-        lock.unlock()
+        queue.async { [self] in
+            invalidateOnQueue()
+        }
     }
 
     func resourceLoader(
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
-        guard !isInvalidated else {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !invalidated else {
             loadingRequest.finishLoading(with: Self.cancelledError)
             return true
         }
 
         if let contentInformationRequest = loadingRequest.contentInformationRequest {
-            contentInformationRequest.contentType = contentType
-            contentInformationRequest.contentLength = Int64(data.count)
+            guard let negotiatedType = negotiatedContentType(
+                allowedTypes: contentInformationRequest.allowedContentTypes
+            ) else {
+                loadingRequest.finishLoading(with: Self.unsupportedContentTypeError)
+                return true
+            }
+            contentInformationRequest.contentType = negotiatedType
+            contentInformationRequest.contentLength = contentLength
             contentInformationRequest.isByteRangeAccessSupported = true
+            contentInformationRequest.isEntireLengthAvailableOnDemand = !isSessionBacked
         }
 
         guard let dataRequest = loadingRequest.dataRequest else {
@@ -190,23 +520,25 @@ private final class InMemoryAssetResourceLoader: NSObject, AVAssetResourceLoader
             return true
         }
 
-        let startOffset = max(dataRequest.requestedOffset, dataRequest.currentOffset)
-        let requestedLength = Int64(dataRequest.requestedLength)
-        let totalLength = Int64(data.count)
-        guard startOffset >= 0,
-              requestedLength >= 0,
-              startOffset <= totalLength,
-              requestedLength <= totalLength - startOffset,
-              let start = Int(exactly: startOffset),
-              let end = Int(exactly: startOffset + requestedLength) else {
+        let identifier = ObjectIdentifier(loadingRequest)
+        guard loadingStates[identifier] == nil else {
             loadingRequest.finishLoading(with: Self.invalidRangeError)
             return true
         }
-
-        if end > start {
-            dataRequest.respond(with: data.subdata(in: start..<end))
+        do {
+            let bounds = try requestedBounds(for: dataRequest)
+            let state = LoadingState(
+                request: loadingRequest,
+                nextOffset: bounds.lowerBound,
+                endOffset: bounds.upperBound
+            )
+            loadingStates[identifier] = state
+            startNextChunkOnQueue(identifier: identifier, token: state.token)
+        } catch {
+            loadingRequest.finishLoading(
+                with: ResourceSourceError.mapping(error) as NSError
+            )
         }
-        loadingRequest.finishLoading()
         return true
     }
 
@@ -214,14 +546,265 @@ private final class InMemoryAssetResourceLoader: NSObject, AVAssetResourceLoader
         _ resourceLoader: AVAssetResourceLoader,
         didCancel loadingRequest: AVAssetResourceLoadingRequest
     ) {
-        // Requests are served synchronously from immutable memory. AVFoundation
-        // owns cancellation of any request that is still pending.
+        dispatchPrecondition(condition: .onQueue(queue))
+        let identifier = ObjectIdentifier(loadingRequest)
+        guard let state = loadingStates.removeValue(forKey: identifier),
+              !state.isTerminal else { return }
+        state.isTerminal = true
+        state.task?.cancel()
+        state.task = nil
     }
 
-    private var isInvalidated: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return invalidated
+    private func requestedBounds(
+        for dataRequest: AVAssetResourceLoadingDataRequest
+    ) throws -> Range<Int64> {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let requestedOffset = dataRequest.requestedOffset
+        let currentOffset = dataRequest.currentOffset
+        let startOffset = currentOffset == 0 ? requestedOffset : currentOffset
+        guard requestedOffset >= 0,
+              startOffset >= requestedOffset,
+              startOffset <= contentLength else {
+            throw ResourceSourceError.invalidResponse
+        }
+
+        let endOffset: Int64
+        if dataRequest.requestsAllDataToEndOfResource {
+            endOffset = contentLength
+        } else {
+            guard let requestedLength = Int64(exactly: dataRequest.requestedLength),
+                  requestedLength >= 0 else {
+                throw ResourceSourceError.invalidResponse
+            }
+            let (requestedEnd, overflow) = requestedOffset.addingReportingOverflow(requestedLength)
+            guard !overflow, requestedEnd >= requestedOffset else {
+                throw ResourceSourceError.invalidResponse
+            }
+            endOffset = min(requestedEnd, contentLength)
+        }
+        guard startOffset <= endOffset else {
+            throw ResourceSourceError.invalidResponse
+        }
+        return startOffset..<endOffset
+    }
+
+    private func startNextChunkOnQueue(
+        identifier: ObjectIdentifier,
+        token: UUID
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let state = loadingStates[identifier],
+              state.token == token,
+              !state.isTerminal else { return }
+        guard !invalidated else {
+            completeOnQueue(
+                identifier: identifier,
+                token: token,
+                error: .cancelled
+            )
+            return
+        }
+        guard !state.request.isCancelled, !state.request.isFinished else {
+            abandonOnQueue(identifier: identifier, token: token)
+            return
+        }
+        guard state.nextOffset < state.endOffset else {
+            completeOnQueue(identifier: identifier, token: token, error: nil)
+            return
+        }
+
+        let remaining = state.endOffset - state.nextOffset
+        let length = min(Self.chunkByteBudget, remaining)
+        let range = ResourceByteRange(
+            lowerBound: state.nextOffset,
+            upperBound: state.nextOffset + length - 1
+        )
+
+        switch backing {
+        case .memory(let data):
+            let result: Result<Data, ResourceSourceError>
+            if let lowerBound = Int(exactly: range.lowerBound),
+               let upperBound = Int(exactly: range.upperBound + 1),
+               lowerBound >= 0,
+               upperBound <= data.count {
+                result = .success(data.subdata(in: lowerBound..<upperBound))
+            } else {
+                result = .failure(.invalidResponse)
+            }
+            receiveChunkOnQueue(
+                result,
+                range: range,
+                identifier: identifier,
+                token: token
+            )
+
+        case .session(let session):
+            let deliveryQueue = queue
+            let task = Task { [weak self] in
+                let result: Result<Data, ResourceSourceError>
+                do {
+                    try Task.checkCancellation()
+                    let data = try await session.readData(
+                        range: range,
+                        maximumBytes: Self.chunkByteBudget
+                    )
+                    try Task.checkCancellation()
+                    result = .success(data)
+                } catch {
+                    result = .failure(
+                        Task.isCancelled || error is CancellationError
+                            ? .cancelled
+                            : ResourceSourceError.mapping(error)
+                    )
+                }
+                deliveryQueue.async { [weak self] in
+                    self?.receiveChunkOnQueue(
+                        result,
+                        range: range,
+                        identifier: identifier,
+                        token: token
+                    )
+                }
+            }
+            state.task = task
+        }
+    }
+
+    private func receiveChunkOnQueue(
+        _ result: Result<Data, ResourceSourceError>,
+        range: ResourceByteRange,
+        identifier: ObjectIdentifier,
+        token: UUID
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let state = loadingStates[identifier],
+              state.token == token,
+              !state.isTerminal else { return }
+        state.task = nil
+        guard !invalidated else {
+            completeOnQueue(
+                identifier: identifier,
+                token: token,
+                error: .cancelled
+            )
+            return
+        }
+        guard !state.request.isCancelled, !state.request.isFinished else {
+            abandonOnQueue(identifier: identifier, token: token)
+            return
+        }
+
+        switch result {
+        case .failure(let error):
+            completeOnQueue(identifier: identifier, token: token, error: error)
+
+        case .success(let data):
+            guard let expectedLength = range.validatedLength,
+                  Int64(data.count) == expectedLength,
+                  let dataRequest = state.request.dataRequest else {
+                completeOnQueue(
+                    identifier: identifier,
+                    token: token,
+                    error: .invalidResponse
+                )
+                return
+            }
+            let currentOffset = dataRequest.currentOffset == 0
+                ? dataRequest.requestedOffset
+                : dataRequest.currentOffset
+            guard currentOffset == range.lowerBound else {
+                completeOnQueue(
+                    identifier: identifier,
+                    token: token,
+                    error: .invalidResponse
+                )
+                return
+            }
+
+            dataRequest.respond(with: data)
+            let expectedNextOffset = range.upperBound + 1
+            guard dataRequest.currentOffset == expectedNextOffset else {
+                completeOnQueue(
+                    identifier: identifier,
+                    token: token,
+                    error: .invalidResponse
+                )
+                return
+            }
+            state.nextOffset = expectedNextOffset
+            startNextChunkOnQueue(identifier: identifier, token: token)
+        }
+    }
+
+    private func completeOnQueue(
+        identifier: ObjectIdentifier,
+        token: UUID,
+        error: ResourceSourceError?
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let state = loadingStates[identifier],
+              state.token == token,
+              !state.isTerminal else { return }
+        state.isTerminal = true
+        state.task?.cancel()
+        state.task = nil
+        loadingStates.removeValue(forKey: identifier)
+
+        guard !state.request.isCancelled, !state.request.isFinished else { return }
+        if let error {
+            state.request.finishLoading(with: error as NSError)
+        } else {
+            state.request.finishLoading()
+        }
+    }
+
+    private func abandonOnQueue(identifier: ObjectIdentifier, token: UUID) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let state = loadingStates[identifier],
+              state.token == token,
+              !state.isTerminal else { return }
+        state.isTerminal = true
+        state.task?.cancel()
+        state.task = nil
+        loadingStates.removeValue(forKey: identifier)
+    }
+
+    private func invalidateOnQueue() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !invalidated else { return }
+        invalidated = true
+
+        for (identifier, state) in Array(loadingStates) {
+            completeOnQueue(
+                identifier: identifier,
+                token: state.token,
+                error: .cancelled
+            )
+        }
+        if case .session(let session) = backing {
+            Task { await session.close() }
+        }
+    }
+
+    private func negotiatedContentType(allowedTypes: [String]?) -> String? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let allowedTypes, !allowedTypes.isEmpty else {
+            return contentTypes.first
+        }
+
+        for contentType in contentTypes where allowedTypes.contains(contentType) {
+            return contentType
+        }
+        for allowedIdentifier in allowedTypes {
+            guard let allowedType = UTType(allowedIdentifier) else { continue }
+            for contentIdentifier in contentTypes {
+                guard let actualType = UTType(contentIdentifier) else { continue }
+                if actualType == allowedType || actualType.conforms(to: allowedType) {
+                    return allowedIdentifier
+                }
+            }
+        }
+        return nil
     }
 
     private static let cancelledError = NSError(
@@ -229,8 +812,9 @@ private final class InMemoryAssetResourceLoader: NSObject, AVAssetResourceLoader
         code: NSURLErrorCancelled
     )
 
-    private static let invalidRangeError = NSError(
-        domain: "iosRemoteFolder.video-resource-loader",
-        code: 1
-    )
+    private static let unsupportedContentTypeError = ResourceSourceError
+        .capabilityUnavailable as NSError
+
+    private static let invalidRangeError = ResourceSourceError.invalidResponse as NSError
+
 }

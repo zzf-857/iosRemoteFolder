@@ -193,72 +193,202 @@ struct HTTPSourceAdapterTests {
         #expect(metadata.revision == .serverVersion("opaque-version-9"))
     }
 
-    @Test("HEAD 被拒绝时降级为 Range GET 探测")
+    @Test("HEAD 405 或 501 时降级为 Range GET 探测")
     func metadataFallsBackToGET() async throws {
+        for rejectedHeadStatus in [405, 501] {
+            MockURLProtocol.reset()
+            let methods = TestBox<[String]>([])
+            MockURLProtocol.register(Self.fileURL) { request in
+                let method = request.httpMethod ?? "GET"
+                methods.value = methods.value + [method]
+                if method == "HEAD" {
+                    return .respond(status: rejectedHeadStatus, headers: [:], body: Data())
+                }
+                #expect(request.value(forHTTPHeaderField: "Range") == "bytes=0-0")
+                return .respond(
+                    status: 206,
+                    headers: [
+                        "Content-Range": "bytes 0-0/88",
+                        "Content-Length": "1",
+                        "Content-Type": "application/pdf",
+                        "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
+                    ],
+                    body: Data([0])
+                )
+            }
+            let adapter = makeAdapter(descriptors: [descriptor()])
+            let item = try #require(try await adapter.listResources().first)
+            let metadata = try await adapter.fetchMetadata(for: item)
+            #expect(methods.value == ["HEAD", "GET"])
+            #expect(metadata.acceptsRanges)
+            #expect(metadata.byteSize == 88)
+            #expect(metadata.mimeType == "application/pdf")
+            guard case .modifiedAndSize(let modifiedAt, let byteSize) = metadata.revision else {
+                Issue.record("合法 206 探测应使用完整大小形成 metadata revision")
+                continue
+            }
+            #expect(modifiedAt == metadata.modifiedAt)
+            #expect(byteSize == 88)
+        }
+    }
+
+    @Test("HEAD 200 未声明 Range 时使用合法 206 合并元数据与能力")
+    func successfulHeadPerformsRangeProbe() async throws {
         MockURLProtocol.reset()
         let methods = TestBox<[String]>([])
+        let ranges = TestBox<[String?]>([])
         MockURLProtocol.register(Self.fileURL) { request in
-            let method = request.httpMethod ?? "GET"
-            methods.value = methods.value + [method]
-            if method == "HEAD" {
-                return .respond(status: 405, headers: [:], body: Data())
+            methods.value = methods.value + [request.httpMethod ?? "GET"]
+            ranges.value = ranges.value + [request.value(forHTTPHeaderField: "Range")]
+            if request.httpMethod == "HEAD" {
+                return .respond(
+                    status: 200,
+                    headers: [
+                        "Content-Length": "88",
+                        "Content-Type": "audio/mpeg",
+                        "ETag": "\"head-version\""
+                    ],
+                    body: Data()
+                )
             }
             return .respond(
                 status: 206,
                 headers: [
                     "Content-Range": "bytes 0-0/88",
                     "Content-Length": "1",
-                    "Content-Type": "application/pdf",
-                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
+                    "Content-Type": "application/octet-stream"
                 ],
-                body: Data([0])
+                body: Data([0x49])
             )
         }
         let adapter = makeAdapter(descriptors: [descriptor()])
-        let items = try await adapter.listResources()
-        let metadata = try await adapter.fetchMetadata(for: items[0])
+        let item = try #require(try await adapter.listResources().first)
+        let metadata = try await adapter.fetchMetadata(for: item)
+        let reference = try await adapter.reference(for: item)
+
         #expect(methods.value == ["HEAD", "GET"])
+        #expect(ranges.value.count == 2)
+        #expect(ranges.value[0] == nil)
+        #expect(ranges.value[1] == "bytes=0-0")
         #expect(metadata.acceptsRanges)
         #expect(metadata.byteSize == 88)
-        #expect(metadata.mimeType == "application/pdf")
-        guard case .modifiedAndSize(let modifiedAt, let byteSize) = metadata.revision else {
-            Issue.record("合法 206 探测应使用完整大小形成 metadata revision")
+        #expect(metadata.mimeType == "audio/mpeg")
+        #expect(metadata.revision == .etag("\"head-version\""))
+        guard case .remoteHTTP(let value) = reference else {
+            Issue.record("应为 HTTP 引用")
             return
         }
-        #expect(modifiedAt == metadata.modifiedAt)
-        #expect(byteSize == 88)
+        #expect(value.supportsRange)
     }
 
-    @Test("malformed 206 探测不声明 Range")
-    func malformedProbeDoesNotAdvertiseRange() async throws {
+    @Test("Range 探测收到 200 时保留 HEAD 元数据但不声明能力")
+    func ignoredRangeProbeRemainsConservative() async throws {
         MockURLProtocol.reset()
+        let observedRange = TestBox<String?>(nil)
         MockURLProtocol.register(Self.fileURL) { request in
             if request.httpMethod == "HEAD" {
-                return .respond(status: 405, headers: [:], body: Data())
+                return .respond(
+                    status: 200,
+                    headers: ["Content-Length": "4096", "Content-Type": "application/pdf"],
+                    body: Data()
+                )
             }
+            observedRange.value = request.value(forHTTPHeaderField: "Range")
             return .respond(
-                status: 206,
-                headers: [
-                    "Content-Range": "bytes 1-1/88",
-                    "Content-Length": "1",
-                    "Last-Modified": "Wed, 06 Aug 2026 08:00:00 GMT"
-                ],
-                body: Data([0])
+                status: 200,
+                headers: ["Content-Length": "4096"],
+                body: Data(repeating: 0x2A, count: 64)
             )
         }
         let adapter = makeAdapter(descriptors: [descriptor()])
-        let items = try await adapter.listResources()
-        let metadata = try await adapter.fetchMetadata(for: items[0])
-        let reference = try await adapter.reference(for: items[0])
+        let item = try #require(try await adapter.listResources().first)
+        let metadata = try await adapter.fetchMetadata(for: item)
+        let reference = try await adapter.reference(for: item)
 
+        #expect(observedRange.value == "bytes=0-0")
+        #expect(metadata.byteSize == 4096)
+        #expect(metadata.mimeType == "application/pdf")
         #expect(!metadata.acceptsRanges)
-        #expect(metadata.byteSize == nil)
-        #expect(metadata.revision.isUnknown)
         guard case .remoteHTTP(let value) = reference else {
             Issue.record("应为 HTTP 引用")
             return
         }
         #expect(!value.supportsRange)
+    }
+
+    @Test("Range 探测收到 416 时清除陈旧能力")
+    func unsatisfiedRangeProbeClearsStaleCapability() async throws {
+        MockURLProtocol.reset()
+        let requestCount = TestBox(0)
+        MockURLProtocol.register(Self.fileURL) { request in
+            requestCount.value += 1
+            switch requestCount.value {
+            case 1:
+                return .respond(status: 200, headers: ["Accept-Ranges": "bytes"], body: Data())
+            case 2:
+                return .respond(status: 200, headers: ["Content-Length": "88"], body: Data())
+            default:
+                #expect(request.httpMethod == "GET")
+                #expect(request.value(forHTTPHeaderField: "Range") == "bytes=0-0")
+                return .respond(status: 416, headers: ["Content-Range": "bytes */88"], body: Data())
+            }
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let item = try #require(try await adapter.listResources().first)
+
+        _ = try await adapter.fetchMetadata(for: item)
+        let firstReference = try await adapter.reference(for: item)
+        let metadata = try await adapter.fetchMetadata(for: item)
+        let secondReference = try await adapter.reference(for: item)
+
+        guard case .remoteHTTP(let first) = firstReference,
+              case .remoteHTTP(let second) = secondReference else {
+            Issue.record("应为 HTTP 引用")
+            return
+        }
+        #expect(first.supportsRange)
+        #expect(!metadata.acceptsRanges)
+        #expect(metadata.byteSize == 88)
+        #expect(!second.supportsRange)
+    }
+
+    @Test("畸形 206 探测返回协议错误并清除陈旧能力")
+    func malformedProbeDoesNotAdvertiseRange() async throws {
+        MockURLProtocol.reset()
+        let requestCount = TestBox(0)
+        MockURLProtocol.register(Self.fileURL) { request in
+            requestCount.value += 1
+            switch requestCount.value {
+            case 1:
+                return .respond(status: 200, headers: ["Accept-Ranges": "bytes"], body: Data())
+            case 2:
+                return .respond(status: 200, headers: ["Content-Length": "88"], body: Data())
+            default:
+                #expect(request.httpMethod == "GET")
+                return .respond(
+                    status: 206,
+                    headers: ["Content-Range": "bytes 0-0/*", "Content-Length": "1"],
+                    body: Data([0])
+                )
+            }
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let item = try #require(try await adapter.listResources().first)
+
+        _ = try await adapter.fetchMetadata(for: item)
+        let firstReference = try await adapter.reference(for: item)
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.fetchMetadata(for: item)
+        }
+        let secondReference = try await adapter.reference(for: item)
+
+        guard case .remoteHTTP(let first) = firstReference,
+              case .remoteHTTP(let second) = secondReference else {
+            Issue.record("应为 HTTP 引用")
+            return
+        }
+        #expect(first.supportsRange)
+        #expect(!second.supportsRange)
     }
 
     @Test("连接探测成功")
@@ -382,6 +512,60 @@ struct HTTPSourceAdapterTests {
         )
         #expect(String(decoding: data, as: UTF8.self) == "2345")
         #expect(observedRange.value == "bytes=2-5")
+    }
+
+    @Test("会话快照 Range 要求 206 总长度一致并拒绝 200 回退")
+    func snapshotRangeRejectsChangedRepresentation() async throws {
+        let requestedRange = ResourceByteRange(lowerBound: 2, upperBound: 5)
+
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: ["Content-Range": "bytes 2-5/10"],
+                body: Data("2345".utf8)
+            )
+        }
+        var adapter = makeAdapter(descriptors: [descriptor()])
+        var listedItem = try #require(try await adapter.listResources().first)
+        var snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(byteSize: 10, acceptsRanges: true)
+        )
+        let valid = try await adapter.readData(for: snapshotItem, range: requestedRange)
+        #expect(valid == Data("2345".utf8))
+
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: ["Content-Range": "bytes 2-5/11"],
+                body: Data("2345".utf8)
+            )
+        }
+        adapter = makeAdapter(descriptors: [descriptor()])
+        listedItem = try #require(try await adapter.listResources().first)
+        snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(byteSize: 10, acceptsRanges: true)
+        )
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(for: snapshotItem, range: requestedRange)
+        }
+
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(status: 200, headers: ["Content-Length": "10"], body: Data("0123456789".utf8))
+        }
+        adapter = makeAdapter(descriptors: [descriptor()])
+        listedItem = try #require(try await adapter.listResources().first)
+        snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(byteSize: 10, acceptsRanges: true)
+        )
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(for: snapshotItem, range: requestedRange)
+        }
     }
 
     @Test("服务器忽略 Range 时在本地切片降级")
@@ -568,6 +752,21 @@ struct HTTPSourceAdapterTests {
             metadata: ResourceMetadata(),
             capabilities: [.read],
             accent: .orange
+        )
+    }
+
+    private func item(
+        _ item: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResourceItem {
+        ResourceItem(
+            sourceID: item.sourceID,
+            logicalPath: ResourcePath(rawValue: item.path)!,
+            name: item.name,
+            kind: item.kind,
+            metadata: metadata,
+            capabilities: item.capabilities.union(.rangeRead),
+            accent: item.accent
         )
     }
 }

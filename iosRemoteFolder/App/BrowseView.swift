@@ -6,7 +6,10 @@ struct BrowseView: View {
     var body: some View {
         @Bindable var appModel = appModel
         NavigationStack {
-            BrowseContentView(store: appModel.sourcesStore)
+            BrowseContentView(
+                store: appModel.sourcesStore,
+                selectedSourceID: $appModel.selectedBrowseSourceID
+            )
                 .navigationTitle("浏览")
                 .navigationDestination(for: ResourceItem.self) { resource in
                     // 只有文件进入查看器；文件夹通过 store 状态切换下钻，不会误入此处。
@@ -19,7 +22,7 @@ struct BrowseView: View {
 private struct BrowseContentView: View {
     let store: SourcesStore
 
-    @State private var selectedSourceID: UUID?
+    @Binding var selectedSourceID: UUID?
     @State private var selectedKind: ResourceKind?
     @State private var searchText: String = ""
 
@@ -38,6 +41,7 @@ private struct BrowseContentView: View {
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, prompt: "搜索当前目录")
         .toolbar { toolbarContent }
+        .glassNavigationBar()
         .task { store.connectAll() }
         .onChange(of: selectedSourceID) { _, newID in
             guard let newID else { return }
@@ -77,6 +81,14 @@ private struct BrowseContentView: View {
                     Image(systemName: "chevron.left")
                 }
             }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            NavigationLink {
+                ResourceSearchView()
+            } label: {
+                Image(systemName: "magnifyingglass")
+            }
+            .accessibilityLabel("搜索已浏览资源")
         }
         ToolbarItem(placement: .topBarTrailing) {
             Picker("类型", selection: $selectedKind) {

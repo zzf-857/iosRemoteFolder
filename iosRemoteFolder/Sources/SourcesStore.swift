@@ -50,6 +50,11 @@ final class SourcesStore {
     @ObservationIgnored private var connectionGenerations: [UUID: Int] = [:]
     /// 浏览加载代数：与连接代数同理，避免过期列举覆盖新目录。
     @ObservationIgnored private var browseGenerations: [UUID: Int] = [:]
+    /// Composition-root hook for indexing successful, current-generation
+    /// directory listings. Failure and cancellation paths never invoke it.
+    @ObservationIgnored var onDirectorySnapshot: (
+        @MainActor (UUID, ResourcePath, [ResourceItem]) async -> Void
+    )?
 
     init(registry: SourceRegistry) {
         self.registry = registry
@@ -157,11 +162,17 @@ final class SourcesStore {
     /// 生命周期：开始时同步进入 connecting；成功进入 ready 并写入当前目录（根目录）
     /// 的真实资源列表；失败进入 failed（保留可行动错误）；任务被取消时回到 disconnected，
     /// 不会永久停留在 connecting。
-    func connect(_ sourceID: UUID) {
+    func connect(_ sourceID: UUID, initialPath: ResourcePath = .root) {
         guard let entry = entry(for: sourceID), entry.hasAdapter else { return }
         connectionTasks[sourceID]?.cancel()
         let generation = nextConnectionGeneration(for: sourceID)
         transition(sourceID, to: .connecting)
+        update(sourceID) { entry in
+            entry.browse.currentPath = initialPath
+            entry.browse.items = []
+            entry.browse.isLoading = false
+            entry.browse.error = nil
+        }
         let registry = self.registry
         let task = Task {
             defer {
@@ -169,17 +180,18 @@ final class SourcesStore {
             }
             do {
                 try await registry.connect(sourceID: sourceID)
-                let resources = try await registry.listResources(sourceID: sourceID, at: .root)
+                let resources = try await registry.listResources(sourceID: sourceID, at: initialPath)
                 try Task.checkCancellation()
                 guard self.isCurrentConnectionGeneration(sourceID, generation) else { return }
                 self.transition(sourceID, to: .ready)
                 self.update(sourceID) { entry in
                     entry.source.itemCountDescription = "\(resources.count) 个资源"
-                    entry.browse.currentPath = .root
+                    entry.browse.currentPath = initialPath
                     entry.browse.items = resources
                     entry.browse.isLoading = false
                     entry.browse.error = nil
                 }
+                await self.onDirectorySnapshot?(sourceID, initialPath, resources)
             } catch {
                 guard self.isCurrentConnectionGeneration(sourceID, generation) else { return }
                 let mapped = ResourceSourceError.mapping(error)
@@ -197,7 +209,8 @@ final class SourcesStore {
 
     /// 失败来源的重试入口。
     func retry(_ sourceID: UUID) {
-        connect(sourceID)
+        let targetPath = entry(for: sourceID)?.browse.currentPath ?? .root
+        connect(sourceID, initialPath: targetPath)
     }
 
     /// 若来源处于可连接状态则发起连接（用于来源被选中时按需连接）。
@@ -266,6 +279,7 @@ final class SourcesStore {
                     entry.browse.isLoading = false
                     entry.browse.error = nil
                 }
+                await self.onDirectorySnapshot?(sourceID, path, items)
             } catch {
                 guard self.isCurrentBrowseGeneration(sourceID, generation) else { return }
                 let mapped = ResourceSourceError.mapping(error)
@@ -285,6 +299,18 @@ final class SourcesStore {
     /// 列举根目录。
     func loadRoot(_ sourceID: UUID) {
         loadDirectory(sourceID, at: .root)
+    }
+
+    /// Opens an indexed directory whether the source is already ready or must
+    /// reconnect first. A reconnect lists the requested path as its first
+    /// current-generation snapshot instead of flashing the root directory.
+    func openDirectory(_ sourceID: UUID, at path: ResourcePath) {
+        guard let entry = entry(for: sourceID), entry.hasAdapter else { return }
+        if case .ready = entry.state {
+            loadDirectory(sourceID, at: path)
+        } else {
+            connect(sourceID, initialPath: path)
+        }
     }
 
     /// 进入一个文件夹：文件夹的 `path` 即其完整规范化逻辑路径。

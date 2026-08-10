@@ -86,7 +86,8 @@ enum SourceConfigurationPersistence {
     private static func makeSchema() -> Schema {
         Schema([
             LocalSourceConfigurationRecord.self,
-            RemoteSourceConfigurationRecord.self
+            RemoteSourceConfigurationRecord.self,
+            ResourceIndexRecord.self
         ])
     }
 }

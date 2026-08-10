@@ -17,6 +17,8 @@ final class AppModel {
     var currentTab: AppTab = .home
     var searchText = ""
     var selectedKind: ResourceKind?
+    /// Shared Browse selection so a folder search result can open its source.
+    var selectedBrowseSourceID: UUID?
     var resources: [ResourceItem]
     /// 成功打开过的资源，按最近打开顺序投影给 Home。
     var recentResources: [ResourceItem]
@@ -30,9 +32,12 @@ final class AppModel {
     var sources: [ResourceSource] { sourcesStore.entries.map(\.source) }
     /// 最近一次来源配置操作的可见错误；错误文本不包含 bookmark 解析后的 URL。
     var sourceActionError: String?
+    /// Last background index write failure. Search reads report their own error.
+    var resourceIndexError: String?
 
     @ObservationIgnored let resourceAccessService: ResourceAccessService
     @ObservationIgnored let cacheCoordinator: CacheCoordinator
+    @ObservationIgnored let resourceIndexStore: ResourceIndexStore
     @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
     @ObservationIgnored private let remoteConfigurationStore: RemoteSourceConfigurationStore
@@ -206,6 +211,8 @@ final class AppModel {
         self.registry = registry
         let cacheCoordinator = CacheCoordinator()
         self.cacheCoordinator = cacheCoordinator
+        let resourceIndexStore = ResourceIndexStore(modelContainer: store.modelContainer)
+        self.resourceIndexStore = resourceIndexStore
         self.sourcesStore = SourcesStore(registry: registry)
         self.resourceAccessService = ResourceAccessService(
             registry: registry,
@@ -213,10 +220,19 @@ final class AppModel {
         )
         self.managedRemoteSourceIDs = restoredRemoteIDs
         self.sourceActionError = startupError
+        self.resourceIndexError = nil
+        self.sourcesStore.onDirectorySnapshot = { [weak self] sourceID, path, items in
+            guard let self else { return }
+            await self.indexDirectory(sourceID: sourceID, path: path, items: items)
+        }
         self.sourcesStore.synchronize(
             with: registry.initialSnapshots,
             failures: startupFailures
         )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.retainResourceIndex(sourceIDs: Set(self.sources.map(\.id)))
+        }
     }
 
     var filteredResources: [ResourceItem] {
@@ -335,6 +351,24 @@ final class AppModel {
     func resetFilters() {
         selectedKind = nil
         searchText = ""
+    }
+
+    /// Opens an indexed folder through the same SourcesStore browse state used
+    /// by the Browse tab. Persisted search results never bypass the registry.
+    func openIndexedFolder(_ resource: ResourceItem) {
+        guard resource.kind == .folder,
+              sources.contains(where: { $0.id == resource.sourceID }),
+              let path = ResourcePath(rawValue: resource.path),
+              path.normalized == resource.path else {
+            return
+        }
+        selectedBrowseSourceID = resource.sourceID
+        sourcesStore.openDirectory(resource.sourceID, at: path)
+        currentTab = .browse
+    }
+
+    func sourceName(for sourceID: UUID) -> String {
+        sources.first(where: { $0.id == sourceID })?.name ?? "未知来源"
     }
 
     func dismissSourceError() {
@@ -578,10 +612,10 @@ final class AppModel {
                 _ = try? configurationStore.replace(oldConfiguration)
                 throw error
             }
+            await synchronizeStore()
             if changesContentNamespace {
                 await invalidateDerivedContent(for: sourceID)
             }
-            await synchronizeStore()
             guard !Task.isCancelled else { return }
             sourcesStore.connect(sourceID)
         } catch {
@@ -732,10 +766,10 @@ final class AppModel {
             }
 
             managedRemoteSourceIDs.insert(sourceID)
+            await synchronizeStore()
             if changesContentNamespace {
                 await invalidateDerivedContent(for: sourceID)
             }
-            await synchronizeStore()
             guard !Task.isCancelled else { return }
             sourcesStore.connect(sourceID)
         } catch {
@@ -803,11 +837,16 @@ final class AppModel {
     private func synchronizeStore() async {
         let snapshots = await registry.currentSnapshots()
         sourcesStore.synchronize(with: snapshots)
-        recentResourceStore.retain(sourceIDs: Set(snapshots.map(\.id)))
+        let sourceIDs = Set(snapshots.map(\.id))
+        if let selectedBrowseSourceID, !sourceIDs.contains(selectedBrowseSourceID) {
+            self.selectedBrowseSourceID = nil
+        }
+        recentResourceStore.retain(sourceIDs: sourceIDs)
         recentResources = recentResourceStore.items
-        resourceProgressStore.retain(sourceIDs: Set(snapshots.map(\.id)))
-        resourceReadingStore.retain(sourceIDs: Set(snapshots.map(\.id)))
-        await cacheCoordinator.retain(sourceIDs: Set(snapshots.map(\.id)))
+        resourceProgressStore.retain(sourceIDs: sourceIDs)
+        resourceReadingStore.retain(sourceIDs: sourceIDs)
+        await cacheCoordinator.retain(sourceIDs: sourceIDs)
+        await retainResourceIndex(sourceIDs: sourceIDs)
         await refreshOfflineCache()
     }
 
@@ -820,7 +859,39 @@ final class AppModel {
         resourceProgressStore.remove(sourceID: sourceID)
         resourceReadingStore.remove(sourceID: sourceID)
         await cacheCoordinator.remove(sourceID: sourceID)
+        do {
+            try await resourceIndexStore.remove(sourceID: sourceID)
+            resourceIndexError = nil
+        } catch {
+            resourceIndexError = error.localizedDescription
+        }
         await refreshOfflineCache()
+    }
+
+    private func indexDirectory(
+        sourceID: UUID,
+        path: ResourcePath,
+        items: [ResourceItem]
+    ) async {
+        do {
+            try await resourceIndexStore.replaceDirectory(
+                sourceID: sourceID,
+                parentPath: path,
+                items: items
+            )
+            resourceIndexError = nil
+        } catch {
+            resourceIndexError = error.localizedDescription
+        }
+    }
+
+    private func retainResourceIndex(sourceIDs: Set<UUID>) async {
+        do {
+            try await resourceIndexStore.retain(sourceIDs: sourceIDs)
+            resourceIndexError = nil
+        } catch {
+            resourceIndexError = error.localizedDescription
+        }
     }
 
     private func reportSourceError(_ error: any Error) {

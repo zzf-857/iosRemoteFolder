@@ -17,7 +17,6 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
     private let session: URLSession
     private let timeout: TimeInterval
     private var metadataByPath: [String: ResourceMetadata] = [:]
-    private var serverAdvertisesRanges = false
     private static let maxPropfindResponseBytes = 2 * 1024 * 1024
 
     init(
@@ -60,8 +59,11 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         if let session {
             self.session = session
         } else {
-            let configuration = URLSessionConfiguration.default
+            let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = timeout
+            configuration.httpCookieStorage = nil
+            configuration.urlCredentialStorage = nil
+            configuration.httpShouldSetCookies = false
             self.session = URLSession(configuration: configuration)
         }
     }
@@ -152,17 +154,25 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
             timeout: timeout
         )
 
-        let metadata: ResourceMetadata
+        let httpMetadata: ResourceMetadata?
         do {
             // HEAD/Range probing supplies concrete Accept-Ranges and a second
             // revision source where the DAV property set is incomplete.
-            let httpMetadata = try await httpAdapter.fetchMetadata(for: item)
-            metadata = merge(dav: davMetadata, http: httpMetadata)
+            httpMetadata = try await httpAdapter.fetchMetadata(for: item)
         } catch ResourceSourceError.httpStatus(let code) where code == 405 || code == 501 {
-            metadata = davMetadata
+            httpMetadata = nil
         } catch ResourceSourceError.invalidResponse {
             // A malformed optional probe must not discard otherwise valid DAV
             // metadata; it only means Range evidence remains conservative.
+            httpMetadata = nil
+        }
+
+        // Keep the optional transport probe separate from consistency checks:
+        // once both metadata sets are valid, conflicting object sizes are fatal.
+        let metadata: ResourceMetadata
+        if let httpMetadata {
+            metadata = try merge(dav: davMetadata, http: httpMetadata)
+        } else {
             metadata = davMetadata
         }
 
@@ -235,10 +245,6 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         guard data.count <= Self.maxPropfindResponseBytes else {
             throw ResourceSourceError.responseTooLarge
         }
-        if let ranges = Self.headerValue("Accept-Ranges", in: httpResponse) {
-            serverAdvertisesRanges = ranges.caseInsensitiveCompare("bytes") == .orderedSame
-        }
-
         let parser = DAVXMLParser()
         let entries: [DAVEntry]
         do {
@@ -300,14 +306,13 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         let byteSize = isDirectory ? nil : entry.byteSize
         let mimeType = isDirectory ? nil : entry.mimeType
         let modifiedAt = entry.modifiedAt
-        let acceptsRanges = !isDirectory && serverAdvertisesRanges
         return ResourceMetadata(
             byteSize: byteSize,
             modifiedAt: modifiedAt,
             mimeType: mimeType,
             typeIdentifier: isDirectory ? nil : Self.typeIdentifier(name: entry.name, mimeType: mimeType),
             isDirectory: isDirectory,
-            acceptsRanges: acceptsRanges,
+            acceptsRanges: false,
             revision: ResourceRevision.strongest(
                 etag: entry.etag,
                 serverVersion: entry.serverVersion,
@@ -317,11 +322,15 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         )
     }
 
-    private func merge(dav: ResourceMetadata, http: ResourceMetadata) -> ResourceMetadata {
+    private func merge(dav: ResourceMetadata, http: ResourceMetadata) throws -> ResourceMetadata {
+        if let davByteSize = dav.byteSize,
+           let httpByteSize = http.byteSize,
+           davByteSize != httpByteSize {
+            throw ResourceSourceError.invalidResponse
+        }
         let byteSize = http.byteSize ?? dav.byteSize
         let modifiedAt = http.modifiedAt ?? dav.modifiedAt
-        let mimeType = http.mimeType ?? dav.mimeType
-        let typeIdentifier = http.typeIdentifier ?? dav.typeIdentifier
+        let contentType = Self.preferredContentType(dav: dav, http: http)
         let revision = ResourceRevision.strongest(
             etag: Self.etag(from: dav.revision) ?? Self.etag(from: http.revision),
             serverVersion: Self.serverVersion(from: dav.revision)
@@ -332,12 +341,97 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         return ResourceMetadata(
             byteSize: byteSize,
             modifiedAt: modifiedAt,
-            mimeType: mimeType,
-            typeIdentifier: typeIdentifier,
+            mimeType: contentType.mimeType,
+            typeIdentifier: contentType.typeIdentifier,
             isDirectory: false,
             acceptsRanges: http.acceptsRanges,
             revision: revision
         )
+    }
+
+    private static func preferredContentType(
+        dav: ResourceMetadata,
+        http: ResourceMetadata
+    ) -> (mimeType: String?, typeIdentifier: String?) {
+        let davMIME = normalizedMIMEType(dav.mimeType)
+        let httpMIME = normalizedMIMEType(http.mimeType)
+        let preferHTTP: Bool
+
+        if davMIME == nil {
+            preferHTTP = true
+        } else if let davMIME, isGenericMIMEType(davMIME),
+                  let httpMIME, !isGenericMIMEType(httpMIME) {
+            preferHTTP = true
+        } else if let davMIME, let httpMIME,
+                  contentFamily(mimeType: davMIME, typeIdentifier: dav.typeIdentifier)
+                    == contentFamily(mimeType: httpMIME, typeIdentifier: http.typeIdentifier),
+                  contentFamily(mimeType: davMIME, typeIdentifier: dav.typeIdentifier) != nil,
+                  mimeSpecificity(httpMIME) > mimeSpecificity(davMIME) {
+            preferHTTP = true
+        } else {
+            // WebDAV getcontenttype describes the listed resource. Some Alist
+            // backends return a generic or conflicting Content-Type for HEAD.
+            preferHTTP = false
+        }
+
+        let primary = preferHTTP ? http : dav
+        let secondary = preferHTTP ? dav : http
+        let mimeType = primary.mimeType ?? secondary.mimeType
+        let typeIdentifier = primary.typeIdentifier
+            ?? mimeType.flatMap { normalizedMIMEType($0) }
+                .flatMap { UTType(mimeType: $0)?.identifier }
+            ?? secondary.typeIdentifier
+        return (mimeType, typeIdentifier)
+    }
+
+    private enum ContentFamily {
+        case pdf
+        case text
+        case image
+        case video
+        case audio
+    }
+
+    private static func contentFamily(
+        mimeType: String?,
+        typeIdentifier: String?
+    ) -> ContentFamily? {
+        let type = typeIdentifier.flatMap(UTType.init)
+            ?? mimeType.flatMap { UTType(mimeType: $0) }
+        if type?.conforms(to: .pdf) == true { return .pdf }
+        if type?.conforms(to: .text) == true { return .text }
+        if type?.conforms(to: .image) == true { return .image }
+        if type?.conforms(to: .movie) == true { return .video }
+        if type?.conforms(to: .audio) == true { return .audio }
+        return nil
+    }
+
+    private static func normalizedMIMEType(_ value: String?) -> String? {
+        guard let value = value?
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private static func isGenericMIMEType(_ mimeType: String) -> Bool {
+        switch mimeType {
+        case "application/octet-stream", "binary/octet-stream", "application/binary",
+             "application/x-binary", "application/unknown", "application/x-unknown":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func mimeSpecificity(_ mimeType: String) -> Int {
+        if isGenericMIMEType(mimeType) { return 0 }
+        if mimeType == "text/plain" { return 1 }
+        return 2
     }
 
     private func resourceURL(for path: ResourcePath, isDirectory: Bool) -> URL {
@@ -496,16 +590,25 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
 /// URLSession task delegate used only by WebDAV/Alist requests.
 ///
-/// Redirects can otherwise move a request carrying Basic Authorization to a
-/// different host or out of the configured `/dav/` root. The delegate refuses
-/// those redirects before URLSession creates the follow-up request.
+/// DAV and authentication requests remain inside the configured root. Content
+/// GET/HEAD requests may follow a storage-provider redirect only after every
+/// source header is removed; the signed target URL remains request-local.
 private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HTTPRedirectFailureReporting, Sendable {
+    private struct RedirectState: Sendable {
+        var hasLeftTrustedRoot = false
+        var hopCount = 0
+    }
+
     private let scheme: String
     private let host: String
     private let port: Int
     private let basePathComponents: [String]
     private let authorization: String?
-    private let rejection = OSAllocatedUnfairLock(initialState: false)
+    private let rejection = OSAllocatedUnfairLock(initialState: 0)
+    private let redirectStates = OSAllocatedUnfairLock(
+        initialState: [Int: RedirectState]()
+    )
+    private static let maximumRedirectHops = 10
 
     init(endpoint: URL, authorization: String?) throws {
         guard let scheme = endpoint.scheme?.lowercased(),
@@ -542,34 +645,109 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
         guard let url = request.url,
-              allows(url),
-              let expectedMethod = task.currentRequest?.httpMethod
-                ?? task.originalRequest?.httpMethod,
+              let responseURL = response.url,
+              let expectedMethod = task.originalRequest?.httpMethod,
               request.httpMethod?.uppercased() == expectedMethod.uppercased() else {
-            rejection.withLock { $0 = true }
-            task.cancel()
-            completionHandler(nil)
+            reject(task: task, completionHandler: completionHandler)
             return
         }
 
-        var safeRequest = request
-        if let authorization {
-            safeRequest.setValue(authorization, forHTTPHeaderField: "Authorization")
-        } else {
-            safeRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+        let state = redirectStates.withLock { states -> RedirectState? in
+            var state = states[task.taskIdentifier] ?? RedirectState()
+            state.hopCount += 1
+            guard state.hopCount <= Self.maximumRedirectHops else {
+                states[task.taskIdentifier] = nil
+                return nil
+            }
+            if !allowsTrustedRoot(responseURL) {
+                state.hasLeftTrustedRoot = true
+            }
+            states[task.taskIdentifier] = state
+            return state
+        }
+        guard let state,
+              !Self.isHTTPSDowngrade(from: responseURL, to: url) else {
+            reject(task: task, completionHandler: completionHandler)
+            return
+        }
+
+        if allowsTrustedRoot(url) {
+            guard !state.hasLeftTrustedRoot else {
+                reject(task: task, completionHandler: completionHandler)
+                return
+            }
+            var safeRequest = request
+            if let authorization {
+                safeRequest.setValue(authorization, forHTTPHeaderField: "Authorization")
+            } else {
+                safeRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+            }
+            completionHandler(safeRequest)
+            return
+        }
+
+        guard allowsExternalContent(url, method: expectedMethod) else {
+            reject(task: task, completionHandler: completionHandler)
+            return
+        }
+        redirectStates.withLock { states in
+            guard var state = states[task.taskIdentifier] else { return }
+            state.hasLeftTrustedRoot = true
+            states[task.taskIdentifier] = state
+        }
+
+        // Do not forward any source-defined header to a signed storage URL.
+        // Range and If-Range are transport semantics, so recover only those
+        // explicit values from the request that initiated the redirect.
+        let originalRequest = task.originalRequest
+        var safeRequest = URLRequest(url: url)
+        safeRequest.httpShouldHandleCookies = false
+        safeRequest.httpMethod = expectedMethod
+        safeRequest.timeoutInterval = request.timeoutInterval
+        for field in ["Range", "If-Range"] {
+            if let value = originalRequest?.value(forHTTPHeaderField: field) {
+                safeRequest.setValue(value, forHTTPHeaderField: field)
+            }
         }
         completionHandler(safeRequest)
     }
 
-    func consumeUnsafeRedirect() -> Bool {
-        rejection.withLock {
-            let wasRejected = $0
-            $0 = false
-            return wasRejected
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        redirectStates.withLock { states in
+            states[task.taskIdentifier] = nil
         }
     }
 
-    private func allows(_ url: URL) -> Bool {
+    func consumeUnsafeRedirect() -> Bool {
+        rejection.withLock {
+            guard $0 > 0 else { return false }
+            $0 -= 1
+            return true
+        }
+    }
+
+    private func reject(
+        task: URLSessionTask,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        rejection.withLock { $0 += 1 }
+        redirectStates.withLock { states in
+            states[task.taskIdentifier] = nil
+        }
+        task.cancel()
+        completionHandler(nil)
+    }
+
+    private static func isHTTPSDowngrade(from source: URL, to target: URL) -> Bool {
+        source.scheme?.lowercased() == "https"
+            && target.scheme?.lowercased() == "http"
+    }
+
+    private func allowsTrustedRoot(_ url: URL) -> Bool {
         guard let candidateScheme = url.scheme?.lowercased(),
               let candidateHost = url.host?.lowercased(),
               candidateScheme == scheme,
@@ -594,11 +772,30 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
         }
         return true
     }
+
+    private func allowsExternalContent(_ url: URL, method: String) -> Bool {
+        let normalizedMethod = method.uppercased()
+        guard normalizedMethod == "GET" || normalizedMethod == "HEAD",
+              let candidateScheme = url.scheme?.lowercased(),
+              candidateScheme == "http" || candidateScheme == "https",
+              !(scheme == "https" && candidateScheme == "http"),
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              url.fragment == nil,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let decodedPath = components.percentEncodedPath.removingPercentEncoding else {
+            return false
+        }
+        let pathComponents = decodedPath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        return !pathComponents.contains(".") && !pathComponents.contains("..")
+    }
 }
 
 private final class DAVXMLParser: NSObject, XMLParserDelegate {
-    private struct Draft {
-        var href: String?
+    private struct PropertyDraft {
         var displayName: String?
         var byteSize: Int64?
         var modifiedAt: Date?
@@ -606,10 +803,24 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
         var etag: String?
         var serverVersion: String?
         var isCollection = false
+        var sawResourceType = false
+    }
+
+    private struct PropstatDraft {
+        var properties = PropertyDraft()
         var statusCode: Int?
     }
 
+    private struct Draft {
+        var href: String?
+        var properties = PropertyDraft()
+        var responseStatusCode: Int?
+        var firstFailedPropstatStatus: Int?
+        var acceptedPropstat = false
+    }
+
     private var current: Draft?
+    private var currentPropstat: PropstatDraft?
     private var activeProperty: String?
     private var propertyText = ""
     private var parseError: Error?
@@ -619,6 +830,7 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
 
     func parse(_ data: Data) throws -> [WebDAVSourceAdapter.DAVEntry] {
         current = nil
+        currentPropstat = nil
         activeProperty = nil
         propertyText = ""
         parseError = nil
@@ -665,7 +877,7 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
             return
         }
         if local == "response" {
-            guard current == nil else {
+            guard current == nil, currentPropstat == nil else {
                 parseError = ResourceSourceError.invalidResponse
                 return
             }
@@ -673,11 +885,36 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
             return
         }
         guard current != nil else { return }
+        if local == "propstat" {
+            guard currentPropstat == nil,
+                  elementStack.dropLast().last == "response" else {
+                parseError = ResourceSourceError.invalidResponse
+                return
+            }
+            currentPropstat = PropstatDraft()
+            return
+        }
+        if local == "resourcetype" {
+            if currentPropstat != nil {
+                currentPropstat?.properties.sawResourceType = true
+            } else {
+                current?.properties.sawResourceType = true
+            }
+            return
+        }
         if local == "collection" {
-            current?.isCollection = true
+            if currentPropstat != nil {
+                currentPropstat?.properties.isCollection = true
+            } else {
+                current?.properties.isCollection = true
+            }
             return
         }
         if Self.propertyNames.contains(local) {
+            guard activeProperty == nil else {
+                parseError = ResourceSourceError.invalidResponse
+                return
+            }
             activeProperty = local
             propertyText = ""
         }
@@ -701,23 +938,36 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
             activeProperty = nil
             propertyText = ""
         }
+        if local == "propstat" {
+            finishCurrentPropstat()
+            return
+        }
         guard local == "response", let current else { return }
+        guard currentPropstat == nil else {
+            parseError = ResourceSourceError.invalidResponse
+            self.current = nil
+            self.currentPropstat = nil
+            return
+        }
         guard let href = current.href, !href.isEmpty else {
             parseError = ResourceSourceError.invalidResponse
             self.current = nil
             return
         }
+        let properties = current.properties
+        let statusCode = current.responseStatusCode
+            ?? (current.acceptedPropstat ? 200 : current.firstFailedPropstatStatus)
         entries.append(
             WebDAVSourceAdapter.DAVEntry(
                 href: href,
-                name: current.displayName ?? "",
-                isCollection: current.isCollection,
-                byteSize: current.byteSize,
-                modifiedAt: current.modifiedAt,
-                mimeType: current.mimeType,
-                etag: current.etag,
-                serverVersion: current.serverVersion,
-                statusCode: current.statusCode
+                name: properties.displayName ?? "",
+                isCollection: properties.isCollection,
+                byteSize: properties.byteSize,
+                modifiedAt: properties.modifiedAt,
+                mimeType: properties.mimeType,
+                etag: properties.etag,
+                serverVersion: properties.serverVersion,
+                statusCode: statusCode
             )
         )
         self.current = nil
@@ -731,16 +981,101 @@ private final class DAVXMLParser: NSObject, XMLParserDelegate {
         guard current != nil else { return }
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         switch property {
-        case "href": current?.href = value
-        case "displayname": current?.displayName = value.isEmpty ? nil : value
-        case "getcontentlength": current?.byteSize = Int64(value)
-        case "getlastmodified": current?.modifiedAt = Self.parseHTTPDate(value)
-        case "getetag": current?.etag = value.isEmpty ? nil : value
-        case "getcontenttype": current?.mimeType = value.isEmpty ? nil : value
-        case "getcontentversion": current?.serverVersion = value.isEmpty ? nil : value
-        case "status": current?.statusCode = Self.parseStatusCode(value)
+        case "href":
+            guard !value.isEmpty else { return }
+            if var response = current {
+                response.href = merged(response.href, value)
+                current = response
+            }
+        case "displayname":
+            assignProperty(\.displayName, value: value.isEmpty ? nil : value)
+        case "getcontentlength":
+            assignProperty(\.byteSize, value: Int64(value))
+        case "getlastmodified":
+            assignProperty(\.modifiedAt, value: Self.parseHTTPDate(value))
+        case "getetag":
+            assignProperty(\.etag, value: value.isEmpty ? nil : value)
+        case "getcontenttype":
+            assignProperty(\.mimeType, value: value.isEmpty ? nil : value)
+        case "getcontentversion":
+            assignProperty(\.serverVersion, value: value.isEmpty ? nil : value)
+        case "status":
+            guard let statusCode = Self.parseStatusCode(value) else {
+                parseError = ResourceSourceError.invalidResponse
+                return
+            }
+            if var propstat = currentPropstat {
+                propstat.statusCode = merged(propstat.statusCode, statusCode)
+                currentPropstat = propstat
+            } else if var response = current {
+                response.responseStatusCode = merged(response.responseStatusCode, statusCode)
+                current = response
+            }
         default: break
         }
+    }
+
+    private func assignProperty<Value: Equatable>(
+        _ keyPath: WritableKeyPath<PropertyDraft, Value?>,
+        value: Value?
+    ) {
+        guard let value else { return }
+        if var propstat = currentPropstat {
+            let existing = propstat.properties[keyPath: keyPath]
+            propstat.properties[keyPath: keyPath] = merged(existing, value)
+            currentPropstat = propstat
+        } else if var response = current {
+            let existing = response.properties[keyPath: keyPath]
+            response.properties[keyPath: keyPath] = merged(existing, value)
+            current = response
+        }
+    }
+
+    private func finishCurrentPropstat() {
+        guard let propstat = currentPropstat, var current else {
+            parseError = ResourceSourceError.invalidResponse
+            currentPropstat = nil
+            return
+        }
+        defer { currentPropstat = nil }
+
+        if let statusCode = propstat.statusCode,
+           !(200..<300).contains(statusCode) {
+            current.firstFailedPropstatStatus = current.firstFailedPropstatStatus ?? statusCode
+            self.current = current
+            return
+        }
+
+        merge(propstat.properties, into: &current.properties)
+        current.acceptedPropstat = true
+        self.current = current
+    }
+
+    private func merge(_ incoming: PropertyDraft, into target: inout PropertyDraft) {
+        target.displayName = merged(target.displayName, incoming.displayName)
+        target.byteSize = merged(target.byteSize, incoming.byteSize)
+        target.modifiedAt = merged(target.modifiedAt, incoming.modifiedAt)
+        target.mimeType = merged(target.mimeType, incoming.mimeType)
+        target.etag = merged(target.etag, incoming.etag)
+        target.serverVersion = merged(target.serverVersion, incoming.serverVersion)
+        if incoming.sawResourceType {
+            if target.sawResourceType, target.isCollection != incoming.isCollection {
+                parseError = ResourceSourceError.invalidResponse
+            } else {
+                target.sawResourceType = true
+                target.isCollection = incoming.isCollection
+            }
+        }
+    }
+
+    private func merged<Value: Equatable>(_ existing: Value?, _ incoming: Value?) -> Value? {
+        guard let existing else { return incoming }
+        guard let incoming else { return existing }
+        guard existing == incoming else {
+            parseError = ResourceSourceError.invalidResponse
+            return existing
+        }
+        return existing
     }
 
     private static func localName(_ name: String) -> String {

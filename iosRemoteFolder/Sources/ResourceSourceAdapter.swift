@@ -163,7 +163,6 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
         try await connect()
         let all = SampleData.resources.filter { $0.sourceID == source.id }
-        guard !path.isRoot else { return all }
         // 按规范化路径过滤：直接子文件保留，深层资源合成必要的虚拟文件夹。
         var folderNames: [String: String] = [:]
         var fileItems: [String: ResourceItem] = [:]
