@@ -287,7 +287,9 @@ final class AppModel {
                 adapters.append(
                     HTTPSourceAdapter(source: source, descriptors: demoHTTPDescriptors)
                 )
-            case .alist, .webdav, .lan:
+            case .alist, .webdav:
+                adapters.append(SampleSourceAdapter(source: source))
+            case .lan:
                 break
             }
         }

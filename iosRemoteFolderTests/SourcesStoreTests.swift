@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 import Testing
 import UniformTypeIdentifiers
 
@@ -611,6 +612,7 @@ struct ViewerResolutionTests {
             )
         )
         #expect(markdownResolution.kind == .markdownReader)
+        #expect(markdownResolution.preparation == .text(maximumBytes: 10 * 1024 * 1024))
 
         let conflict = makeItem(path: "/notes/readme.pdf", kind: .pdf)
         let conflictResolution = ViewerRegistry.resolve(
@@ -641,5 +643,33 @@ struct ViewerResolutionTests {
             capabilities: [.read],
             accent: .blue
         )
+    }
+}
+
+@Suite("演示来源文档内容")
+struct SampleSourceContentTests {
+    @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")
+    func readsDemoDocumentsThroughSession() async throws {
+        let markdownSource = SampleData.sources.first { $0.id == SampleData.workSourceID }!
+        let markdownItem = SampleData.resources.first { $0.path == "/产品/路线图.md" }!
+        let markdownAdapter = SampleSourceAdapter(source: markdownSource)
+        let markdownRegistry = try SourceRegistry(
+            sources: [markdownSource],
+            adapters: [markdownAdapter]
+        )
+        let markdownSession = try await ResourceAccessService(registry: markdownRegistry)
+            .makeSession(for: markdownItem)
+        let markdownData = try await markdownSession.readData(maximumBytes: 10 * 1024 * 1024)
+        #expect(String(decoding: markdownData, as: UTF8.self).contains("产品路线图"))
+
+        let pdfSource = SampleData.sources.first { $0.id == SampleData.personalSourceID }!
+        let pdfItem = SampleData.resources.first { $0.path.hasSuffix("设计系统与组件规范.pdf") }!
+        let pdfAdapter = SampleSourceAdapter(source: pdfSource)
+        let pdfRegistry = try SourceRegistry(sources: [pdfSource], adapters: [pdfAdapter])
+        let pdfSession = try await ResourceAccessService(registry: pdfRegistry)
+            .makeSession(for: pdfItem)
+        let pdfData = try await pdfSession.readData(maximumBytes: 50 * 1024 * 1024)
+        #expect(pdfData.starts(with: Data("%PDF-1.4".utf8)))
+        #expect(PDFDocument(data: pdfData) != nil)
     }
 }

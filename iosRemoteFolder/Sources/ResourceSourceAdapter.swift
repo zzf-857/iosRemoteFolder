@@ -145,8 +145,8 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
     }
 }
 
-/// 假数据占位 adapter：在真实 Alist / WebDAV adapter 接入前维持骨架行为，
-/// 引用、元数据和读取能力明确声明为不可用。
+/// 演示来源 adapter：在真实 Alist / WebDAV adapter 接入前提供可浏览的
+/// 受控文档内容。内容只属于开发演示路径，不代表真实协议或远端数据能力。
 struct SampleSourceAdapter: ResourceSourceAdapter {
     let source: ResourceSource
 
@@ -196,10 +196,111 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
     }
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
-        throw ResourceSourceError.capabilityUnavailable
+        let sample = try sampleItem(for: item)
+        guard let content = Self.content(for: sample.path) else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
+        var metadata = sample.metadata
+        let byteSize = Int64(content.count)
+        metadata.byteSize = byteSize
+        metadata.revision = ResourceRevision.strongest(
+            etag: nil,
+            serverVersion: nil,
+            modifiedAt: metadata.modifiedAt,
+            byteSize: byteSize
+        )
+        return metadata
     }
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
-        throw ResourceSourceError.capabilityUnavailable
+        let sample = try sampleItem(for: item)
+        guard let content = Self.content(for: sample.path) else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
+        try Task.checkCancellation()
+        guard let range else { return content }
+        guard let clamped = range.clamped(toTotalLength: Int64(content.count)) else {
+            return Data()
+        }
+        let lower = Int(clamped.lowerBound)
+        let upper = Int(clamped.upperBound) + 1
+        return content.subdata(in: lower..<upper)
+    }
+
+    private func sampleItem(for item: ResourceItem) throws -> ResourceItem {
+        guard item.sourceID == source.id,
+              item.id.sourceID == source.id,
+              item.id.logicalPath == item.path,
+              let path = ResourcePath(rawValue: item.path),
+              path.normalized == item.path,
+              let sample = SampleData.resources.first(where: {
+                  $0.sourceID == source.id && $0.path == path.normalized
+              }) else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard sample.kind != .folder, !sample.metadata.isDirectory else {
+            throw ResourceSourceError.invalidReference
+        }
+        return sample
+    }
+
+    private static func content(for path: String) -> Data? {
+        switch path {
+        case "/产品/路线图.md":
+            return Data(
+                """
+                # 产品路线图
+
+                这是统一资源查看器的第一条真实文档内容路径。
+
+                ## 当前阶段
+
+                - 来源列举会返回规范化的逻辑路径
+                - 内容读取经过受预算的 ResourceContentSession
+                - TXT、Markdown 和 PDF 共享同一套来源生命周期
+
+                > 这份内容来自演示来源，仅用于验证浏览到阅读的完整链路。
+                """.utf8
+            )
+        case "/运维/服务器部署日志.txt":
+            return Data(
+                """
+                2026-08-10 09:00 连接来源
+                2026-08-10 09:02 完成根目录列举
+                2026-08-10 09:03 获取最新 metadata
+                2026-08-10 09:04 通过受控会话读取文本
+                """.utf8
+            )
+        case "/知识库/设计/设计系统与组件规范.pdf":
+            return Self.makePDF()
+        default:
+            return nil
+        }
+    }
+
+    /// 生成一个稳定、可由 PDFKit 打开的最小 PDF，避免演示内容依赖网络。
+    private static func makePDF() -> Data {
+        let stream = "BT /F1 20 Tf 72 720 Td (Resource viewer demo PDF) Tj ET\n"
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+            "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+            "5 0 obj\n<< /Length \(stream.utf8.count) >>\nstream\n\(stream)endstream\nendobj\n"
+        ]
+        var data = Data("%PDF-1.4\n".utf8)
+        var offsets = [0]
+        for object in objects {
+            offsets.append(data.count)
+            data.append(contentsOf: object.utf8)
+        }
+        let xrefOffset = data.count
+        data.append(contentsOf: "xref\n0 \(objects.count + 1)\n".utf8)
+        data.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for offset in offsets.dropFirst() {
+            data.append(contentsOf: String(format: "%010d 00000 n \n", offset).utf8)
+        }
+        data.append(contentsOf: "trailer\n<< /Size \(objects.count + 1) /Root 1 0 R >>\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8)
+        return data
     }
 }

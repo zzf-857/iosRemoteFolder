@@ -73,8 +73,8 @@ struct ViewerRegistry {
         case .markdown:
             return ViewerResolution(
                 kind: .markdownReader,
-                preparation: .none,
-                fallbackDescription: "Markdown 内容查看器仍在建设中"
+                preparation: .text(maximumBytes: 10 * 1024 * 1024),
+                fallbackDescription: nil
             )
         case .image:
             return ViewerResolution(kind: .imageViewer, preparation: .none, fallbackDescription: nil)

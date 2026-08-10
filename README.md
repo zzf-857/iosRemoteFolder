@@ -13,8 +13,8 @@
 - 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
 - HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
 - Sources 页面连接中、失败、重试状态
-- 79 个 Swift Testing fixture 测试和托管测试 target
-- PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口；TXT 与 PDF 已接入受预算内容读取，其他类型保留占位流程
+- 80 个 Swift Testing fixture 测试和托管测试 target
+- PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口；演示来源的 PDF/Markdown/TXT 已接入受预算内容读取，图片、视频、音乐仍保留占位流程
 - D-035 自适应与无障碍壳已通过主程验收：辅助字号布局、VoiceOver 语义、Reduce Motion、方向声明和 disclosure 所有权均已收口
 - D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
 - D-028B 已通过主程复核：`ResourceViewerHost` 经 `ResourceAccessService` 创建会话并获取最新 typed metadata，加载、失败、取消和重试状态均有结构化生命周期

@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import PDFKit
 import UIKit
@@ -74,7 +75,11 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "PDF 内容读取无效")
             }
         case .markdownReader:
-            MarkdownReaderView(resource: resource)
+            if case .text(let text) = payload {
+                MarkdownReaderView(resource: resource, text: text)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "Markdown 内容读取无效")
+            }
         case .textReader:
             if case .text(let text) = payload {
                 TextReaderView(resource: resource, text: text)
@@ -308,12 +313,13 @@ struct PDFReaderView: View {
 
 struct MarkdownReaderView: View {
     let resource: ResourceItem
+    let text: String
     @State private var renderedMode = true
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                ViewerHeader(icon: "text.badge.checkmark", eyebrow: "MARKDOWN READER", title: "结构化长文")
+                ViewerHeader(icon: "text.badge.checkmark", eyebrow: "MARKDOWN READER", title: resource.name)
                 Picker("显示模式", selection: $renderedMode) {
                     Text("渲染").tag(true)
                     Text("源码").tag(false)
@@ -321,26 +327,21 @@ struct MarkdownReaderView: View {
                 .pickerStyle(.segmented)
 
                 if renderedMode {
-                    Text("产品路线图")
-                        .font(.largeTitle.bold())
-                    Text("统一资源查看器的内容层以阅读优先，来源协议隐藏在 ResourceReference 后面。")
-                        .font(.title3)
-                    Divider()
-                    Text("当前骨架已经为 Textual、代码块、表格、远端图片和标题导航预留独立承载区。")
-                        .foregroundStyle(.secondary)
+                    if let rendered = try? AttributedString(markdown: text) {
+                        Text(rendered)
+                            .textSelection(.enabled)
+                    } else {
+                        Text(text.isEmpty ? "（空文件）" : text)
+                            .textSelection(.enabled)
+                    }
                 } else {
-                    Text("# \(resource.name)\n\nResourceReference -> ViewerRegistry -> MarkdownReader")
+                    Text(text.isEmpty ? "（空文件）" : text)
                         .font(.system(.body, design: .monospaced))
                         .textSelection(.enabled)
                 }
             }
             .frame(maxWidth: 720, alignment: .leading)
             .padding()
-        }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("目录", systemImage: "list.bullet.indent") {}
-            }
         }
     }
 }
