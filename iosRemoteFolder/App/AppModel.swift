@@ -185,7 +185,7 @@ final class AppModel {
             let location = try LocalSourceLocation(directoryURL: directoryURL)
             let configuration = LocalSourceConfiguration(
                 id: oldConfiguration.id,
-                displayName: Self.displayName(for: directoryURL),
+                displayName: oldConfiguration.displayName,
                 endpointDescription: oldConfiguration.endpointDescription,
                 location: location
             )
