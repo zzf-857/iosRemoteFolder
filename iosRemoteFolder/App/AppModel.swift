@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftData
 
 enum AppTab: String, CaseIterable, Hashable, Identifiable {
     case home
@@ -50,10 +51,39 @@ final class AppModel {
     init(
         configurationStore: LocalSourceConfigurationStore? = nil,
         remoteConfigurationStore: RemoteSourceConfigurationStore? = nil,
-        credentialStore: RemoteCredentialStore? = nil
+        credentialStore: RemoteCredentialStore? = nil,
+        modelContainer: ModelContainer? = nil
     ) {
-        let store = configurationStore ?? LocalSourceConfigurationStore()
-        let remoteStore = remoteConfigurationStore ?? RemoteSourceConfigurationStore()
+        let sharedContainer: ModelContainer?
+        if let modelContainer {
+            sharedContainer = modelContainer
+        } else if configurationStore == nil || remoteConfigurationStore == nil {
+            do {
+                sharedContainer = try SourceConfigurationPersistence.makePersistentContainer()
+            } catch {
+                fatalError("无法创建来源配置容器：\(error.localizedDescription)")
+            }
+        } else {
+            sharedContainer = nil
+        }
+
+        let store: LocalSourceConfigurationStore
+        if let configurationStore {
+            store = configurationStore
+        } else if let sharedContainer {
+            store = LocalSourceConfigurationStore(modelContainer: sharedContainer)
+        } else {
+            fatalError("本地来源配置缺少持久化容器")
+        }
+
+        let remoteStore: RemoteSourceConfigurationStore
+        if let remoteConfigurationStore {
+            remoteStore = remoteConfigurationStore
+        } else if let sharedContainer {
+            remoteStore = RemoteSourceConfigurationStore(modelContainer: sharedContainer)
+        } else {
+            fatalError("远端来源配置缺少持久化容器")
+        }
         let resolvedCredentialStore = credentialStore ?? RemoteCredentialStore()
         self.configurationStore = store
         self.remoteConfigurationStore = remoteStore

@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SwiftData
 
 /// 持久化的远端来源描述只包含可公开配置和不含秘密的凭证引用。
 /// 用户名、密码等实际凭证由 `RemoteCredentialStore` 单独写入 Keychain。
@@ -96,9 +97,9 @@ enum RemoteSourceConfigurationError: LocalizedError, Hashable, Sendable {
     }
 }
 
-/// D-032 全量 SwiftData 迁移前的窄描述存储。
+/// SwiftData 中保存的窄描述存储。
 /// 这里故意只写 source descriptor 和 credential reference，不写 URL 中的秘密、
-/// Authorization、Cookie 或密码；迁移到 SwiftData 时保持同一 Codable 语义。
+/// Authorization、Cookie 或密码；旧 UserDefaults payload 只用于一次性迁移。
 @MainActor
 final class RemoteSourceConfigurationStore {
     private struct Payload: Codable {
@@ -109,32 +110,54 @@ final class RemoteSourceConfigurationStore {
     private static let currentVersion = 1
     private static let storageKey = "remoteSourceConfigurations.v1"
 
-    private let defaults: UserDefaults
+    private let modelContainer: ModelContainer
+    private let modelContext: ModelContext
+    private let migrationDefaults: UserDefaults
     private(set) var configurations: [RemoteSourceConfiguration] = []
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    init(modelContainer: ModelContainer, defaults: UserDefaults = .standard) {
+        self.modelContainer = modelContainer
+        self.modelContext = ModelContext(modelContainer)
+        self.migrationDefaults = defaults
+    }
+
+    /// 兼容测试/预览注入：使用独立内存容器，UserDefaults 只作为一次性旧数据迁移源。
+    convenience init(defaults: UserDefaults = .standard) {
+        self.init(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer(),
+            defaults: defaults
+        )
     }
 
     @discardableResult
     func load() throws -> [RemoteSourceConfiguration] {
-        guard let data = defaults.data(forKey: Self.storageKey) else {
-            configurations = []
-            return []
-        }
-
-        let payload: Payload
+        let records: [RemoteSourceConfigurationRecord]
         do {
-            payload = try JSONDecoder().decode(Payload.self, from: data)
+            records = try modelContext.fetch(FetchDescriptor<RemoteSourceConfigurationRecord>())
         } catch {
             throw RemoteSourceConfigurationError.invalidStoredData
         }
-        guard payload.version == Self.currentVersion else {
+
+        if records.isEmpty, let data = migrationDefaults.data(forKey: Self.storageKey) {
+            let payload = try decodeLegacyPayload(data)
+            try validate(payload.configurations)
+            try persistRecords(payload.configurations)
+            migrationDefaults.removeObject(forKey: Self.storageKey)
+            configurations = payload.configurations
+            return configurations
+        }
+
+        do {
+            let loaded = try records.map(configuration(from:))
+            try validate(loaded)
+            configurations = loaded
+            migrationDefaults.removeObject(forKey: Self.storageKey)
+            return loaded
+        } catch let error as RemoteSourceConfigurationError {
+            throw error
+        } catch {
             throw RemoteSourceConfigurationError.invalidStoredData
         }
-        try validate(payload.configurations)
-        configurations = payload.configurations
-        return configurations
     }
 
     func configuration(for sourceID: UUID) -> RemoteSourceConfiguration? {
@@ -201,9 +224,57 @@ final class RemoteSourceConfigurationStore {
 
     private func persist(_ configurations: [RemoteSourceConfiguration]) throws {
         do {
-            let payload = Payload(version: Self.currentVersion, configurations: configurations)
-            defaults.set(try JSONEncoder().encode(payload), forKey: Self.storageKey)
+            try persistRecords(configurations)
         } catch {
+            throw RemoteSourceConfigurationError.invalidStoredData
+        }
+    }
+
+    private func decodeLegacyPayload(_ data: Data) throws -> Payload {
+        do {
+            let payload = try JSONDecoder().decode(Payload.self, from: data)
+            guard payload.version == Self.currentVersion else {
+                throw RemoteSourceConfigurationError.invalidStoredData
+            }
+            return payload
+        } catch {
+            throw RemoteSourceConfigurationError.invalidStoredData
+        }
+    }
+
+    private func configuration(from record: RemoteSourceConfigurationRecord) throws -> RemoteSourceConfiguration {
+        guard let kind = ResourceSource.SourceKind(rawValue: record.kindRawValue),
+              kind == .webdav || kind == .alist,
+              let endpoint = URL(string: record.endpoint) else {
+            throw RemoteSourceConfigurationError.invalidStoredData
+        }
+        return RemoteSourceConfiguration(
+            id: record.id,
+            displayName: record.displayName,
+            endpoint: endpoint,
+            kind: kind,
+            credentialReference: record.credentialReference
+        )
+    }
+
+    private func persistRecords(_ configurations: [RemoteSourceConfiguration]) throws {
+        do {
+            let existing = try modelContext.fetch(FetchDescriptor<RemoteSourceConfigurationRecord>())
+            existing.forEach(modelContext.delete)
+            for configuration in configurations {
+                modelContext.insert(
+                    RemoteSourceConfigurationRecord(
+                        id: configuration.id,
+                        displayName: configuration.displayName,
+                        endpoint: configuration.endpoint,
+                        kindRawValue: configuration.kind.rawValue,
+                        credentialReference: configuration.credentialReference
+                    )
+                )
+            }
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
             throw RemoteSourceConfigurationError.invalidStoredData
         }
     }

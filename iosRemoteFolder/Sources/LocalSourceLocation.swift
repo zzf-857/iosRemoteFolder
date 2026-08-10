@@ -57,6 +57,9 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
         self.bookmarkData = bookmarkData
     }
 
+    /// 只返回 security-scoped bookmark bytes，供来源配置持久化使用；不返回解析后的 URL。
+    var bookmarkDataForPersistence: Data { bookmarkData }
+
     private enum CodingKeys: String, CodingKey {
         case bookmarkData
     }

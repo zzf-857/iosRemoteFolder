@@ -1,10 +1,10 @@
 import Foundation
+import SwiftData
 
 /// 只包含本地来源的稳定身份、展示信息和 security-scoped bookmark。
 ///
 /// `ResourceSource` 是运行时投影，不参与持久化；配置中没有绝对 URL、路径、
-/// URLSession、请求头或任何凭证。D-032 会把该临时 UserDefaults 后端迁移到
-/// SwiftData，但不会改变这个窄配置模型。
+/// URLSession、请求头或任何凭证。SwiftData 只保存该窄配置模型的非敏感字段。
 struct LocalSourceConfiguration: Identifiable, Hashable, Sendable, Codable {
     let id: UUID
     var displayName: String
@@ -62,7 +62,7 @@ enum LocalSourceConfigurationError: LocalizedError, Hashable, Sendable {
     }
 }
 
-/// D-032 前的窄配置后端。所有读写都发生在 MainActor，避免把 UserDefaults
+/// 来源配置的 SwiftData 后端。所有读写都发生在 MainActor，避免把 ModelContext
 /// 或其可变状态泄漏到 adapter、registry 或异步文件访问边界。
 @MainActor
 final class LocalSourceConfigurationStore {
@@ -74,34 +74,58 @@ final class LocalSourceConfigurationStore {
     private static let currentVersion = 1
     private static let storageKey = "localSourceConfigurations.v1"
 
-    private let defaults: UserDefaults
+    private let modelContainer: ModelContainer
+    private let modelContext: ModelContext
+    private let migrationDefaults: UserDefaults
     private(set) var configurations: [LocalSourceConfiguration]
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    init(modelContainer: ModelContainer, defaults: UserDefaults = .standard) {
+        self.modelContainer = modelContainer
+        self.modelContext = ModelContext(modelContainer)
+        self.migrationDefaults = defaults
         self.configurations = []
     }
 
-    /// 从 UserDefaults 恢复配置；空值表示首次启动。
+    /// 兼容测试/预览注入：使用独立内存容器，UserDefaults 只作为一次性旧数据迁移源。
+    convenience init(defaults: UserDefaults = .standard) {
+        self.init(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer(),
+            defaults: defaults
+        )
+    }
+
+    /// 优先从 SwiftData 恢复；只有数据库为空且存在旧 payload 时执行一次迁移。
     @discardableResult
     func load() throws -> [LocalSourceConfiguration] {
-        guard let data = defaults.data(forKey: Self.storageKey) else {
-            configurations = []
-            return []
-        }
-
-        let payload: Payload
+        let records: [LocalSourceConfigurationRecord]
         do {
-            payload = try JSONDecoder().decode(Payload.self, from: data)
+            records = try modelContext.fetch(FetchDescriptor<LocalSourceConfigurationRecord>())
         } catch {
             throw LocalSourceConfigurationError.invalidStoredData
         }
-        guard payload.version == Self.currentVersion else {
+
+        if records.isEmpty, let data = migrationDefaults.data(forKey: Self.storageKey) {
+            let payload = try decodeLegacyPayload(data)
+            try validate(payload.configurations)
+            try persistRecords(payload.configurations)
+            migrationDefaults.removeObject(forKey: Self.storageKey)
+            configurations = payload.configurations
+            return configurations
+        }
+
+        do {
+            let loaded = try records.map(configuration(from:))
+            try validate(loaded)
+            configurations = loaded
+            // A record already exists, so a leftover legacy key must not become a
+            // second source of truth after a later restart.
+            migrationDefaults.removeObject(forKey: Self.storageKey)
+            return loaded
+        } catch let error as LocalSourceConfigurationError {
+            throw error
+        } catch {
             throw LocalSourceConfigurationError.invalidStoredData
         }
-        try validate(payload.configurations)
-        configurations = payload.configurations
-        return configurations
     }
 
     func configuration(for sourceID: UUID) -> LocalSourceConfiguration? {
@@ -195,11 +219,52 @@ final class LocalSourceConfigurationStore {
     }
 
     private func persist(_ configurations: [LocalSourceConfiguration]) throws {
-        let payload = Payload(version: Self.currentVersion, configurations: configurations)
+        try persistRecords(configurations)
+    }
+
+    private func decodeLegacyPayload(_ data: Data) throws -> Payload {
         do {
-            let data = try JSONEncoder().encode(payload)
-            defaults.set(data, forKey: Self.storageKey)
+            let payload = try JSONDecoder().decode(Payload.self, from: data)
+            guard payload.version == Self.currentVersion else {
+                throw LocalSourceConfigurationError.invalidStoredData
+            }
+            return payload
         } catch {
+            throw LocalSourceConfigurationError.invalidStoredData
+        }
+    }
+
+    private func configuration(from record: LocalSourceConfigurationRecord) throws -> LocalSourceConfiguration {
+        do {
+            let location = try LocalSourceLocation(bookmarkData: record.bookmarkData)
+            return LocalSourceConfiguration(
+                id: record.id,
+                displayName: record.displayName,
+                endpointDescription: record.endpointDescription,
+                location: location
+            )
+        } catch {
+            throw LocalSourceConfigurationError.invalidStoredData
+        }
+    }
+
+    private func persistRecords(_ configurations: [LocalSourceConfiguration]) throws {
+        do {
+            let existing = try modelContext.fetch(FetchDescriptor<LocalSourceConfigurationRecord>())
+            existing.forEach(modelContext.delete)
+            for configuration in configurations {
+                modelContext.insert(
+                    LocalSourceConfigurationRecord(
+                        id: configuration.id,
+                        displayName: configuration.displayName,
+                        endpointDescription: configuration.endpointDescription,
+                        bookmarkData: configuration.location.bookmarkDataForPersistence
+                    )
+                )
+            }
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
             throw LocalSourceConfigurationError.invalidStoredData
         }
     }

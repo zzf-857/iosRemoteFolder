@@ -32,12 +32,12 @@
 
 当前阶段：
 
-- D-030B Files 来源配置生命周期已实现，主程构建/测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-033A/D-033B/D-033C 已完成 WebDAV/Alist `/dav/` 的 adapter、来源添加、descriptor/Keychain 恢复、目录浏览、内容读取和重定向安全接线，真实 WebDAV/NAS/Alist 服务互操作、DNS rebinding 和 SwiftData 全量迁移仍待专项验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复，D-044 已接通 revision-aware 内容缓存，D-045 已接通缓存内容离线查看。
+- D-030B Files 来源配置生命周期已实现，主程构建/测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-032 非敏感来源配置已迁入共享 SwiftData 容器，旧 UserDefaults 仅保留一次性迁移路径，真实迁移 fixture 与重启恢复仍待专项复核；D-033A/D-033B/D-033C 已完成 WebDAV/Alist `/dav/` 的 adapter、来源添加、descriptor/Keychain 恢复、目录浏览、内容读取和重定向安全接线，真实 WebDAV/NAS/Alist 服务互操作和 DNS rebinding 仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复，D-044 已接通 revision-aware 内容缓存，D-045 已接通缓存内容离线查看。
 
 尚未完成：
 
 - SMB/SFTP 等其他真实协议 adapter；WebDAV/Alist 的具体服务端互操作专项验证仍待完成
-- SwiftData 非敏感来源配置全量迁移、真实 WebDAV/NAS/Alist 互操作、跨 origin/DNS rebinding 重定向防护、其他真实协议 adapter 和其余格式的生产级内容解码
+- SwiftData 非敏感来源配置迁移已实现，仍需真实迁移 fixture 与重启恢复专项复核；真实 WebDAV/NAS/Alist 互操作、跨 origin/DNS rebinding 重定向专项证据、其他真实协议 adapter 和其余格式的生产级内容解码
 - 后台下载、缓存淘汰和完整离线下载；D-045 只覆盖已经缓存内容的离线打开
 - 真实远端视频流式/长视频策略、后台音频/Now Playing/队列、文档搜索/批注和 Files Provider 离线语义
 
