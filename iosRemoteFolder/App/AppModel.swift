@@ -31,6 +31,7 @@ final class AppModel {
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
     @ObservationIgnored private let recentResourceStore: RecentResourceStore
     @ObservationIgnored private let resourceProgressStore: ResourceProgressStore
+    @ObservationIgnored private let resourceReadingStore: ResourceReadingStore
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
     @ObservationIgnored private var sourceMutationTask: Task<Void, Never>?
@@ -93,6 +94,9 @@ final class AppModel {
         let progressStore = ResourceProgressStore()
         progressStore.retain(sourceIDs: Set(allSources.map(\.id)))
         self.resourceProgressStore = progressStore
+        let readingStore = ResourceReadingStore()
+        readingStore.retain(sourceIDs: Set(allSources.map(\.id)))
+        self.resourceReadingStore = readingStore
         self.registry = registry
         self.sourcesStore = SourcesStore(registry: registry)
         self.resourceAccessService = ResourceAccessService(registry: registry)
@@ -160,6 +164,25 @@ final class AppModel {
 
     func clearResumePosition(for resource: ResourceItem) {
         resourceProgressStore.remove(for: resource)
+    }
+
+    func readingPosition(
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResourceReadingPosition? {
+        resourceReadingStore.position(for: resource, metadata: metadata)
+    }
+
+    func recordReadingPosition(
+        _ position: ResourceReadingPosition,
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) {
+        resourceReadingStore.record(position, for: resource, metadata: metadata)
+    }
+
+    func clearReadingPosition(for resource: ResourceItem) {
+        resourceReadingStore.remove(for: resource)
     }
 
     func resetFilters() {
@@ -298,6 +321,7 @@ final class AppModel {
         recentResourceStore.retain(sourceIDs: Set(snapshots.map(\.id)))
         recentResources = recentResourceStore.items
         resourceProgressStore.retain(sourceIDs: Set(snapshots.map(\.id)))
+        resourceReadingStore.retain(sourceIDs: Set(snapshots.map(\.id)))
     }
 
     private func reportSourceError(_ error: any Error) {
@@ -733,6 +757,235 @@ final class ResourceProgressStore {
 
     private static func isSupportedMedia(_ resource: ResourceItem) -> Bool {
         resource.kind == .audio || resource.kind == .video
+    }
+
+    private static func hasCanonicalIdentity(_ resource: ResourceItem) -> Bool {
+        guard let path = ResourcePath(rawValue: resource.path) else { return false }
+        return path.normalized == resource.path
+            && resource.id.logicalPath == resource.path
+    }
+}
+
+/// Temporary revision-aware document reading position storage.
+///
+/// This store deliberately uses a separate key from media progress so the two
+/// position domains cannot be decoded as one another during future migrations.
+@MainActor
+final class ResourceReadingStore {
+    private static let currentVersion = 1
+    private static let storageKey = "resourceReading.v1"
+    private static let maximumItemCount = 20
+
+    private struct Payload: Codable {
+        let version: Int
+        let items: [StoredItem]
+    }
+
+    private struct StoredItem: Codable {
+        let identityKey: String
+        let revisionKind: String
+        let revisionValue: String?
+        let revisionDate: Date?
+        let revisionByteSize: Int64?
+        let positionKind: String
+        let pageIndex: Int?
+        let fraction: Double?
+        let updatedAt: Date
+
+        init(
+            position: ResourceReadingPosition,
+            resource: ResourceItem,
+            metadata: ResourceMetadata
+        ) {
+            identityKey = resource.id.identityKey
+            updatedAt = Date()
+            switch metadata.revision {
+            case .etag(let value):
+                revisionKind = "etag"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .serverVersion(let value):
+                revisionKind = "serverVersion"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .modifiedAndSize(let modifiedAt, let byteSize):
+                revisionKind = "modifiedAndSize"
+                revisionValue = nil
+                revisionDate = modifiedAt
+                revisionByteSize = byteSize
+            case .unknown:
+                revisionKind = "unknown"
+                revisionValue = nil
+                revisionDate = nil
+                revisionByteSize = nil
+            }
+
+            switch position {
+            case .pdf(let pageIndex):
+                positionKind = "pdf"
+                self.pageIndex = pageIndex
+                fraction = nil
+            case .text(let value):
+                positionKind = "text"
+                pageIndex = nil
+                fraction = value
+            }
+        }
+
+        var identity: ResourceIdentity? {
+            ResourceIdentity(identityKey: identityKey)
+        }
+
+        var revision: ResourceRevision? {
+            switch revisionKind {
+            case "etag":
+                guard let revisionValue,
+                      !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return .etag(revisionValue)
+            case "serverVersion":
+                guard let revisionValue,
+                      !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return .serverVersion(revisionValue)
+            case "modifiedAndSize":
+                guard let revisionDate, let revisionByteSize, revisionByteSize >= 0 else {
+                    return nil
+                }
+                return .modifiedAndSize(modifiedAt: revisionDate, byteSize: revisionByteSize)
+            default:
+                return nil
+            }
+        }
+
+        var position: ResourceReadingPosition? {
+            switch positionKind {
+            case "pdf":
+                guard let pageIndex, pageIndex >= 0 else { return nil }
+                return .pdf(pageIndex: pageIndex)
+            case "text":
+                guard let fraction,
+                      fraction.isFinite,
+                      (0...1).contains(fraction) else { return nil }
+                return .text(fraction: fraction)
+            default:
+                return nil
+            }
+        }
+    }
+
+    private let defaults: UserDefaults
+    private var items: [StoredItem]
+
+    var count: Int { items.count }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        guard let data = defaults.data(forKey: Self.storageKey),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.version == Self.currentVersion else {
+            self.items = []
+            return
+        }
+        self.items = payload.items.filter { item in
+            item.identity != nil
+                && item.revision?.isKnown == true
+                && item.position != nil
+        }
+    }
+
+    func position(
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResourceReadingPosition? {
+        guard Self.supportsReading(resource), Self.hasCanonicalIdentity(resource) else {
+            return nil
+        }
+        guard let index = items.firstIndex(where: { $0.identityKey == resource.id.identityKey }) else {
+            return nil
+        }
+        guard metadata.revision.isKnown else {
+            remove(at: index)
+            return nil
+        }
+        let item = items[index]
+        guard item.revision == metadata.revision,
+              let position = item.position,
+              Self.isCompatible(position, with: resource.kind) else {
+            remove(at: index)
+            return nil
+        }
+        return position
+    }
+
+    func record(
+        _ position: ResourceReadingPosition,
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) {
+        guard Self.supportsReading(resource),
+              Self.hasCanonicalIdentity(resource),
+              metadata.revision.isKnown,
+              Self.isCompatible(position, with: resource.kind) else {
+            return
+        }
+        let stored = StoredItem(position: position, resource: resource, metadata: metadata)
+        items.removeAll { $0.identityKey == resource.id.identityKey }
+        items.insert(stored, at: 0)
+        if items.count > Self.maximumItemCount {
+            items.removeLast(items.count - Self.maximumItemCount)
+        }
+        persist()
+    }
+
+    func remove(for resource: ResourceItem) {
+        let originalCount = items.count
+        items.removeAll { $0.identityKey == resource.id.identityKey }
+        guard items.count != originalCount else { return }
+        persist()
+    }
+
+    func retain(sourceIDs: Set<UUID>) {
+        let retained = items.filter { item in
+            guard let identity = item.identity else { return false }
+            return sourceIDs.contains(identity.sourceID)
+        }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    private func remove(at index: Int) {
+        items.remove(at: index)
+        persist()
+    }
+
+    private func persist() {
+        let payload = Payload(version: Self.currentVersion, items: items)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        defaults.set(data, forKey: Self.storageKey)
+    }
+
+    private static func supportsReading(_ resource: ResourceItem) -> Bool {
+        resource.kind == .pdf || resource.kind == .text || resource.kind == .markdown
+    }
+
+    private static func isCompatible(
+        _ position: ResourceReadingPosition,
+        with kind: ResourceKind
+    ) -> Bool {
+        switch (position, kind) {
+        case (.pdf(let pageIndex), .pdf):
+            return pageIndex >= 0
+        case (.text(let fraction), .text), (.text(let fraction), .markdown):
+            return fraction.isFinite && (0...1).contains(fraction)
+        default:
+            return false
+        }
     }
 
     private static func hasCanonicalIdentity(_ resource: ResourceItem) -> Bool {

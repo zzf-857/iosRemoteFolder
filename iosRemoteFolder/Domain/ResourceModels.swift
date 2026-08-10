@@ -69,6 +69,27 @@ enum ResourceResumePosition: Hashable, Sendable {
     }
 }
 
+/// A bounded document reading position. PDF uses a zero-based page index;
+/// text-like readers use a normalized vertical scroll fraction.
+enum ResourceReadingPosition: Hashable, Sendable {
+    case pdf(pageIndex: Int)
+    case text(fraction: Double)
+
+    var pdfPageIndex: Int? {
+        guard case .pdf(let pageIndex) = self, pageIndex >= 0 else { return nil }
+        return pageIndex
+    }
+
+    var textFraction: Double? {
+        guard case .text(let fraction) = self,
+              fraction.isFinite,
+              (0...1).contains(fraction) else {
+            return nil
+        }
+        return fraction
+    }
+}
+
 /// 资源的稳定位置身份：由来源 ID 与规范化逻辑路径确定性派生。
 ///
 /// `logicalPath` 保留为规范化字符串以兼容现有领域调用点，但显式构造器只

@@ -890,6 +890,110 @@ struct ResourceProgressStoreTests {
     }
 }
 
+@Suite("文档阅读位置")
+@MainActor
+struct ResourceReadingStoreTests {
+    @Test("PDF 页码与文本比例按身份和 revision 持久化恢复")
+    func persistsAndRestoresDocumentPositions() {
+        let suiteName = "iosRemoteFolder.resource-reading-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let sourceID = UUID()
+        let revision = ResourceRevision.modifiedAndSize(
+            modifiedAt: Date(timeIntervalSince1970: 1_786_003_200),
+            byteSize: 4096
+        )
+        let metadata = ResourceMetadata(byteSize: 4096, revision: revision)
+        let pdf = makeResource(sourceID: sourceID, path: "/docs/guide.pdf", kind: .pdf)
+        let text = makeResource(sourceID: sourceID, path: "/docs/notes.txt", kind: .text)
+        let store = ResourceReadingStore(defaults: defaults)
+
+        store.record(.pdf(pageIndex: 3), for: pdf, metadata: metadata)
+        store.record(.text(fraction: 0.65), for: text, metadata: metadata)
+
+        #expect(store.position(for: pdf, metadata: metadata) == .pdf(pageIndex: 3))
+        #expect(store.position(for: text, metadata: metadata) == .text(fraction: 0.65))
+
+        let restored = ResourceReadingStore(defaults: defaults)
+        #expect(restored.position(for: pdf, metadata: metadata) == .pdf(pageIndex: 3))
+        #expect(restored.position(for: text, metadata: metadata) == .text(fraction: 0.65))
+
+        let payloadText = String(
+            data: defaults.data(forKey: "resourceReading.v1")!,
+            encoding: .utf8
+        )!
+        #expect(!payloadText.contains("http://"))
+        #expect(!payloadText.contains("headers"))
+        #expect(!payloadText.contains("Cookie"))
+    }
+
+    @Test("unknown 或变化的 revision 清理旧文档位置")
+    func rejectsUnknownAndChangedRevision() {
+        let suiteName = "iosRemoteFolder.resource-reading-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let resource = makeResource(sourceID: UUID(), path: "/docs/notes.md", kind: .markdown)
+        let first = ResourceMetadata(revision: .etag("\"first\""))
+        let changed = ResourceMetadata(revision: .etag("\"changed\""))
+        let unknown = ResourceMetadata(revision: .unknown)
+        let store = ResourceReadingStore(defaults: defaults)
+
+        store.record(.text(fraction: 0.4), for: resource, metadata: first)
+        #expect(store.position(for: resource, metadata: changed) == nil)
+        #expect(store.count == 0)
+
+        store.record(.text(fraction: 0.4), for: resource, metadata: first)
+        #expect(store.position(for: resource, metadata: unknown) == nil)
+        #expect(store.count == 0)
+    }
+
+    @Test("非法位置、类型冲突和移除来源不会留下记录")
+    func validatesPositionsAndPrunesSources() {
+        let suiteName = "iosRemoteFolder.resource-reading-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let retainedSource = UUID()
+        let removedSource = UUID()
+        let metadata = ResourceMetadata(revision: .serverVersion("v1"))
+        let pdf = makeResource(sourceID: retainedSource, path: "/docs/guide.pdf", kind: .pdf)
+        let text = makeResource(sourceID: removedSource, path: "/docs/notes.txt", kind: .text)
+        let store = ResourceReadingStore(defaults: defaults)
+
+        store.record(.pdf(pageIndex: -1), for: pdf, metadata: metadata)
+        store.record(.text(fraction: .nan), for: text, metadata: metadata)
+        store.record(.pdf(pageIndex: 2), for: text, metadata: metadata)
+        #expect(store.count == 0)
+
+        store.record(.pdf(pageIndex: 2), for: pdf, metadata: metadata)
+        store.record(.text(fraction: 0.2), for: text, metadata: metadata)
+        #expect(store.count == 2)
+
+        store.retain(sourceIDs: [retainedSource])
+        #expect(store.count == 1)
+        #expect(store.position(for: pdf, metadata: metadata) == .pdf(pageIndex: 2))
+        #expect(store.position(for: text, metadata: metadata) == nil)
+    }
+
+    private func makeResource(
+        sourceID: UUID,
+        path: String,
+        kind: ResourceKind
+    ) -> ResourceItem {
+        ResourceItem(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: path)!,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: kind,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
+            accent: .blue
+        )
+    }
+}
+
 @Suite("演示来源文档内容")
 struct SampleSourceContentTests {
     @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")

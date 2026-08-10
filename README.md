@@ -13,7 +13,7 @@
 - 本地文件与 HTTP/HTTPS 读取基础，包含 Range/重定向/请求头边界和连接状态仓库
 - HTTP 206 响应契约、Range 探测证据、能力缓存和 200 回退预算边界已收敛
 - Sources 页面连接中、失败、重试状态
-- 91 个 Swift Testing fixture 测试和托管测试 target
+- 94 个 Swift Testing fixture 测试和托管测试 target
 - PDF、Markdown、TXT、图片、视频、音乐六类独立查看器入口；演示来源的 PDF/Markdown/TXT/图片/音乐/视频均已接入受预算真实内容读取
 - D-035 自适应与无障碍壳已通过主程验收：辅助字号布局、VoiceOver 语义、Reduce Motion、方向声明和 disclosure 所有权均已收口
 - D-028A 已通过主程验收：唯一 `SourceRegistry`、注入式 `SourcesStore`、`ResourceAccessService` 和受预算/可取消的 `ResourceContentSession` 已建立
@@ -22,18 +22,19 @@
 - D-030B 已实现，主程构建/测试基线复核通过，真实 Files Provider 生命周期待验证：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
 - D-036/D-037/D-038/D-039/D-040 功能闭环切片已实现：`ViewerRegistry` 按 typed metadata/UTType/MIME/扩展名解析，TXT 使用显式 10 MiB 预算和编码探测，PDF/图片/视频使用显式 50 MiB 预算，演示图片通过原生缩放/平移查看器呈现，演示音频通过 `AVAudioPlayer` 播放，演示视频通过内存资源加载器交给 `AVPlayer` 播放；D-030B 外部 Provider 证据、SwiftData/Keychain 和其他协议仍未提前视为完成
 - D-041 已实现：成功打开的资源按 `ResourceIdentity` 去重并恢复到 Home 的“继续/最近打开”，最多保留 20 条；临时存储不含 URL、请求头、Token、Cookie 或绝对路径，后续迁移到 SwiftData 不改变身份键语义
-- D-042 已实现：音频/视频查看器按 `ResourceIdentity + ResourceRevision` 保存和恢复播放时间点；unknown 或变化的 revision 不恢复，视频异步时长解析后再恢复；文本/PDF 阅读位置和后台媒体能力继续后置
+- D-042 已实现：音频/视频查看器按 `ResourceIdentity + ResourceRevision` 保存和恢复播放时间点；unknown 或变化的 revision 不恢复，视频异步时长解析后再恢复
+- D-043 已实现：PDF 保存当前页，TXT/Markdown 保存规范化纵向阅读比例；仅在 identity 与已知 revision 同时匹配时恢复，未知或变化 revision 自动清理，持久记录不含 URL、凭证或正文
 
 当前阶段：
 
-- D-030B Files 来源配置生命周期已实现，主程构建/91 项测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042 已接通音频/视频播放位置恢复。本轮不进入 D-032 的 SwiftData/Keychain 迁移。
+- D-030B Files 来源配置生命周期已实现，主程构建/94 项测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影，D-042/D-043 已接通媒体与文档阅读位置恢复。本轮不进入 D-032 的 SwiftData/Keychain 迁移。
 
 尚未完成：
 
 - Alist、WebDAV、SMB/SFTP 等真实协议 adapter
 - SwiftData/Keychain 配置迁移、真实协议 adapter 和其余格式的生产级内容解码
 - 用户可配置来源、Keychain 凭证存储、SwiftData 索引和完整离线下载
-- 真实远端视频流式/长视频策略、后台音频/Now Playing/队列、文本/PDF 阅读位置与生产级缓存
+- 真实远端视频流式/长视频策略、后台音频/Now Playing/队列、文档搜索/批注和生产级缓存
 
 ## 打开工程
 
