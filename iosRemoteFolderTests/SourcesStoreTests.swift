@@ -776,6 +776,120 @@ struct RecentResourceStoreTests {
     }
 }
 
+@Suite("媒体播放位置")
+@MainActor
+struct ResourceProgressStoreTests {
+    @Test("已知 revision 的位置可持久化并恢复")
+    func persistsAndRestoresKnownRevision() {
+        let suiteName = "iosRemoteFolder.resource-progress-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let sourceID = UUID()
+        let resource = makeResource(sourceID: sourceID, path: "/media/demo.mp3")
+        let revision = ResourceRevision.modifiedAndSize(
+            modifiedAt: Date(timeIntervalSince1970: 1_786_003_200),
+            byteSize: 4096
+        )
+        let metadata = ResourceMetadata(
+            byteSize: 4096,
+            mimeType: "audio/mpeg",
+            revision: revision
+        )
+
+        let store = ResourceProgressStore(defaults: defaults)
+        store.record(.seconds(12.5), for: resource, metadata: metadata)
+
+        #expect(store.count == 1)
+        #expect(store.position(for: resource, metadata: metadata) == .seconds(12.5))
+        #expect(ResourceProgressStore(defaults: defaults).position(for: resource, metadata: metadata) == .seconds(12.5))
+
+        let payloadText = String(
+            data: defaults.data(forKey: "resourceResume.v1")!,
+            encoding: .utf8
+        )!
+        #expect(!payloadText.contains("http://"))
+        #expect(!payloadText.contains("headers"))
+        #expect(!payloadText.contains("Cookie"))
+    }
+
+    @Test("unknown 或变化的 revision 不恢复旧位置")
+    func rejectsUnknownAndChangedRevision() {
+        let suiteName = "iosRemoteFolder.resource-progress-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let resource = makeResource(sourceID: UUID(), path: "/media/demo.mp4", kind: .video)
+        let firstMetadata = ResourceMetadata(
+            byteSize: 2048,
+            revision: .etag("\"first\"")
+        )
+        let changedMetadata = ResourceMetadata(
+            byteSize: 2048,
+            revision: .etag("\"changed\"")
+        )
+        let unknownMetadata = ResourceMetadata(byteSize: 2048, revision: .unknown)
+        let store = ResourceProgressStore(defaults: defaults)
+
+        store.record(.seconds(4), for: resource, metadata: firstMetadata)
+        #expect(store.position(for: resource, metadata: changedMetadata) == nil)
+        #expect(store.count == 0)
+
+        store.record(.seconds(4), for: resource, metadata: firstMetadata)
+        #expect(store.position(for: resource, metadata: unknownMetadata) == nil)
+        #expect(store.count == 0)
+
+        store.record(.seconds(-1), for: resource, metadata: firstMetadata)
+        store.record(.seconds(.nan), for: resource, metadata: firstMetadata)
+        store.record(.seconds(.infinity), for: resource, metadata: firstMetadata)
+        #expect(store.count == 0)
+    }
+
+    @Test("来源移除后清理位置")
+    func prunesRemovedSources() {
+        let suiteName = "iosRemoteFolder.resource-progress-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let retainedSource = UUID()
+        let removedSource = UUID()
+        let metadata = ResourceMetadata(
+            byteSize: 1024,
+            revision: .serverVersion("v1")
+        )
+        let store = ResourceProgressStore(defaults: defaults)
+        store.record(
+            .seconds(1),
+            for: makeResource(sourceID: retainedSource, path: "/keep.mp3"),
+            metadata: metadata
+        )
+        store.record(
+            .seconds(2),
+            for: makeResource(sourceID: removedSource, path: "/remove.mp4", kind: .video),
+            metadata: metadata
+        )
+
+        store.retain(sourceIDs: [retainedSource])
+        #expect(store.count == 1)
+    }
+
+    private func makeResource(
+        sourceID: UUID,
+        path: String,
+        kind: ResourceKind = .audio
+    ) -> ResourceItem {
+        ResourceItem(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: path)!,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: kind,
+            metadata: ResourceMetadata(byteSize: 1),
+            capabilities: [.read],
+            accent: .blue
+        )
+    }
+}
+
 @Suite("演示来源文档内容")
 struct SampleSourceContentTests {
     @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")

@@ -60,13 +60,14 @@ struct ResourceViewerHost: View {
     ) -> some View {
         VStack(spacing: 0) {
             metadataSummary(metadata)
-            viewerView(resolution: resolution, payload: payload)
+            viewerView(resolution: resolution, metadata: metadata, payload: payload)
         }
     }
 
     @ViewBuilder
     private func viewerView(
         resolution: ViewerResolution,
+        metadata: ResourceMetadata,
         payload: ViewerContentPayload?
     ) -> some View {
         switch resolution.kind {
@@ -96,13 +97,13 @@ struct ResourceViewerHost: View {
             }
         case .videoPlayer:
             if case .video(let data) = payload {
-                VideoPlayerView(resource: resource, data: data)
+                VideoPlayerView(resource: resource, metadata: metadata, data: data)
             } else {
                 UnsupportedViewerView(resource: resource, reason: "视频内容读取无效")
             }
         case .musicPlayer:
             if case .audio(let data) = payload {
-                MusicPlayerView(resource: resource, data: data)
+                MusicPlayerView(resource: resource, metadata: metadata, data: data)
             } else {
                 UnsupportedViewerView(resource: resource, reason: "音乐内容读取无效")
             }
@@ -510,12 +511,16 @@ struct ImageViewerView: View {
 
 @MainActor
 struct VideoPlayerView: View {
+    @Environment(AppModel.self) private var appModel
     let resource: ResourceItem
+    let metadata: ResourceMetadata
     let data: Data
     @State private var engine: AVVideoPlayerEngine?
+    @State private var restoredPosition = false
 
-    init(resource: ResourceItem, data: Data) {
+    init(resource: ResourceItem, metadata: ResourceMetadata, data: Data) {
         self.resource = resource
+        self.metadata = metadata
         self.data = data
         _engine = State(initialValue: AVVideoPlayerEngine(data: data))
     }
@@ -582,7 +587,56 @@ struct VideoPlayerView: View {
                 )
             }
         }
-        .onDisappear { engine?.stop() }
+        .onAppear {
+            if let engine {
+                restorePositionIfNeeded(engine)
+            }
+        }
+        .task {
+            guard let engine else { return }
+            if engine.duration <= 0 {
+                try? await engine.prepare()
+            }
+            guard !Task.isCancelled else { return }
+            restorePositionIfNeeded(engine)
+        }
+        .onDisappear {
+            if let engine {
+                savePosition(engine)
+                engine.stop()
+            }
+        }
+    }
+
+    private func restorePositionIfNeeded(_ engine: AVVideoPlayerEngine) {
+        guard !restoredPosition else { return }
+        guard case .seconds(let seconds) = appModel.resumePosition(
+            for: resource,
+            metadata: metadata
+        ) else {
+            restoredPosition = true
+            return
+        }
+        guard engine.duration > 0 else {
+            return
+        }
+        restoredPosition = true
+        engine.seek(to: seconds)
+    }
+
+    private func savePosition(_ engine: AVVideoPlayerEngine) {
+        let duration = engine.duration
+        let currentTime = engine.currentTime
+        guard duration.isFinite, duration > 0, currentTime.isFinite else { return }
+        if currentTime >= max(duration - 0.5, 0) {
+            appModel.clearResumePosition(for: resource)
+        } else {
+            appModel.recordResumePosition(
+                .seconds(currentTime),
+                for: resource,
+                metadata: metadata
+            )
+        }
     }
 
     private static func timeLabel(_ time: TimeInterval) -> String {
@@ -593,12 +647,16 @@ struct VideoPlayerView: View {
 
 @MainActor
 struct MusicPlayerView: View {
+    @Environment(AppModel.self) private var appModel
     let resource: ResourceItem
+    let metadata: ResourceMetadata
     let data: Data
     @State private var engine: AVAudioPlayerEngine?
+    @State private var restoredPosition = false
 
-    init(resource: ResourceItem, data: Data) {
+    init(resource: ResourceItem, metadata: ResourceMetadata, data: Data) {
         self.resource = resource
+        self.metadata = metadata
         self.data = data
         _engine = State(initialValue: try? AVAudioPlayerEngine(data: data))
     }
@@ -670,7 +728,44 @@ struct MusicPlayerView: View {
                 )
             }
         }
-        .onDisappear { engine?.stop() }
+        .onAppear {
+            if let engine {
+                restorePositionIfNeeded(engine)
+            }
+        }
+        .onDisappear {
+            if let engine {
+                savePosition(engine)
+                engine.stop()
+            }
+        }
+    }
+
+    private func restorePositionIfNeeded(_ engine: AVAudioPlayerEngine) {
+        guard !restoredPosition else { return }
+        restoredPosition = true
+        guard case .seconds(let seconds) = appModel.resumePosition(
+            for: resource,
+            metadata: metadata
+        ) else {
+            return
+        }
+        engine.seek(to: seconds)
+    }
+
+    private func savePosition(_ engine: AVAudioPlayerEngine) {
+        let duration = engine.duration
+        let currentTime = engine.currentTime
+        guard duration.isFinite, duration > 0, currentTime.isFinite else { return }
+        if currentTime >= max(duration - 0.5, 0) {
+            appModel.clearResumePosition(for: resource)
+        } else {
+            appModel.recordResumePosition(
+                .seconds(currentTime),
+                for: resource,
+                metadata: metadata
+            )
+        }
     }
 
     private static func timeLabel(_ time: TimeInterval) -> String {

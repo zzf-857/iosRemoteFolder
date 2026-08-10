@@ -30,6 +30,7 @@ final class AppModel {
     @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
     @ObservationIgnored private let recentResourceStore: RecentResourceStore
+    @ObservationIgnored private let resourceProgressStore: ResourceProgressStore
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
     @ObservationIgnored private var sourceMutationTask: Task<Void, Never>?
@@ -89,6 +90,9 @@ final class AppModel {
         recentStore.retain(sourceIDs: Set(allSources.map(\.id)))
         self.recentResourceStore = recentStore
         self.recentResources = recentStore.items
+        let progressStore = ResourceProgressStore()
+        progressStore.retain(sourceIDs: Set(allSources.map(\.id)))
+        self.resourceProgressStore = progressStore
         self.registry = registry
         self.sourcesStore = SourcesStore(registry: registry)
         self.resourceAccessService = ResourceAccessService(registry: registry)
@@ -133,6 +137,29 @@ final class AppModel {
         )
         recentResourceStore.record(updated)
         recentResources = recentResourceStore.items
+    }
+
+    /// Returns a persisted media position only when the current resource facts
+    /// still match the identity and known revision captured at save time.
+    func resumePosition(
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResourceResumePosition? {
+        resourceProgressStore.position(for: resource, metadata: metadata)
+    }
+
+    /// Saves a media position after the viewer has obtained current metadata.
+    /// Unknown revisions and non-media resources are intentionally ignored.
+    func recordResumePosition(
+        _ position: ResourceResumePosition,
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) {
+        resourceProgressStore.record(position, for: resource, metadata: metadata)
+    }
+
+    func clearResumePosition(for resource: ResourceItem) {
+        resourceProgressStore.remove(for: resource)
     }
 
     func resetFilters() {
@@ -270,6 +297,7 @@ final class AppModel {
         sourcesStore.synchronize(with: snapshots)
         recentResourceStore.retain(sourceIDs: Set(snapshots.map(\.id)))
         recentResources = recentResourceStore.items
+        resourceProgressStore.retain(sourceIDs: Set(snapshots.map(\.id)))
     }
 
     private func reportSourceError(_ error: any Error) {
@@ -517,5 +545,199 @@ final class RecentResourceStore {
         let payload = Payload(version: Self.currentVersion, items: items.map(StoredItem.init(resource:)))
         guard let data = try? JSONEncoder().encode(payload) else { return }
         defaults.set(data, forKey: Self.storageKey)
+    }
+}
+
+/// Temporary revision-aware media resume storage.
+///
+/// D-032 will decide the durable schema. Until then this narrow store keeps
+/// only a canonical identity, known revision evidence, and a bounded time
+/// value. It never receives a URL, adapter, credential, or content payload.
+@MainActor
+final class ResourceProgressStore {
+    private static let currentVersion = 1
+    private static let storageKey = "resourceResume.v1"
+    private static let maximumItemCount = 20
+
+    private struct Payload: Codable {
+        let version: Int
+        let items: [StoredItem]
+    }
+
+    private struct StoredItem: Codable {
+        let identityKey: String
+        let revisionKind: String
+        let revisionValue: String?
+        let revisionDate: Date?
+        let revisionByteSize: Int64?
+        let seconds: Double
+        let updatedAt: Date
+
+        init(
+            position: ResourceResumePosition,
+            resource: ResourceItem,
+            metadata: ResourceMetadata
+        ) {
+            identityKey = resource.id.identityKey
+            seconds = position.secondsValue ?? 0
+            updatedAt = Date()
+            switch metadata.revision {
+            case .etag(let value):
+                revisionKind = "etag"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .serverVersion(let value):
+                revisionKind = "serverVersion"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .modifiedAndSize(let modifiedAt, let byteSize):
+                revisionKind = "modifiedAndSize"
+                revisionValue = nil
+                revisionDate = modifiedAt
+                revisionByteSize = byteSize
+            case .unknown:
+                revisionKind = "unknown"
+                revisionValue = nil
+                revisionDate = nil
+                revisionByteSize = nil
+            }
+        }
+
+        var identity: ResourceIdentity? {
+            ResourceIdentity(identityKey: identityKey)
+        }
+
+        var revision: ResourceRevision? {
+            switch revisionKind {
+            case "etag":
+                guard let revisionValue,
+                      !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return .etag(revisionValue)
+            case "serverVersion":
+                guard let revisionValue,
+                      !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return .serverVersion(revisionValue)
+            case "modifiedAndSize":
+                guard let revisionDate, let revisionByteSize, revisionByteSize >= 0 else {
+                    return nil
+                }
+                return .modifiedAndSize(modifiedAt: revisionDate, byteSize: revisionByteSize)
+            default:
+                return nil
+            }
+        }
+    }
+
+    private let defaults: UserDefaults
+    private var items: [StoredItem]
+
+    var count: Int { items.count }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        guard let data = defaults.data(forKey: Self.storageKey),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.version == Self.currentVersion else {
+            self.items = []
+            return
+        }
+        self.items = payload.items.filter { item in
+            item.identity != nil
+                && item.revision?.isKnown == true
+                && item.seconds.isFinite
+                && item.seconds >= 0
+        }
+    }
+
+    func position(
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResourceResumePosition? {
+        guard Self.isSupportedMedia(resource), Self.hasCanonicalIdentity(resource) else {
+            return nil
+        }
+
+        guard let index = items.firstIndex(where: { $0.identityKey == resource.id.identityKey }) else {
+            return nil
+        }
+
+        guard metadata.revision.isKnown else {
+            remove(at: index)
+            return nil
+        }
+
+        let item = items[index]
+        guard item.revision == metadata.revision,
+              item.seconds.isFinite,
+              item.seconds >= 0 else {
+            remove(at: index)
+            return nil
+        }
+        return .seconds(item.seconds)
+    }
+
+    func record(
+        _ position: ResourceResumePosition,
+        for resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) {
+        guard Self.isSupportedMedia(resource),
+              Self.hasCanonicalIdentity(resource),
+              metadata.revision.isKnown,
+              let seconds = position.secondsValue else {
+            return
+        }
+
+        let stored = StoredItem(position: .seconds(seconds), resource: resource, metadata: metadata)
+        items.removeAll { $0.identityKey == resource.id.identityKey }
+        items.insert(stored, at: 0)
+        if items.count > Self.maximumItemCount {
+            items.removeLast(items.count - Self.maximumItemCount)
+        }
+        persist()
+    }
+
+    func remove(for resource: ResourceItem) {
+        let originalCount = items.count
+        items.removeAll { $0.identityKey == resource.id.identityKey }
+        guard items.count != originalCount else { return }
+        persist()
+    }
+
+    func retain(sourceIDs: Set<UUID>) {
+        let retained = items.filter { item in
+            guard let identity = item.identity else { return false }
+            return sourceIDs.contains(identity.sourceID)
+        }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    private func remove(at index: Int) {
+        items.remove(at: index)
+        persist()
+    }
+
+    private func persist() {
+        let payload = Payload(version: Self.currentVersion, items: items)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        defaults.set(data, forKey: Self.storageKey)
+    }
+
+    private static func isSupportedMedia(_ resource: ResourceItem) -> Bool {
+        resource.kind == .audio || resource.kind == .video
+    }
+
+    private static func hasCanonicalIdentity(_ resource: ResourceItem) -> Bool {
+        guard let path = ResourcePath(rawValue: resource.path) else { return false }
+        return path.normalized == resource.path
+            && resource.id.logicalPath == resource.path
     }
 }

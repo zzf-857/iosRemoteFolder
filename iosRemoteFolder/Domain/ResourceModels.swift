@@ -51,6 +51,24 @@ struct ResourceCapability: OptionSet, Hashable, Sendable {
     static let search = Self(rawValue: 1 << 6)
 }
 
+/// A bounded resume position owned by the viewer layer.
+///
+/// D-042 currently persists only media time. Keeping the position typed avoids
+/// treating an arbitrary floating-point value as a valid playback location and
+/// leaves room for a separately specified page/scroll contract later.
+enum ResourceResumePosition: Hashable, Sendable {
+    case seconds(TimeInterval)
+
+    var secondsValue: TimeInterval? {
+        guard case .seconds(let value) = self,
+              value.isFinite,
+              value >= 0 else {
+            return nil
+        }
+        return value
+    }
+}
+
 /// 资源的稳定位置身份：由来源 ID 与规范化逻辑路径确定性派生。
 ///
 /// `logicalPath` 保留为规范化字符串以兼容现有领域调用点，但显式构造器只
