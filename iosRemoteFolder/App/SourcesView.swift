@@ -1,24 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum RemoteSourceTestingDefaults {
-    #if DEBUG
-    static let endpoint = "http://pan.zengxiansheng.top:5244/dav/"
-    static let name = "我的 Alist"
-    static let username = "test"
-    /// The password is supplied only through the debug launch environment and
-    /// is never persisted as a source descriptor or written into this target.
-    static var password: String {
-        ProcessInfo.processInfo.environment["IOSREMOTE_DEFAULT_ALIST_PASSWORD"] ?? ""
-    }
-    #else
-    static let endpoint = ""
-    static let name = ""
-    static let username = ""
-    static let password = ""
-    #endif
-}
-
 private struct RemoteSourceDraft: Identifiable {
     let id: UUID
     let sourceID: UUID?
@@ -32,11 +14,11 @@ private struct RemoteSourceDraft: Identifiable {
         Self(
             id: UUID(),
             sourceID: nil,
-            name: RemoteSourceTestingDefaults.name,
-            endpoint: RemoteSourceTestingDefaults.endpoint,
-            kind: .alist,
-            username: RemoteSourceTestingDefaults.username,
-            password: RemoteSourceTestingDefaults.password
+            name: "",
+            endpoint: "",
+            kind: .webdav,
+            username: "",
+            password: ""
         )
     }
 
@@ -146,6 +128,7 @@ struct SourcesView: View {
                     Button("发现局域网", systemImage: "dot.radiowaves.left.and.right") {}
                 }
             }
+            .glassNavigationBar()
             .fileImporter(
                 isPresented: $isShowingFolderImporter,
                 allowedContentTypes: [.folder],
