@@ -3,6 +3,7 @@ import SwiftUI
 import PDFKit
 import UIKit
 import AVFoundation
+import AVKit
 
 struct ResourceViewerHost: View {
     @Environment(AppModel.self) private var appModel
@@ -94,7 +95,11 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "图片内容读取无效")
             }
         case .videoPlayer:
-            VideoPlayerView(resource: resource)
+            if case .video(let data) = payload {
+                VideoPlayerView(resource: resource, data: data)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "视频内容读取无效")
+            }
         case .musicPlayer:
             if case .audio(let data) = payload {
                 MusicPlayerView(resource: resource, data: data)
@@ -220,6 +225,13 @@ struct ResourceViewerHost: View {
                     throw ResourceSourceError.invalidResponse
                 }
                 payload = .audio(data)
+            case .video(let maximumBytes):
+                let data = try await createdSession.readData(maximumBytes: maximumBytes)
+                try Task.checkCancellation()
+                guard await ViewerContentDecoder.isValidVideoData(data) else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .video(data)
             }
             try Task.checkCancellation()
             result = .ready(request.identity, metadata, resolution, payload)
@@ -254,6 +266,7 @@ enum ViewerContentPayload: Equatable, Sendable {
     case pdf(Data)
     case image(Data)
     case audio(Data)
+    case video(Data)
 }
 
 enum ViewerContentDecoder {
@@ -263,6 +276,19 @@ enum ViewerContentDecoder {
 
     static func isValidAudioData(_ data: Data) -> Bool {
         (try? AVAudioPlayer(data: data)) != nil
+    }
+
+    @MainActor
+    static func isValidVideoData(_ data: Data) async -> Bool {
+        let engine = AVVideoPlayerEngine(data: data)
+        do {
+            try await engine.prepare()
+            engine.stop()
+            return true
+        } catch {
+            engine.stop()
+            return false
+        }
     }
 
     static func decodeText(_ data: Data) -> String {
@@ -479,45 +505,86 @@ struct ImageViewerView: View {
     }
 }
 
+@MainActor
 struct VideoPlayerView: View {
     let resource: ResourceItem
-    @State private var isPlaying = false
+    let data: Data
+    @State private var engine: AVVideoPlayerEngine?
+
+    init(resource: ResourceItem, data: Data) {
+        self.resource = resource
+        self.data = data
+        _engine = State(initialValue: AVVideoPlayerEngine(data: data))
+    }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 24) {
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(Color(white: 0.12))
-                    .aspectRatio(16 / 9, contentMode: .fit)
-                    .overlay {
-                        Image(systemName: "film.fill")
-                            .font(.system(size: 54))
-                            .foregroundStyle(AppTheme.accent)
-                    }
-                VStack(spacing: 12) {
-                    Slider(value: .constant(0.28))
-                    HStack {
-                        Text("00:42")
-                        Spacer()
-                        Text("24:18")
-                    }
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    HStack(spacing: 26) {
-                        Button("后退", systemImage: "gobackward.10") {}
-                        Button(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.fill" : "play.fill") {
-                            isPlaying.toggle()
+        Group {
+            if let engine {
+                TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+                    ScrollView {
+                        VStack(spacing: 18) {
+                            VideoPlayer(player: engine.player)
+                                .aspectRatio(16 / 9, contentMode: .fit)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                .accessibilityLabel(Text("\(resource.name)，视频播放器"))
+
+                            Slider(
+                                value: Binding(
+                                    get: { engine.currentTime },
+                                    set: { engine.seek(to: $0) }
+                                ),
+                                in: 0...max(engine.duration, 0.001)
+                            )
+                            .accessibilityLabel("播放进度")
+
+                            HStack {
+                                Text(Self.timeLabel(engine.currentTime))
+                                Spacer()
+                                Text(Self.timeLabel(engine.duration))
+                            }
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+
+                            HStack(spacing: 32) {
+                                Button("后退 10 秒", systemImage: "gobackward.10") {
+                                    engine.seek(to: engine.currentTime - 10)
+                                }
+                                Button(
+                                    engine.isPlaying ? "暂停" : "播放",
+                                    systemImage: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill"
+                                ) {
+                                    if engine.isPlaying {
+                                        engine.pause()
+                                    } else {
+                                        _ = engine.play()
+                                    }
+                                }
+                                .font(.largeTitle)
+                                Button("前进 10 秒", systemImage: "goforward.10") {
+                                    engine.seek(to: engine.currentTime + 10)
+                                }
+                            }
+                            .labelStyle(.iconOnly)
+                            .accessibilityElement(children: .contain)
                         }
-                        Button("前进", systemImage: "goforward.10") {}
+                        .frame(maxWidth: 900)
+                        .padding()
                     }
-                    .font(.title2)
                 }
+            } else {
+                ContentUnavailableView(
+                    "无法播放视频",
+                    systemImage: "film",
+                    description: Text("文件内容不是有效的视频。")
+                )
             }
-            .padding()
         }
-        .foregroundStyle(.white)
-        .toolbarBackground(.hidden, for: .navigationBar)
+        .onDisappear { engine?.stop() }
+    }
+
+    private static func timeLabel(_ time: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(time.rounded(.down)))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 }
 

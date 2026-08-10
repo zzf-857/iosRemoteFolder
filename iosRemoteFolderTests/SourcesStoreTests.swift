@@ -634,6 +634,20 @@ struct ViewerResolutionTests {
         #expect(resolution.preparation == .audio(maximumBytes: 50 * 1024 * 1024))
     }
 
+    @Test("视频解析使用显式预算")
+    func resolvesVideoContent() {
+        let item = makeItem(path: "/demo.mp4", kind: .video)
+        let metadata = ResourceMetadata(
+            mimeType: "video/mp4",
+            typeIdentifier: UTType.mpeg4Movie.identifier
+        )
+
+        let resolution = ViewerRegistry.resolve(resource: item, metadata: metadata)
+
+        #expect(resolution.kind == .videoPlayer)
+        #expect(resolution.preparation == .video(maximumBytes: 50 * 1024 * 1024))
+    }
+
     @Test("Markdown 与通用文本证据兼容，但真正冲突降级")
     func resolvesMarkdownAndRejectsConflict() {
         let markdown = makeItem(path: "/notes/readme.md", kind: .unknown)
@@ -731,5 +745,19 @@ struct SampleSourceContentTests {
 
         #expect(ViewerContentDecoder.isValidAudioData(audioData))
         #expect((try? AVAudioPlayer(data: audioData)) != nil)
+    }
+
+    @Test("演示来源经内容会话返回可加载视频字节")
+    func readsDemoVideoThroughSession() async throws {
+        let videoSource = SampleData.sources.first { $0.id == SampleData.workSourceID }!
+        let videoItem = SampleData.resources.first { $0.path == "/产品/路线图演示.mp4" }!
+        let adapter = SampleSourceAdapter(source: videoSource)
+        let registry = try SourceRegistry(sources: [videoSource], adapters: [adapter])
+        let session = try await ResourceAccessService(registry: registry)
+            .makeSession(for: videoItem)
+        let videoData = try await session.readData(maximumBytes: 50 * 1024 * 1024)
+
+        #expect(videoData.count == 2_268)
+        #expect(await ViewerContentDecoder.isValidVideoData(videoData))
     }
 }

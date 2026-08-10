@@ -114,6 +114,20 @@ enum SampleData {
             accent: .pink
         ),
         ResourceItem(
+            sourceID: workSourceID,
+            logicalPath: ResourcePath(rawValue: "/产品/路线图演示.mp4")!,
+            name: "路线图演示.mp4",
+            kind: .video,
+            metadata: metadata(
+                byteSize: 2_268,
+                modifiedAt: Date(timeIntervalSince1970: 1_754_700_000),
+                mimeType: "video/mp4",
+                typeIdentifier: "public.mpeg-4"
+            ),
+            capabilities: [.read, .download],
+            accent: .orange
+        ),
+        ResourceItem(
             sourceID: localSourceID,
             logicalPath: ResourcePath(rawValue: "/照片/旅行/海边-2026-01.jpg")!,
             name: "海边-2026-01.jpg",
