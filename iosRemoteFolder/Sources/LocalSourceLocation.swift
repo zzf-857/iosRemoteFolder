@@ -112,7 +112,11 @@ struct LocalSourceLocation: Hashable, Sendable, Codable {
     private var comparisonURL: URL? {
         do {
             return try withResolvedURL { url in
-                url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+                guard url.startAccessingSecurityScopedResource() else {
+                    return nil
+                }
+                defer { url.stopAccessingSecurityScopedResource() }
+                return url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
             }
         } catch {
             return nil
