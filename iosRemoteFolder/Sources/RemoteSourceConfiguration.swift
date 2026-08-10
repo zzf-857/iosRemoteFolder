@@ -176,6 +176,19 @@ final class RemoteSourceConfigurationStore {
         configurations = next
     }
 
+    /// 使用同一 source ID 原子替换一条远端描述；未知 ID 明确失败，
+    /// 不把编辑误当成新增来源。
+    func replace(_ configuration: RemoteSourceConfiguration) throws {
+        try validate(configuration)
+        guard let index = configurations.firstIndex(where: { $0.id == configuration.id }) else {
+            throw RemoteSourceConfigurationError.sourceNotFound(configuration.id)
+        }
+        var next = configurations
+        next[index] = configuration
+        try persist(next)
+        configurations = next
+    }
+
     @discardableResult
     func remove(sourceID: UUID) throws -> RemoteSourceConfiguration {
         guard let index = configurations.firstIndex(where: { $0.id == sourceID }) else {

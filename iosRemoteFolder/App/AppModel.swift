@@ -368,6 +368,14 @@ final class AppModel {
         }
     }
 
+    /// 修改本地来源展示名称；位置 bookmark 与 source ID 保持不变。
+    func editLocalSource(sourceID: UUID, displayName: String) {
+        scheduleMutation { [weak self] in
+            guard let self else { return }
+            await self.performEditLocalSource(sourceID: sourceID, displayName: displayName)
+        }
+    }
+
     /// 只移除应用配置、registry 与 Store 状态，不调用任何文件删除 API。
     func removeLocalSource(sourceID: UUID) {
         scheduleMutation { [weak self] in
@@ -388,6 +396,29 @@ final class AppModel {
         scheduleMutation { [weak self] in
             guard let self else { return }
             await self.performAddRemoteSource(
+                name: name,
+                endpoint: endpoint,
+                kind: kind,
+                username: username,
+                password: password
+            )
+        }
+    }
+
+    /// 修改远端来源描述。认证字段留空时保留原 Keychain 凭证，填写任一字段
+    /// 则用同一 source ID 的新凭证替换现有凭证。
+    func editRemoteSource(
+        sourceID: UUID,
+        name: String,
+        endpoint: String,
+        kind: ResourceSource.SourceKind,
+        username: String,
+        password: String
+    ) {
+        scheduleMutation { [weak self] in
+            guard let self else { return }
+            await self.performEditRemoteSource(
+                sourceID: sourceID,
                 name: name,
                 endpoint: endpoint,
                 kind: kind,
@@ -550,6 +581,171 @@ final class AppModel {
             sourcesStore.connect(sourceID)
         } catch {
             reportSourceError(error)
+        }
+    }
+
+    private func performEditLocalSource(sourceID: UUID, displayName: String) async {
+        sourceActionError = nil
+        do {
+            try Task.checkCancellation()
+            guard let oldConfiguration = configurationStore.configuration(for: sourceID) else {
+                throw LocalSourceConfigurationError.sourceNotFound(sourceID)
+            }
+            let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedName.isEmpty else {
+                throw LocalSourceConfigurationError.invalidDisplayName
+            }
+
+            let configuration = LocalSourceConfiguration(
+                id: oldConfiguration.id,
+                displayName: trimmedName,
+                endpointDescription: oldConfiguration.endpointDescription,
+                location: oldConfiguration.location
+            )
+            let source = configuration.resourceSource
+            let adapter = try LocalFilesSourceAdapter(
+                source: source,
+                location: configuration.location
+            )
+            try Task.checkCancellation()
+            try configurationStore.replace(configuration)
+            do {
+                try await registry.replace(source: source, adapter: adapter)
+            } catch {
+                _ = try? configurationStore.replace(oldConfiguration)
+                throw error
+            }
+            await synchronizeStore()
+            guard !Task.isCancelled else { return }
+            sourcesStore.connect(sourceID)
+        } catch {
+            reportSourceError(error)
+        }
+    }
+
+    private func performEditRemoteSource(
+        sourceID: UUID,
+        name: String,
+        endpoint: String,
+        kind: ResourceSource.SourceKind,
+        username: String,
+        password: String
+    ) async {
+        sourceActionError = nil
+        do {
+            try Task.checkCancellation()
+            guard let oldConfiguration = remoteConfigurationStore.configuration(for: sourceID) else {
+                throw RemoteSourceConfigurationError.sourceNotFound(sourceID)
+            }
+            let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !displayName.isEmpty else {
+                throw RemoteSourceConfigurationError.invalidDisplayName
+            }
+            guard kind == .webdav || kind == .alist,
+                  let rawEndpoint = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw RemoteSourceConfigurationError.invalidEndpoint
+            }
+            let endpointURL = try WebDAVSourceAdapter.normalizedEndpoint(rawEndpoint)
+            let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasNewCredentials = !trimmedUsername.isEmpty || !password.isEmpty
+
+            var oldCredentials: RemoteCredentials?
+            if let oldReference = oldConfiguration.credentialReference {
+                do {
+                    oldCredentials = try credentialStore.load(reference: oldReference)
+                } catch {
+                    if !hasNewCredentials {
+                        throw RemoteSourceConfigurationError.credentialUnavailable
+                    }
+                }
+                if oldCredentials == nil, !hasNewCredentials {
+                    throw RemoteSourceConfigurationError.credentialUnavailable
+                }
+            }
+
+            let credentialReference: String?
+            let credentials: RemoteCredentials?
+            if hasNewCredentials {
+                credentialReference = oldConfiguration.credentialReference
+                    ?? sourceID.uuidString.lowercased()
+                credentials = RemoteCredentials(
+                    username: trimmedUsername,
+                    password: password
+                )
+            } else {
+                credentialReference = oldConfiguration.credentialReference
+                credentials = oldCredentials
+            }
+
+            let source = ResourceSource(
+                id: sourceID,
+                name: displayName,
+                kind: kind,
+                endpoint: endpointURL.absoluteString,
+                status: .disconnected,
+                itemCountDescription: ""
+            )
+            let configuration = RemoteSourceConfiguration(
+                id: sourceID,
+                displayName: displayName,
+                endpoint: endpointURL,
+                kind: kind,
+                credentialReference: credentialReference
+            )
+            let adapter = try WebDAVSourceAdapter(
+                source: source,
+                endpoint: endpointURL,
+                username: credentials?.username,
+                password: credentials?.password
+            )
+            try Task.checkCancellation()
+
+            var didWriteCredentials = false
+            var didPersistConfiguration = false
+            do {
+                if hasNewCredentials, let credentialReference, let credentials {
+                    try credentialStore.save(credentials, reference: credentialReference)
+                    didWriteCredentials = true
+                }
+                try remoteConfigurationStore.replace(configuration)
+                didPersistConfiguration = true
+                try await registry.replace(source: source, adapter: adapter)
+            } catch {
+                if didPersistConfiguration {
+                    _ = try? remoteConfigurationStore.replace(oldConfiguration)
+                }
+                if didWriteCredentials, let credentialReference = credentialReference {
+                    restoreRemoteCredentials(
+                        reference: credentialReference,
+                        oldReference: oldConfiguration.credentialReference,
+                        oldCredentials: oldCredentials
+                    )
+                }
+                throw error
+            }
+
+            managedRemoteSourceIDs.insert(sourceID)
+            await synchronizeStore()
+            guard !Task.isCancelled else { return }
+            sourcesStore.connect(sourceID)
+        } catch {
+            reportSourceError(error)
+        }
+    }
+
+    private func restoreRemoteCredentials(
+        reference: String,
+        oldReference: String?,
+        oldCredentials: RemoteCredentials?
+    ) {
+        guard reference == oldReference else {
+            try? credentialStore.remove(reference: reference)
+            return
+        }
+        if let oldCredentials {
+            try? credentialStore.save(oldCredentials, reference: reference)
+        } else {
+            try? credentialStore.remove(reference: reference)
         }
     }
 

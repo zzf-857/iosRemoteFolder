@@ -1,11 +1,46 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct RemoteSourceDraft: Identifiable {
+    let id: UUID
+    let sourceID: UUID?
+    let name: String
+    let endpoint: String
+    let kind: ResourceSource.SourceKind
+
+    static func adding() -> Self {
+        Self(
+            id: UUID(),
+            sourceID: nil,
+            name: "",
+            endpoint: "",
+            kind: .webdav
+        )
+    }
+
+    static func editing(_ source: ResourceSource) -> Self {
+        Self(
+            id: source.id,
+            sourceID: source.id,
+            name: source.name,
+            endpoint: source.endpoint,
+            kind: source.kind
+        )
+    }
+}
+
+private struct LocalSourceDraft: Identifiable {
+    let id: UUID
+    let sourceID: UUID
+    let name: String
+}
+
 struct SourcesView: View {
     @Environment(AppModel.self) private var appModel
 
     @State private var isShowingFolderImporter = false
-    @State private var isShowingRemoteForm = false
+    @State private var remoteDraft: RemoteSourceDraft?
+    @State private var localDraft: LocalSourceDraft?
     @State private var reauthorizationSourceID: UUID?
     @State private var pendingAction: SourceAction?
 
@@ -33,7 +68,7 @@ struct SourcesView: View {
 
                     Button {
                         appModel.dismissSourceError()
-                        isShowingRemoteForm = true
+                        remoteDraft = .adding()
                     } label: {
                         Label("添加 WebDAV / Alist", systemImage: "server.rack")
                             .font(.headline)
@@ -66,6 +101,9 @@ struct SourcesView: View {
                         SourceConnectionRow(
                             entry: entry,
                             retry: { store.retry(entry.id) },
+                            edit: appModel.isManagedSource(entry.id) ? {
+                                beginEditing(entry)
+                            } : nil,
                             reauthorize: canReauthorize(entry) ? {
                                 appModel.dismissSourceError()
                                 reauthorizationSourceID = entry.id
@@ -91,16 +129,37 @@ struct SourcesView: View {
             ) { result in
                 handleFolderImportResult(result)
             }
-            .sheet(isPresented: $isShowingRemoteForm) {
-                RemoteSourceFormView { name, endpoint, kind, username, password in
-                    isShowingRemoteForm = false
-                    appModel.addRemoteSource(
-                        name: name,
-                        endpoint: endpoint,
-                        kind: kind,
-                        username: username,
-                        password: password
-                    )
+            .sheet(item: $remoteDraft) { draft in
+                RemoteSourceFormView(draft: draft) { sourceID, name, endpoint, kind, username, password in
+                    remoteDraft = nil
+                    if let sourceID {
+                        appModel.editRemoteSource(
+                            sourceID: sourceID,
+                            name: name,
+                            endpoint: endpoint,
+                            kind: kind,
+                            username: username,
+                            password: password
+                        )
+                    } else {
+                        appModel.addRemoteSource(
+                            name: name,
+                            endpoint: endpoint,
+                            kind: kind,
+                            username: username,
+                            password: password
+                        )
+                    }
+                }
+            }
+            .sheet(item: $localDraft) { draft in
+                LocalSourceFormView(draft: draft) { name in
+                    localDraft = nil
+                    appModel.editLocalSource(sourceID: draft.sourceID, displayName: name)
+                } changeFolder: {
+                    localDraft = nil
+                    reauthorizationSourceID = draft.sourceID
+                    isShowingFolderImporter = true
                 }
             }
             .task {
@@ -118,6 +177,22 @@ struct SourcesView: View {
                     appModel.removeManagedSource(sourceID: sourceID)
                 }
             }
+        }
+    }
+
+    private func beginEditing(_ entry: SourcesStore.Entry) {
+        appModel.dismissSourceError()
+        switch entry.source.kind {
+        case .local:
+            localDraft = LocalSourceDraft(
+                id: entry.id,
+                sourceID: entry.id,
+                name: entry.source.name
+            )
+        case .webdav, .alist:
+            remoteDraft = .editing(entry.source)
+        case .lan, .http:
+            break
         }
     }
 
@@ -177,13 +252,25 @@ struct SourcesView: View {
 private struct RemoteSourceFormView: View {
     @Environment(\.dismiss) private var dismiss
 
-    @State private var name = ""
-    @State private var endpoint = ""
+    @State private var name: String
+    @State private var endpoint: String
     @State private var username = ""
     @State private var password = ""
-    @State private var kind: ResourceSource.SourceKind = .webdav
+    @State private var kind: ResourceSource.SourceKind
 
-    let submit: (String, String, ResourceSource.SourceKind, String, String) -> Void
+    let draft: RemoteSourceDraft
+    let submit: (UUID?, String, String, ResourceSource.SourceKind, String, String) -> Void
+
+    init(
+        draft: RemoteSourceDraft,
+        submit: @escaping (UUID?, String, String, ResourceSource.SourceKind, String, String) -> Void
+    ) {
+        self.draft = draft
+        self.submit = submit
+        _name = State(initialValue: draft.name)
+        _endpoint = State(initialValue: draft.endpoint)
+        _kind = State(initialValue: draft.kind)
+    }
 
     private var canSubmit: Bool {
         !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -240,17 +327,24 @@ private struct RemoteSourceFormView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     SecureField("密码", text: $password)
+                    if draft.sourceID != nil {
+                        Text("留空以保留当前凭证；填写任一字段会替换当前凭证。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
-            .navigationTitle("添加远端来源")
+            .navigationTitle(draft.sourceID == nil ? "添加远端来源" : "编辑远端来源")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("连接") {
+                    Button(draft.sourceID == nil ? "连接" : "保存") {
                         submit(
+                            draft.sourceID,
                             name.trimmingCharacters(in: .whitespacesAndNewlines),
                             endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
                             kind,
@@ -265,17 +359,95 @@ private struct RemoteSourceFormView: View {
     }
 }
 
+private struct LocalSourceFormView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name: String
+    let draft: LocalSourceDraft
+    let save: (String) -> Void
+    let changeFolder: () -> Void
+
+    init(
+        draft: LocalSourceDraft,
+        save: @escaping (String) -> Void,
+        changeFolder: @escaping () -> Void
+    ) {
+        self.draft = draft
+        self.save = save
+        self.changeFolder = changeFolder
+        _name = State(initialValue: draft.name)
+    }
+
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("来源") {
+                    TextField("名称", text: $name)
+                        .textContentType(.organizationName)
+                    Text("Files 文件夹")
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button {
+                        changeFolder()
+                        dismiss()
+                    } label: {
+                        Label("更换文件夹", systemImage: "folder.badge.gearshape")
+                    }
+                    .frame(minHeight: 44, alignment: .leading)
+                    Text("更换后会保留当前来源 ID，并重新连接新文件夹。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .navigationTitle("编辑本地来源")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        save(name.trimmingCharacters(in: .whitespacesAndNewlines))
+                        dismiss()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+}
+
 /// 来源连接行：复用 `SourceRowView` 的身份与状态展示，再按实时连接状态
 /// 附加连接中、失败原因、重试和重新授权入口。UI 只消费 `SourcesStore` 的状态。
 private struct SourceConnectionRow: View {
     let entry: SourcesStore.Entry
     let retry: () -> Void
+    let edit: (() -> Void)?
     let reauthorize: (() -> Void)?
     let remove: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             SourceRowView(source: displaySource)
+
+            if let edit {
+                HStack {
+                    Spacer(minLength: 0)
+                    Button(action: edit) {
+                        Label("编辑来源", systemImage: "pencil")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(AppTheme.accent)
+                    .frame(minHeight: 44)
+                }
+            }
 
             switch entry.state {
             case .connecting:
@@ -322,6 +494,14 @@ private struct SourceConnectionRow: View {
             }
         }
         .padding(.vertical, 2)
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if let edit {
+                Button(action: edit) {
+                    Label("编辑来源", systemImage: "pencil")
+                }
+                .tint(AppTheme.accent)
+            }
+        }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if let remove {
                 Button(role: .destructive, action: remove) {
