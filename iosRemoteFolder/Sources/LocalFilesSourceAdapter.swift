@@ -128,6 +128,9 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         try Task.checkCancellation()
+        if let range, range.validatedLength == nil {
+            throw ResourceSourceError.invalidReference
+        }
         return try withRootAccess { context in
             try withValidatedFile(for: item, in: context) { file in
                 try Task.checkCancellation()
@@ -438,6 +441,9 @@ struct LocalFilesSourceAdapter: ResourceSourceAdapter {
 
     /// 区间读取：只 seek/read 请求的字节窗口，不把整个文件载入内存。
     private func readRange(_ range: ResourceByteRange, of url: URL) throws -> Data {
+        guard range.validatedLength != nil else {
+            throw ResourceSourceError.invalidReference
+        }
         let handle: FileHandle
         do {
             handle = try FileHandle(forReadingFrom: url)

@@ -81,14 +81,27 @@ struct ResourceByteRange: Hashable, Sendable {
     var upperBound: Int64
 
     init(lowerBound: Int64, upperBound: Int64) {
-        precondition(lowerBound >= 0, "字节区间起点不能为负")
-        precondition(upperBound >= lowerBound, "字节区间终点不能小于起点")
         self.lowerBound = lowerBound
         self.upperBound = upperBound
     }
 
-    /// 期望读取的字节数。
-    var length: Int64 { upperBound - lowerBound + 1 }
+    /// 只有有限、非空且不反向的区间才有有效长度。
+    ///
+    /// 构造器保留值类型调用兼容性，不再用 `precondition` 让外部输入直接
+    /// 终止进程；所有读取/缓存边界必须先消费这个可失败结果。
+    var validatedLength: Int64? {
+        guard lowerBound >= 0, upperBound >= lowerBound else { return nil }
+        let (difference, differenceOverflow) = upperBound.subtractingReportingOverflow(lowerBound)
+        let (length, lengthOverflow) = difference.addingReportingOverflow(1)
+        guard !differenceOverflow, !lengthOverflow, length > 0 else { return nil }
+        return length
+    }
+
+    /// 区间是否可用于读取或持久化寻址。
+    var isValid: Bool { validatedLength != nil }
+
+    /// 期望读取的字节数；非法区间返回 0，调用方必须先检查 `validatedLength`。
+    var length: Int64 { validatedLength ?? 0 }
 
     /// 转换为 HTTP `Range` 请求头的值。
     var httpHeaderValue: String {
@@ -98,7 +111,7 @@ struct ResourceByteRange: Hashable, Sendable {
     /// 将区间收敛到给定总长度内，返回实际可用的区间。
     /// 若区间完全越界，返回 nil。
     func clamped(toTotalLength total: Int64) -> ResourceByteRange? {
-        guard total > 0, lowerBound < total else { return nil }
+        guard validatedLength != nil, total > 0, lowerBound < total else { return nil }
         let upper = min(upperBound, total - 1)
         return ResourceByteRange(lowerBound: lowerBound, upperBound: upper)
     }

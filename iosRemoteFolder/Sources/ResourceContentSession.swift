@@ -199,17 +199,7 @@ actor ResourceContentSession {
     }
 
     private static func checkedLength(of range: ResourceByteRange) -> Int64? {
-        guard range.lowerBound >= 0, range.upperBound >= range.lowerBound else {
-            return nil
-        }
-        let (difference, differenceOverflow) = range.upperBound.subtractingReportingOverflow(
-            range.lowerBound
-        )
-        let (length, lengthOverflow) = difference.addingReportingOverflow(1)
-        guard !differenceOverflow, !lengthOverflow, length > 0 else {
-            return nil
-        }
-        return length
+        range.validatedLength
     }
 
 }

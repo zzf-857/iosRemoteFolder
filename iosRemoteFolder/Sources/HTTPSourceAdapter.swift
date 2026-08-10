@@ -255,6 +255,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             let (data, _) = try await performRequest(method: "GET", descriptor: descriptor, headers: [:])
             return data
         }
+        guard range.validatedLength != nil else {
+            throw ResourceSourceError.invalidReference
+        }
 
         let key = capabilityKey(for: descriptor)
         let (response, bytes) = try await performStreamingRequest(

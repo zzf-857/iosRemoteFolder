@@ -48,6 +48,9 @@ struct ResourceCacheKey: Hashable, Sendable {
         variant: ResourceCacheVariant
     ) {
         guard revision.isKnown else { return nil }
+        if case .byteRange(let range) = variant, !range.isValid {
+            return nil
+        }
         self.identity = identity
         self.revision = revision
         self.variant = variant
