@@ -558,6 +558,8 @@ final class AppModel {
                 throw LocalSourceConfigurationError.sourceNotFound(sourceID)
             }
             let location = try LocalSourceLocation(directoryURL: directoryURL)
+            let changesContentNamespace = !oldConfiguration.location
+                .isSameResolvedLocation(as: location)
             let configuration = LocalSourceConfiguration(
                 id: oldConfiguration.id,
                 displayName: oldConfiguration.displayName,
@@ -575,6 +577,9 @@ final class AppModel {
             } catch {
                 _ = try? configurationStore.replace(oldConfiguration)
                 throw error
+            }
+            if changesContentNamespace {
+                await invalidateDerivedContent(for: sourceID)
             }
             await synchronizeStore()
             guard !Task.isCancelled else { return }
@@ -646,6 +651,8 @@ final class AppModel {
                 throw RemoteSourceConfigurationError.invalidEndpoint
             }
             let endpointURL = try WebDAVSourceAdapter.normalizedEndpoint(rawEndpoint)
+            let changesContentNamespace = oldConfiguration.kind != kind
+                || oldConfiguration.endpoint != endpointURL.absoluteString
             let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
             let hasNewCredentials = !trimmedUsername.isEmpty || !password.isEmpty
 
@@ -725,6 +732,9 @@ final class AppModel {
             }
 
             managedRemoteSourceIDs.insert(sourceID)
+            if changesContentNamespace {
+                await invalidateDerivedContent(for: sourceID)
+            }
             await synchronizeStore()
             guard !Task.isCancelled else { return }
             sourcesStore.connect(sourceID)
@@ -798,6 +808,18 @@ final class AppModel {
         resourceProgressStore.retain(sourceIDs: Set(snapshots.map(\.id)))
         resourceReadingStore.retain(sourceIDs: Set(snapshots.map(\.id)))
         await cacheCoordinator.retain(sourceIDs: Set(snapshots.map(\.id)))
+        await refreshOfflineCache()
+    }
+
+    /// A source ID can survive reauthorization or endpoint editing, but content
+    /// derived from the old namespace cannot. Names and credentials alone do
+    /// not call this path.
+    private func invalidateDerivedContent(for sourceID: UUID) async {
+        recentResourceStore.remove(sourceID: sourceID)
+        recentResources = recentResourceStore.items
+        resourceProgressStore.remove(sourceID: sourceID)
+        resourceReadingStore.remove(sourceID: sourceID)
+        await cacheCoordinator.remove(sourceID: sourceID)
         await refreshOfflineCache()
     }
 
@@ -1042,6 +1064,13 @@ final class RecentResourceStore {
         persist()
     }
 
+    func remove(sourceID: UUID) {
+        let retained = items.filter { $0.sourceID != sourceID }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
     private func persist() {
         let payload = Payload(version: Self.currentVersion, items: items.map(StoredItem.init(resource:)))
         guard let data = try? JSONEncoder().encode(payload) else { return }
@@ -1216,6 +1245,13 @@ final class ResourceProgressStore {
             guard let identity = item.identity else { return false }
             return sourceIDs.contains(identity.sourceID)
         }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    func remove(sourceID: UUID) {
+        let retained = items.filter { $0.identity?.sourceID != sourceID }
         guard retained.count != items.count else { return }
         items = retained
         persist()
@@ -1431,6 +1467,13 @@ final class ResourceReadingStore {
             guard let identity = item.identity else { return false }
             return sourceIDs.contains(identity.sourceID)
         }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    func remove(sourceID: UUID) {
+        let retained = items.filter { $0.identity?.sourceID != sourceID }
         guard retained.count != items.count else { return }
         items = retained
         persist()

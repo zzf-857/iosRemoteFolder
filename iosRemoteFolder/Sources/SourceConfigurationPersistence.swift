@@ -55,6 +55,17 @@ enum SourceConfigurationPersistence {
         try makeContainer(isStoredInMemoryOnly: false)
     }
 
+    /// 仅供测试和迁移复核显式重开同一个文件型 store；路径不进入 UI 或 adapter。
+    static func makePersistentContainer(at storeURL: URL) throws -> ModelContainer {
+        let schema = makeSchema()
+        let configuration = ModelConfiguration(
+            schema: schema,
+            url: storeURL,
+            cloudKitDatabase: .none
+        )
+        return try ModelContainer(for: schema, configurations: [configuration])
+    }
+
     static func makeInMemoryContainer() -> ModelContainer {
         do {
             return try makeContainer(isStoredInMemoryOnly: true)
@@ -64,14 +75,18 @@ enum SourceConfigurationPersistence {
     }
 
     private static func makeContainer(isStoredInMemoryOnly: Bool) throws -> ModelContainer {
-        let schema = Schema([
-            LocalSourceConfigurationRecord.self,
-            RemoteSourceConfigurationRecord.self
-        ])
+        let schema = makeSchema()
         let configuration = ModelConfiguration(
             schema: schema,
             isStoredInMemoryOnly: isStoredInMemoryOnly
         )
         return try ModelContainer(for: schema, configurations: [configuration])
+    }
+
+    private static func makeSchema() -> Schema {
+        Schema([
+            LocalSourceConfigurationRecord.self,
+            RemoteSourceConfigurationRecord.self
+        ])
     }
 }

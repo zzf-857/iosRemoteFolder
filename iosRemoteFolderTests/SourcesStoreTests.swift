@@ -405,6 +405,194 @@ struct SourceConfigurationMigrationTests {
 
         #expect(model.sources.contains { $0.id == remote.id })
     }
+
+    @Test("文件型容器重建后恢复本地与远端迁移配置")
+    func fileBackedContainerRestoresConfigurationsAfterReopen() throws {
+        let fileManager = FileManager.default
+        let temporaryDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-source-store-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer {
+            do {
+                try fileManager.removeItem(at: temporaryDirectory)
+            } catch {
+                Issue.record("无法清理临时 SwiftData store：\(error.localizedDescription)")
+            }
+        }
+
+        let suiteName = "iosRemoteFolder.file-backed-migration.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let localLegacyKey = "localSourceConfigurations.v1"
+        let remoteLegacyKey = "remoteSourceConfigurations.v1"
+        let local = LocalSourceConfiguration(
+            id: UUID(),
+            displayName: "文件型本地来源",
+            endpointDescription: "Files 文件夹",
+            location: try LocalSourceLocation(bookmarkData: Data([0x01, 0x02, 0x03]))
+        )
+        let remote = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "文件型远端来源",
+            endpoint: URL(string: "https://example.com/dav/")!,
+            kind: .webdav,
+            credentialReference: UUID().uuidString.lowercased()
+        )
+        defaults.set(
+            try JSONEncoder().encode(LocalLegacyPayload(version: 1, configurations: [local])),
+            forKey: localLegacyKey
+        )
+        defaults.set(
+            try JSONEncoder().encode(RemoteLegacyPayload(version: 1, configurations: [remote])),
+            forKey: remoteLegacyKey
+        )
+
+        let storeURL = temporaryDirectory.appendingPathComponent("SourceConfigurations.store")
+        try withPersistentStores(at: storeURL, defaults: defaults) { localStore, remoteStore in
+            let loadedLocal = try localStore.load()
+            let loadedRemote = try remoteStore.load()
+            #expect(loadedLocal == [local])
+            #expect(loadedRemote == [remote])
+        }
+        #expect(defaults.data(forKey: localLegacyKey) == nil)
+        #expect(defaults.data(forKey: remoteLegacyKey) == nil)
+
+        try withPersistentStores(at: storeURL, defaults: defaults) { localStore, remoteStore in
+            let reopenedLocal = try localStore.load()
+            let reopenedRemote = try remoteStore.load()
+            #expect(reopenedLocal == [local])
+            #expect(reopenedRemote == [remote])
+        }
+        #expect(defaults.data(forKey: localLegacyKey) == nil)
+        #expect(defaults.data(forKey: remoteLegacyKey) == nil)
+    }
+
+    @Test("远端来源改名保留派生状态而 endpoint 变化会清理")
+    func remoteNamespaceChangeInvalidatesDerivedState() async throws {
+        let suiteName = "iosRemoteFolder.remote-namespace.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let localStore = LocalSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        let remoteStore = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        let sourceID = UUID()
+        let configuration = RemoteSourceConfiguration(
+            id: sourceID,
+            displayName: "旧名称",
+            endpoint: URL(string: "http://127.0.0.1:49101/dav/")!,
+            kind: .webdav,
+            credentialReference: nil
+        )
+        try remoteStore.insert(configuration)
+
+        let model = AppModel(
+            configurationStore: localStore,
+            remoteConfigurationStore: remoteStore
+        )
+        let metadata = ResourceMetadata(
+            byteSize: 7,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            mimeType: "text/plain",
+            isDirectory: false,
+            revision: .etag("\"namespace-v1\"")
+        )
+        let resource = ResourceItem(
+            sourceID: sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: "/notes/readme.txt")),
+            name: "readme.txt",
+            kind: .text,
+            metadata: metadata,
+            capabilities: [.read, .download],
+            accent: .blue
+        )
+        let audio = ResourceItem(
+            sourceID: sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: "/music/theme.m4a")),
+            name: "theme.m4a",
+            kind: .audio,
+            metadata: metadata,
+            capabilities: [.read, .download],
+            accent: .pink
+        )
+        let cacheKey = try #require(
+            ResourceCacheKey(
+                identity: resource.id,
+                revision: metadata.revision,
+                variant: .content
+            )
+        )
+        model.recordRecent(resource: resource, metadata: metadata)
+        model.recordResumePosition(.seconds(12), for: audio, metadata: metadata)
+        model.recordReadingPosition(.text(fraction: 0.4), for: resource, metadata: metadata)
+        try await model.cacheCoordinator.store(
+            Data("content".utf8),
+            for: cacheKey,
+            maximumBytes: 1_024
+        )
+
+        model.editRemoteSource(
+            sourceID: sourceID,
+            name: "新名称",
+            endpoint: configuration.endpoint,
+            kind: .webdav,
+            username: "",
+            password: ""
+        )
+        try await waitUntil {
+            model.sources.first(where: { $0.id == sourceID })?.name == "新名称"
+        }
+        #expect(model.recentResources.contains { $0.id == resource.id })
+        #expect(model.resumePosition(for: audio, metadata: metadata) == .seconds(12))
+        #expect(model.readingPosition(for: resource, metadata: metadata) == .text(fraction: 0.4))
+        #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) != nil)
+
+        model.editRemoteSource(
+            sourceID: sourceID,
+            name: "新名称",
+            endpoint: "http://127.0.0.1:49102/dav/",
+            kind: .webdav,
+            username: "",
+            password: ""
+        )
+        try await waitUntil {
+            model.sources.first(where: { $0.id == sourceID })?.endpoint
+                == "http://127.0.0.1:49102/dav/"
+        }
+        #expect(!model.recentResources.contains { $0.id == resource.id })
+        #expect(model.resumePosition(for: audio, metadata: metadata) == nil)
+        #expect(model.readingPosition(for: resource, metadata: metadata) == nil)
+        #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) == nil)
+    }
+
+    /// The stores and their shared container leave scope before a second
+    /// container opens the same file-backed store URL.
+    private func withPersistentStores(
+        at storeURL: URL,
+        defaults: UserDefaults,
+        _ body: (
+            LocalSourceConfigurationStore,
+            RemoteSourceConfigurationStore
+        ) throws -> Void
+    ) throws {
+        let container = try SourceConfigurationPersistence.makePersistentContainer(at: storeURL)
+        let localStore = LocalSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        let remoteStore = RemoteSourceConfigurationStore(
+            modelContainer: container,
+            defaults: defaults
+        )
+        try body(localStore, remoteStore)
+    }
 }
 
 /// 在超时前轮询等待条件成立；超时记录测试失败。
@@ -911,7 +1099,7 @@ struct RecentResourceStoreTests {
         #expect(store.items.first?.path == "/recent-20.txt")
         #expect(store.items.last?.path == "/recent-1.txt")
 
-        store.retain(sourceIDs: [UUID()])
+        store.remove(sourceID: sourceID)
         #expect(store.items.isEmpty)
         #expect(RecentResourceStore(defaults: defaults).items.isEmpty)
     }
@@ -1010,7 +1198,7 @@ struct ResourceProgressStoreTests {
             metadata: metadata
         )
 
-        store.retain(sourceIDs: [retainedSource])
+        store.remove(sourceID: removedSource)
         #expect(store.count == 1)
     }
 
@@ -1112,7 +1300,7 @@ struct ResourceReadingStoreTests {
         store.record(.text(fraction: 0.2), for: text, metadata: metadata)
         #expect(store.count == 2)
 
-        store.retain(sourceIDs: [retainedSource])
+        store.remove(sourceID: removedSource)
         #expect(store.count == 1)
         #expect(store.position(for: pdf, metadata: metadata) == .pdf(pageIndex: 2))
         #expect(store.position(for: text, metadata: metadata) == nil)
@@ -1289,7 +1477,7 @@ struct CacheCoordinatorTests {
         #expect(await cache.state(for: retained) == .online)
 
         try await cache.store(Data("12345".utf8), for: retained, maximumBytes: 1024)
-        await cache.retain(sourceIDs: [retainedSource])
+        await cache.remove(sourceID: removedSource)
         #expect(try await cache.data(for: retained, maximumBytes: 1024) == Data("12345".utf8))
         #expect(try await cache.data(for: removed, maximumBytes: 1024) == nil)
 

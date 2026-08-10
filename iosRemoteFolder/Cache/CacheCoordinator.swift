@@ -262,6 +262,25 @@ actor CacheCoordinator {
         states = states.filter { sourceIDs.contains($0.key.identity.sourceID) }
     }
 
+    /// Invalidates all cached representations for one source while preserving
+    /// cache entries owned by other sources.
+    func remove(sourceID: UUID) {
+        let removedDigests = manifest.compactMap { digest, entry -> String? in
+            guard let identity = ResourceIdentity(identityKey: entry.identityKey) else {
+                return digest
+            }
+            return identity.sourceID == sourceID ? digest : nil
+        }
+        for digest in removedDigests {
+            removeFile(at: rootURL.appendingPathComponent(digest + ".bin"))
+            manifest.removeValue(forKey: digest)
+        }
+        if !removedDigests.isEmpty {
+            try? persistManifest()
+        }
+        states = states.filter { $0.key.identity.sourceID != sourceID }
+    }
+
     /// Returns the bytes currently occupied by managed cache files.
     func storedByteCount() -> Int64 {
         manifest.keys.reduce(into: Int64(0)) { total, digest in
