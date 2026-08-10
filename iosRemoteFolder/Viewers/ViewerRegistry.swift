@@ -16,6 +16,7 @@ enum ViewerPreparation: Hashable, Sendable {
     case text(maximumBytes: Int64)
     case pdf(maximumBytes: Int64)
     case image(maximumBytes: Int64)
+    case audio(maximumBytes: Int64)
 }
 
 struct ViewerResolution: Hashable, Sendable {
@@ -83,10 +84,14 @@ struct ViewerRegistry {
                 preparation: .image(maximumBytes: 50 * 1024 * 1024),
                 fallbackDescription: nil
             )
+        case .audio:
+            return ViewerResolution(
+                kind: .musicPlayer,
+                preparation: .audio(maximumBytes: 50 * 1024 * 1024),
+                fallbackDescription: nil
+            )
         case .video:
             return ViewerResolution(kind: .videoPlayer, preparation: .none, fallbackDescription: nil)
-        case .audio:
-            return ViewerResolution(kind: .musicPlayer, preparation: .none, fallbackDescription: nil)
         case .unknown, .folder:
             return unsupported("无法从资源元数据确认内容类型")
         }

@@ -276,11 +276,53 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
             return Data(
                 base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
             )
+        case "/产品/路线图演示.wav":
+            return Self.makeWAV()
         case "/知识库/设计/设计系统与组件规范.pdf":
             return Self.makePDF()
         default:
             return nil
         }
+    }
+
+    /// Generate one second of a quiet 440 Hz tone in a standard PCM WAV container.
+    private static func makeWAV() -> Data {
+        let sampleRate: UInt32 = 8_000
+        let channels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let frameCount: UInt32 = 8_000
+        let blockAlign = channels * bitsPerSample / 8
+        let byteRate = sampleRate * UInt32(blockAlign)
+        let dataSize = frameCount * UInt32(blockAlign)
+
+        var data = Data()
+        data.append(contentsOf: Data("RIFF".utf8))
+
+        func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+            var littleEndianValue = value.littleEndian
+            withUnsafeBytes(of: &littleEndianValue) { bytes in
+                data.append(contentsOf: bytes)
+            }
+        }
+
+        appendLittleEndian(UInt32(36) + dataSize)
+        data.append(contentsOf: Data("WAVE".utf8))
+        data.append(contentsOf: Data("fmt ".utf8))
+        appendLittleEndian(UInt32(16))
+        appendLittleEndian(UInt16(1))
+        appendLittleEndian(channels)
+        appendLittleEndian(sampleRate)
+        appendLittleEndian(byteRate)
+        appendLittleEndian(blockAlign)
+        appendLittleEndian(bitsPerSample)
+        data.append(contentsOf: Data("data".utf8))
+        appendLittleEndian(dataSize)
+        let amplitude = Double(Int16.max) * 0.2
+        for frame in 0..<Int(frameCount) {
+            let phase = 2 * Double.pi * 440 * Double(frame) / Double(sampleRate)
+            appendLittleEndian(Int16(sin(phase) * amplitude))
+        }
+        return data
     }
 
     /// 生成一个稳定、可由 PDFKit 打开的最小 PDF，避免演示内容依赖网络。

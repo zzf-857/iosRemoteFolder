@@ -100,6 +100,20 @@ enum SampleData {
             accent: .teal
         ),
         ResourceItem(
+            sourceID: workSourceID,
+            logicalPath: ResourcePath(rawValue: "/产品/路线图演示.wav")!,
+            name: "路线图演示.wav",
+            kind: .audio,
+            metadata: metadata(
+                byteSize: 16_044,
+                modifiedAt: Date(timeIntervalSince1970: 1_754_700_000),
+                mimeType: "audio/wav",
+                typeIdentifier: "com.microsoft.waveform-audio"
+            ),
+            capabilities: [.read, .download],
+            accent: .pink
+        ),
+        ResourceItem(
             sourceID: localSourceID,
             logicalPath: ResourcePath(rawValue: "/照片/旅行/海边-2026-01.jpg")!,
             name: "海边-2026-01.jpg",

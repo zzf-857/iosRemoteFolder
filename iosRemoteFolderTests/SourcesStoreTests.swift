@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import PDFKit
 import Testing
 import UIKit
@@ -619,6 +620,20 @@ struct ViewerResolutionTests {
         #expect(!ViewerContentDecoder.isValidImageData(Data("not an image".utf8)))
     }
 
+    @Test("音乐解析使用显式预算")
+    func resolvesAudioContent() {
+        let item = makeItem(path: "/demo.wav", kind: .audio)
+        let metadata = ResourceMetadata(
+            mimeType: "audio/wav",
+            typeIdentifier: "com.microsoft.waveform-audio"
+        )
+
+        let resolution = ViewerRegistry.resolve(resource: item, metadata: metadata)
+
+        #expect(resolution.kind == .musicPlayer)
+        #expect(resolution.preparation == .audio(maximumBytes: 50 * 1024 * 1024))
+    }
+
     @Test("Markdown 与通用文本证据兼容，但真正冲突降级")
     func resolvesMarkdownAndRejectsConflict() {
         let markdown = makeItem(path: "/notes/readme.md", kind: .unknown)
@@ -702,5 +717,19 @@ struct SampleSourceContentTests {
         let imageData = try await session.readData(maximumBytes: 50 * 1024 * 1024)
 
         #expect(UIImage(data: imageData) != nil)
+    }
+
+    @Test("演示来源经内容会话返回可播放音频字节")
+    func readsDemoAudioThroughSession() async throws {
+        let audioSource = SampleData.sources.first { $0.id == SampleData.workSourceID }!
+        let audioItem = SampleData.resources.first { $0.path == "/产品/路线图演示.wav" }!
+        let adapter = SampleSourceAdapter(source: audioSource)
+        let registry = try SourceRegistry(sources: [audioSource], adapters: [adapter])
+        let session = try await ResourceAccessService(registry: registry)
+            .makeSession(for: audioItem)
+        let audioData = try await session.readData(maximumBytes: 50 * 1024 * 1024)
+
+        #expect(ViewerContentDecoder.isValidAudioData(audioData))
+        #expect((try? AVAudioPlayer(data: audioData)) != nil)
     }
 }

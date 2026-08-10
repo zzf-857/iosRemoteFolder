@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import PDFKit
 import UIKit
+import AVFoundation
 
 struct ResourceViewerHost: View {
     @Environment(AppModel.self) private var appModel
@@ -95,7 +96,11 @@ struct ResourceViewerHost: View {
         case .videoPlayer:
             VideoPlayerView(resource: resource)
         case .musicPlayer:
-            MusicPlayerView(resource: resource)
+            if case .audio(let data) = payload {
+                MusicPlayerView(resource: resource, data: data)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: "音乐内容读取无效")
+            }
         case .systemPreview:
             UnsupportedViewerView(resource: resource, reason: resolution.fallbackDescription)
         }
@@ -208,6 +213,13 @@ struct ResourceViewerHost: View {
                     throw ResourceSourceError.invalidResponse
                 }
                 payload = .image(data)
+            case .audio(let maximumBytes):
+                let data = try await createdSession.readData(maximumBytes: maximumBytes)
+                try Task.checkCancellation()
+                guard ViewerContentDecoder.isValidAudioData(data) else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .audio(data)
             }
             try Task.checkCancellation()
             result = .ready(request.identity, metadata, resolution, payload)
@@ -241,11 +253,16 @@ enum ViewerContentPayload: Equatable, Sendable {
     case text(String)
     case pdf(Data)
     case image(Data)
+    case audio(Data)
 }
 
 enum ViewerContentDecoder {
     static func isValidImageData(_ data: Data) -> Bool {
         UIImage(data: data) != nil
+    }
+
+    static func isValidAudioData(_ data: Data) -> Bool {
+        (try? AVAudioPlayer(data: data)) != nil
     }
 
     static func decodeText(_ data: Data) -> String {
@@ -504,42 +521,91 @@ struct VideoPlayerView: View {
     }
 }
 
+@MainActor
 struct MusicPlayerView: View {
     let resource: ResourceItem
-    @State private var isPlaying = false
+    let data: Data
+    @State private var engine: AVAudioPlayerEngine?
+
+    init(resource: ResourceItem, data: Data) {
+        self.resource = resource
+        self.data = data
+        _engine = State(initialValue: try? AVAudioPlayerEngine(data: data))
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 24) {
-                ViewerHeader(icon: "music.note", eyebrow: "MUSIC PLAYER", title: "队列与系统媒体")
-                RoundedRectangle(cornerRadius: 26)
-                    .fill(AppTheme.accent.opacity(0.18))
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                        Image(systemName: "music.note.list")
-                            .font(.system(size: 72))
-                            .foregroundStyle(AppTheme.accent)
+        Group {
+            if let engine {
+                TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+                    ScrollView {
+                        VStack(spacing: 24) {
+                            ViewerHeader(icon: "music.note", eyebrow: "MUSIC PLAYER", title: resource.name)
+                            RoundedRectangle(cornerRadius: 26)
+                                .fill(AppTheme.accent.opacity(0.18))
+                                .aspectRatio(1, contentMode: .fit)
+                                .overlay {
+                                    Image(systemName: "music.note.list")
+                                        .font(.system(size: 72))
+                                        .foregroundStyle(AppTheme.accent)
+                                }
+                            Text(resource.name)
+                                .font(.title2.bold())
+                                .multilineTextAlignment(.center)
+                            Slider(
+                                value: Binding(
+                                    get: { engine.currentTime },
+                                    set: { engine.seek(to: $0) }
+                                ),
+                                in: 0...max(engine.duration, 0.001)
+                            )
+                            .accessibilityLabel("播放进度")
+                            HStack {
+                                Text(Self.timeLabel(engine.currentTime))
+                                Spacer()
+                                Text(Self.timeLabel(engine.duration))
+                            }
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            HStack(spacing: 32) {
+                                Button("后退 10 秒", systemImage: "gobackward.10") {
+                                    engine.seek(to: engine.currentTime - 10)
+                                }
+                                Button(
+                                    engine.isPlaying ? "暂停" : "播放",
+                                    systemImage: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill"
+                                ) {
+                                    if engine.isPlaying {
+                                        engine.pause()
+                                    } else {
+                                        _ = engine.play()
+                                    }
+                                }
+                                .font(.largeTitle)
+                                Button("前进 10 秒", systemImage: "goforward.10") {
+                                    engine.seek(to: engine.currentTime + 10)
+                                }
+                            }
+                            .labelStyle(.iconOnly)
+                            .accessibilityElement(children: .contain)
+                        }
+                        .frame(maxWidth: 620)
+                        .padding()
                     }
-                Text(resource.name)
-                    .font(.title2.bold())
-                Text("本地导入 · 04:32")
-                    .foregroundStyle(.secondary)
-                Slider(value: .constant(0.42))
-                HStack(spacing: 32) {
-                    Button("随机", systemImage: "shuffle") {}
-                    Button("上一首", systemImage: "backward.fill") {}
-                    Button(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.circle.fill" : "play.circle.fill") {
-                        isPlaying.toggle()
-                    }
-                    .font(.largeTitle)
-                    Button("下一首", systemImage: "forward.fill") {}
-                    Button("队列", systemImage: "list.bullet") {}
                 }
-                .labelStyle(.iconOnly)
+            } else {
+                ContentUnavailableView(
+                    "无法播放音乐",
+                    systemImage: "music.note",
+                    description: Text("文件内容不是有效的音频。")
+                )
             }
-            .frame(maxWidth: 620)
-            .padding()
         }
+        .onDisappear { engine?.stop() }
+    }
+
+    private static func timeLabel(_ time: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(time.rounded(.down)))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 }
 
