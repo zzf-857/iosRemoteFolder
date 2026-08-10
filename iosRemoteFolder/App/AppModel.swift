@@ -30,6 +30,8 @@ final class AppModel {
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
     @ObservationIgnored private var sourceMutationTask: Task<Void, Never>?
+    /// mutation 任务代数；旧任务结束时不能清理已替换的新任务引用。
+    @ObservationIgnored private var sourceMutationGeneration = 0
 
     init(configurationStore: LocalSourceConfigurationStore? = nil) {
         let store = configurationStore ?? LocalSourceConfigurationStore()
@@ -243,7 +245,12 @@ final class AppModel {
     ) {
         let previousTask = sourceMutationTask
         sourceMutationTask?.cancel()
+        sourceMutationGeneration += 1
+        let generation = sourceMutationGeneration
         sourceMutationTask = Task { @MainActor in
+            defer {
+                self.finishSourceMutation(generation: generation)
+            }
             // Mutations are latest-wins but serialized. A cancelled operation is
             // allowed to finish its in-flight commit/rollback before the next one
             // touches the same configuration and registry.
@@ -253,6 +260,11 @@ final class AppModel {
             guard !Task.isCancelled else { return }
             await operation()
         }
+    }
+
+    private func finishSourceMutation(generation: Int) {
+        guard sourceMutationGeneration == generation else { return }
+        sourceMutationTask = nil
     }
 
     private static func displayName(for directoryURL: URL) -> String {
