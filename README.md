@@ -21,10 +21,11 @@
 - D-030A 已通过 Codex 主程复核：Local adapter 增加 bookmark 位置值、stale/失效重新授权错误、平衡 security-scoped lease 和 `NSFileCoordinator` 协调访问
 - D-030B 已实现，主程构建/测试基线复核通过，真实 Files Provider 生命周期待验证：Files 目录选择、bookmark 配置恢复、动态来源注册/替换/移除和 stale/失效重新授权均由 composition root 接线；临时 Codable + UserDefaults 后端只保存 bookmark 与非敏感来源描述
 - D-036/D-037/D-038/D-039/D-040 功能闭环切片已实现：`ViewerRegistry` 按 typed metadata/UTType/MIME/扩展名解析，TXT 使用显式 10 MiB 预算和编码探测，PDF/图片/视频使用显式 50 MiB 预算，演示图片通过原生缩放/平移查看器呈现，演示音频通过 `AVAudioPlayer` 播放，演示视频通过内存资源加载器交给 `AVPlayer` 播放；D-030B 外部 Provider 证据、SwiftData/Keychain 和其他协议仍未提前视为完成
+- D-041 已实现：成功打开的资源按 `ResourceIdentity` 去重并恢复到 Home 的“继续/最近打开”，最多保留 20 条；临时存储不含 URL、请求头、Token、Cookie 或绝对路径，后续迁移到 SwiftData 不改变身份键语义
 
 当前阶段：
 
-- D-030B Files 来源配置生命周期已实现，主程构建/86 项测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径。本轮不进入 D-032 的 SwiftData/Keychain 迁移。
+- D-030B Files 来源配置生命周期已实现，主程构建/88 项测试基线已通过，真实 Files Provider stale/失效 bookmark、授权和恢复语义仍待验证；D-036/D-037/D-038/D-039/D-040 已把 TXT/PDF/Markdown/图片/演示音乐/视频推进为受控真实内容路径，D-041 已接通最近资源投影。本轮不进入 D-032 的 SwiftData/Keychain 迁移。
 
 尚未完成：
 

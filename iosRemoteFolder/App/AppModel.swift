@@ -17,6 +17,8 @@ final class AppModel {
     var searchText = ""
     var selectedKind: ResourceKind?
     var resources: [ResourceItem]
+    /// 成功打开过的资源，按最近打开顺序投影给 Home。
+    var recentResources: [ResourceItem]
     /// 来源连接与浏览状态的唯一仓库，由应用级状态持有。
     var sourcesStore: SourcesStore
     /// 来源列表是 Store 的实时投影，Home 与 Sources 不维护第二份来源状态。
@@ -27,6 +29,7 @@ final class AppModel {
     @ObservationIgnored let resourceAccessService: ResourceAccessService
     @ObservationIgnored private let registry: SourceRegistry
     @ObservationIgnored private let configurationStore: LocalSourceConfigurationStore
+    @ObservationIgnored private let recentResourceStore: RecentResourceStore
     /// UI 操作通过这个可取消、可追踪的任务串行执行 registry actor mutation，
     /// 不把异步操作丢成未跟踪的 fire-and-forget Task。
     @ObservationIgnored private var sourceMutationTask: Task<Void, Never>?
@@ -82,6 +85,10 @@ final class AppModel {
         }
 
         self.resources = SampleData.resources
+        let recentStore = RecentResourceStore()
+        recentStore.retain(sourceIDs: Set(allSources.map(\.id)))
+        self.recentResourceStore = recentStore
+        self.recentResources = recentStore.items
         self.registry = registry
         self.sourcesStore = SourcesStore(registry: registry)
         self.resourceAccessService = ResourceAccessService(registry: registry)
@@ -98,6 +105,34 @@ final class AppModel {
             let matchesSearch = searchText.isEmpty || resource.name.localizedCaseInsensitiveContains(searchText)
             return matchesKind && matchesSearch
         }
+    }
+
+    /// 在没有历史记录的首次启动上保留演示内容；一旦用户打开真实资源，
+    /// Home 的继续/最近区域只显示最近记录，避免静态样例遮蔽真实路径。
+    var homeResources: [ResourceItem] {
+        recentResources.isEmpty ? resources : recentResources
+    }
+
+    /// 只有查看器已经完成 metadata/内容准备后才写入最近记录。
+    /// 传入的 metadata 是本次会话最新事实，不复用列举时的旧值。
+    func recordRecent(resource: ResourceItem, metadata: ResourceMetadata) {
+        guard resource.kind != .folder,
+              !metadata.isDirectory,
+              let path = ResourcePath(rawValue: resource.path),
+              path.normalized == resource.path else {
+            return
+        }
+        let updated = ResourceItem(
+            sourceID: resource.sourceID,
+            logicalPath: path,
+            name: resource.name,
+            kind: resource.kind,
+            metadata: metadata,
+            capabilities: resource.capabilities,
+            accent: resource.accent
+        )
+        recentResourceStore.record(updated)
+        recentResources = recentResourceStore.items
     }
 
     func resetFilters() {
@@ -233,6 +268,8 @@ final class AppModel {
     private func synchronizeStore() async {
         let snapshots = await registry.currentSnapshots()
         sourcesStore.synchronize(with: snapshots)
+        recentResourceStore.retain(sourceIDs: Set(snapshots.map(\.id)))
+        recentResources = recentResourceStore.items
     }
 
     private func reportSourceError(_ error: any Error) {
@@ -310,4 +347,175 @@ final class AppModel {
             url: URL(string: "http://127.0.0.1:48080/files/team-photo.jpg")!
         )
     ]
+}
+
+/// 临时的最近资源窄存储。
+///
+/// D-032 接入 SwiftData 前只保存不敏感的稳定身份和展示 metadata；请求 URL、
+/// headers、凭证、绝对文件 URL 和内容字节均不进入持久化 payload。
+@MainActor
+final class RecentResourceStore {
+    private static let currentVersion = 1
+    private static let storageKey = "recentResources.v1"
+    private static let maximumItemCount = 20
+
+    private struct Payload: Codable {
+        let version: Int
+        let items: [StoredItem]
+    }
+
+    private struct StoredItem: Codable {
+        let identityKey: String
+        let path: String
+        let name: String
+        let kind: String
+        let byteSize: Int64?
+        let modifiedAt: Date?
+        let mimeType: String?
+        let typeIdentifier: String?
+        let isDirectory: Bool
+        let acceptsRanges: Bool
+        let revisionKind: String
+        let revisionValue: String?
+        let revisionDate: Date?
+        let revisionByteSize: Int64?
+        let capabilities: Int
+        let accent: String
+
+        init(resource: ResourceItem) {
+            identityKey = resource.id.identityKey
+            path = resource.path
+            name = resource.name
+            kind = resource.kind.rawValue
+            byteSize = resource.metadata.byteSize
+            modifiedAt = resource.metadata.modifiedAt
+            mimeType = resource.metadata.mimeType
+            typeIdentifier = resource.metadata.typeIdentifier
+            isDirectory = resource.metadata.isDirectory
+            acceptsRanges = resource.metadata.acceptsRanges
+            switch resource.metadata.revision {
+            case .etag(let value):
+                revisionKind = "etag"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .serverVersion(let value):
+                revisionKind = "serverVersion"
+                revisionValue = value
+                revisionDate = nil
+                revisionByteSize = nil
+            case .modifiedAndSize(let modifiedAt, let byteSize):
+                revisionKind = "modifiedAndSize"
+                revisionValue = nil
+                revisionDate = modifiedAt
+                revisionByteSize = byteSize
+            case .unknown:
+                revisionKind = "unknown"
+                revisionValue = nil
+                revisionDate = nil
+                revisionByteSize = nil
+            }
+            capabilities = resource.capabilities.rawValue
+            accent = resource.accent.rawValue
+        }
+
+        func resource() -> ResourceItem? {
+            guard let identity = ResourceIdentity(identityKey: identityKey),
+                  let logicalPath = ResourcePath(rawValue: path),
+                  logicalPath.normalized == path,
+                  identity.logicalPath == path,
+                  let kind = ResourceKind(rawValue: kind),
+                  kind != .folder,
+                  !isDirectory,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let accent = ResourceAccent(rawValue: accent) else {
+                return nil
+            }
+
+            let revision: ResourceRevision
+            switch revisionKind {
+            case "etag":
+                if let revisionValue, !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    revision = .etag(revisionValue)
+                } else {
+                    revision = .unknown
+                }
+            case "serverVersion":
+                if let revisionValue, !revisionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    revision = .serverVersion(revisionValue)
+                } else {
+                    revision = .unknown
+                }
+            case "modifiedAndSize":
+                if let revisionDate, let revisionByteSize, revisionByteSize >= 0 {
+                    revision = .modifiedAndSize(modifiedAt: revisionDate, byteSize: revisionByteSize)
+                } else {
+                    revision = .unknown
+                }
+            default:
+                revision = .unknown
+            }
+
+            let metadata = ResourceMetadata(
+                byteSize: byteSize,
+                modifiedAt: modifiedAt,
+                mimeType: mimeType,
+                typeIdentifier: typeIdentifier,
+                isDirectory: false,
+                acceptsRanges: acceptsRanges,
+                revision: revision
+            )
+            return ResourceItem(
+                sourceID: identity.sourceID,
+                logicalPath: logicalPath,
+                name: name,
+                kind: kind,
+                metadata: metadata,
+                capabilities: ResourceCapability(rawValue: capabilities),
+                accent: accent
+            )
+        }
+    }
+
+    private let defaults: UserDefaults
+    private(set) var items: [ResourceItem]
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        guard let data = defaults.data(forKey: Self.storageKey),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.version == Self.currentVersion else {
+            self.items = []
+            return
+        }
+        self.items = payload.items.compactMap { $0.resource() }
+    }
+
+    func record(_ resource: ResourceItem) {
+        guard resource.kind != .folder,
+              !resource.metadata.isDirectory,
+              ResourcePath(rawValue: resource.path)?.normalized == resource.path else {
+            return
+        }
+        let identity = resource.id
+        items.removeAll { $0.id == identity }
+        items.insert(resource, at: 0)
+        if items.count > Self.maximumItemCount {
+            items.removeLast(items.count - Self.maximumItemCount)
+        }
+        persist()
+    }
+
+    func retain(sourceIDs: Set<UUID>) {
+        let retained = items.filter { sourceIDs.contains($0.sourceID) }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    private func persist() {
+        let payload = Payload(version: Self.currentVersion, items: items.map(StoredItem.init(resource:)))
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        defaults.set(data, forKey: Self.storageKey)
+    }
 }

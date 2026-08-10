@@ -234,6 +234,9 @@ struct ResourceViewerHost: View {
                 payload = .video(data)
             }
             try Task.checkCancellation()
+            if resolution.kind != .systemPreview {
+                appModel.recordRecent(resource: resource, metadata: metadata)
+            }
             result = .ready(request.identity, metadata, resolution, payload)
         } catch {
             result = state(for: error, identity: request.identity)

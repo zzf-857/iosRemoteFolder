@@ -693,6 +693,89 @@ struct ViewerResolutionTests {
     }
 }
 
+@Suite("最近资源记录")
+@MainActor
+struct RecentResourceStoreTests {
+    @Test("按稳定身份去重并在重启后恢复最新 metadata")
+    func persistsAndDeduplicates() {
+        let suiteName = "iosRemoteFolder.recent-resource-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let sourceID = UUID()
+        let path = ResourcePath(rawValue: "/notes/guide.txt")!
+        let first = ResourceItem(
+            sourceID: sourceID,
+            logicalPath: path,
+            name: "guide.txt",
+            kind: .text,
+            metadata: ResourceMetadata(byteSize: 10, mimeType: "text/plain"),
+            capabilities: [.read],
+            accent: .blue
+        )
+        let updated = ResourceItem(
+            sourceID: sourceID,
+            logicalPath: path,
+            name: "guide.txt",
+            kind: .text,
+            metadata: ResourceMetadata(byteSize: 99, mimeType: "text/plain"),
+            capabilities: [.read],
+            accent: .blue
+        )
+
+        let store = RecentResourceStore(defaults: defaults)
+        store.record(first)
+        store.record(updated)
+
+        #expect(store.items.count == 1)
+        #expect(store.items.first?.id == first.id)
+        #expect(store.items.first?.metadata.byteSize == 99)
+
+        let restored = RecentResourceStore(defaults: defaults)
+        #expect(restored.items.count == 1)
+        #expect(restored.items.first?.id == first.id)
+        #expect(restored.items.first?.metadata.byteSize == 99)
+        let payloadText = String(
+            data: defaults.data(forKey: "recentResources.v1")!,
+            encoding: .utf8
+        )!
+        #expect(!payloadText.contains("http://"))
+        #expect(!payloadText.contains("headers"))
+    }
+
+    @Test("限制数量并在来源移除后过滤记录")
+    func limitsAndPrunesBySource() {
+        let suiteName = "iosRemoteFolder.recent-resource-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let sourceID = UUID()
+        let store = RecentResourceStore(defaults: defaults)
+        for index in 0..<21 {
+            let path = ResourcePath(rawValue: "/recent-\(index).txt")!
+            store.record(
+                ResourceItem(
+                    sourceID: sourceID,
+                    logicalPath: path,
+                    name: "recent-\(index).txt",
+                    kind: .text,
+                    metadata: ResourceMetadata(byteSize: Int64(index)),
+                    capabilities: [.read],
+                    accent: .blue
+                )
+            )
+        }
+
+        #expect(store.items.count == 20)
+        #expect(store.items.first?.path == "/recent-20.txt")
+        #expect(store.items.last?.path == "/recent-1.txt")
+
+        store.retain(sourceIDs: [UUID()])
+        #expect(store.items.isEmpty)
+        #expect(RecentResourceStore(defaults: defaults).items.isEmpty)
+    }
+}
+
 @Suite("演示来源文档内容")
 struct SampleSourceContentTests {
     @Test("演示来源经内容会话返回真实 Markdown 与 PDF 字节")

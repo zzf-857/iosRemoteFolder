@@ -9,8 +9,8 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     HomeHeader()
-                    ContinueSection(resources: Array(appModel.resources.prefix(3)))
-                    RecentSection(resources: appModel.resources)
+                    ContinueSection(resources: Array(appModel.homeResources.prefix(3)))
+                    RecentSection(resources: appModel.homeResources)
                     SourceAttentionSection(sources: appModel.sources)
                 }
                 .padding(.horizontal)
