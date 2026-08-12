@@ -213,6 +213,29 @@ final class SourcesStore {
         connect(sourceID, initialPath: targetPath)
     }
 
+    /// 弱网/断网恢复入口：自动重连所有因瞬时网络失败进入 failed 的来源。
+    ///
+    /// 认证、权限、协议违约等需要用户行动或提示确定性问题的失败不自动重连，
+    /// 避免用错误凭证反复打服务器或掩盖真实问题。
+    func reconnectFailedSources() {
+        for entry in entries where entry.hasAdapter {
+            guard case .failed(let error) = entry.state,
+                  Self.isRecoverableConnectionFailure(error) else { continue }
+            retry(entry.id)
+        }
+    }
+
+    private static func isRecoverableConnectionFailure(_ error: ResourceSourceError) -> Bool {
+        switch error {
+        case .timedOut, .networkUnavailable, .unavailable:
+            return true
+        case .httpStatus(let code):
+            return code >= 500
+        default:
+            return false
+        }
+    }
+
     /// 若来源处于可连接状态则发起连接（用于来源被选中时按需连接）。
     func ensureConnected(_ sourceID: UUID) {
         guard let entry = entry(for: sourceID), entry.state.canConnect else { return }

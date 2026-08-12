@@ -312,13 +312,57 @@ struct SourcesStoreTests {
         #expect(stub.listPaths == [targetPath])
     }
 
+    @Test("前台恢复只自动重连瞬时失败的来源")
+    func reconnectFailedSourcesRetriesOnlyTransientFailures() async throws {
+        let transientSource = makeSource(kind: .webdav)
+        let authSource = makeSource(kind: .webdav)
+        let transientStub = StubSourceAdapter(
+            source: transientSource,
+            items: [sampleItem(transientSource.id)]
+        )
+        transientStub.setFailure(.networkUnavailable)
+        transientStub.release()
+        let authStub = StubSourceAdapter(source: authSource)
+        authStub.setFailure(.authenticationRequired)
+        authStub.release()
+        // 关闭 registry 自动重试，隔离验证前台恢复入口自身的筛选逻辑。
+        let store = try makeStore(
+            sources: [transientSource, authSource],
+            adapters: [transientStub, authStub],
+            transientRetryDelays: []
+        )
+
+        store.connect(transientSource.id)
+        store.connect(authSource.id)
+        try await waitUntil {
+            entry(of: transientSource, in: store)?.state == .failed(.networkUnavailable)
+                && entry(of: authSource, in: store)?.state == .failed(.authenticationRequired)
+        }
+
+        transientStub.setFailure(nil)
+        authStub.setFailure(nil)
+        let authCallsBefore = authStub.calls
+        store.reconnectFailedSources()
+        try await waitUntil {
+            entry(of: transientSource, in: store)?.state == .ready
+        }
+        // 认证失败需要用户行动，不允许被前台恢复自动重连。
+        #expect(entry(of: authSource, in: store)?.state == .failed(.authenticationRequired))
+        #expect(authStub.calls == authCallsBefore)
+    }
+
     // MARK: - Helpers
 
     private func makeStore(
         sources: [ResourceSource],
-        adapters: [any ResourceSourceAdapter]
+        adapters: [any ResourceSourceAdapter],
+        transientRetryDelays: [Duration] = SourceRegistry.defaultTransientRetryDelays
     ) throws -> SourcesStore {
-        let registry = try SourceRegistry(sources: sources, adapters: adapters)
+        let registry = try SourceRegistry(
+            sources: sources,
+            adapters: adapters,
+            transientRetryDelays: transientRetryDelays
+        )
         return SourcesStore(registry: registry)
     }
 
@@ -701,6 +745,218 @@ func waitUntil(timeout: Duration = .seconds(3), _ condition: @MainActor () -> Bo
         try await Task.sleep(for: .milliseconds(10))
     }
     Issue.record("等待条件超时")
+}
+
+/// 瞬时失败桩：所有操作共享一个尝试计数，先失败指定次数再成功。
+private final class FlakyStubAdapter: ResourceSourceAdapter, @unchecked Sendable {
+    let source: ResourceSource
+
+    private let lock = NSLock()
+    private let failure: ResourceSourceError
+    private var remainingFailures: Int
+    private var attemptCount = 0
+    private let content = Data("flaky".utf8)
+
+    init(
+        source: ResourceSource,
+        failuresBeforeSuccess: Int,
+        failure: ResourceSourceError
+    ) {
+        self.source = source
+        self.remainingFailures = failuresBeforeSuccess
+        self.failure = failure
+    }
+
+    var attempts: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return attemptCount
+    }
+
+    func connect() async throws {
+        try gate()
+    }
+
+    func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
+        try gate()
+        return []
+    }
+
+    func reference(for item: ResourceItem) async throws -> ResourceReference {
+        throw ResourceSourceError.capabilityUnavailable
+    }
+
+    func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
+        try gate()
+        return ResourceMetadata(byteSize: Int64(content.count))
+    }
+
+    func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
+        try gate()
+        guard range == nil else { throw ResourceSourceError.capabilityUnavailable }
+        return content
+    }
+
+    private func gate() throws {
+        lock.lock()
+        attemptCount += 1
+        let shouldFail = remainingFailures > 0
+        if shouldFail { remainingFailures -= 1 }
+        lock.unlock()
+        if shouldFail { throw failure }
+    }
+}
+
+@Suite("来源瞬时错误自动重试")
+struct SourceTransientRetryTests {
+    @Test("远端来源瞬时失败按退避重试后成功")
+    func remoteTransientFailureRetriesUntilSuccess() async throws {
+        let source = makeSource(kind: .webdav)
+        let adapter = FlakyStubAdapter(
+            source: source,
+            failuresBeforeSuccess: 2,
+            failure: .networkUnavailable
+        )
+        let registry = try SourceRegistry(
+            sources: [source],
+            adapters: [adapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        try await registry.connect(sourceID: source.id)
+        #expect(adapter.attempts == 3)
+    }
+
+    @Test("读取路径的瞬时失败同样自动重试")
+    func readDataRetriesTransientFailure() async throws {
+        let source = makeSource(kind: .alist)
+        let adapter = FlakyStubAdapter(
+            source: source,
+            failuresBeforeSuccess: 1,
+            failure: .timedOut
+        )
+        let registry = try SourceRegistry(
+            sources: [source],
+            adapters: [adapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        let data = try await registry.readData(
+            sourceID: source.id,
+            for: makeItem(sourceID: source.id),
+            range: nil
+        )
+        #expect(data == Data("flaky".utf8))
+        #expect(adapter.attempts == 2)
+    }
+
+    @Test("确定性失败不自动重试")
+    func deterministicFailureDoesNotRetry() async throws {
+        let authSource = makeSource(kind: .webdav)
+        let authAdapter = FlakyStubAdapter(
+            source: authSource,
+            failuresBeforeSuccess: 1,
+            failure: .authenticationRequired
+        )
+        let authRegistry = try SourceRegistry(
+            sources: [authSource],
+            adapters: [authAdapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        await #expect(throws: ResourceSourceError.authenticationRequired) {
+            try await authRegistry.connect(sourceID: authSource.id)
+        }
+        #expect(authAdapter.attempts == 1)
+
+        // 协议违约意味着数据完整性问题，自动重试只会掩盖真实原因。
+        let invalidSource = makeSource(kind: .webdav)
+        let invalidAdapter = FlakyStubAdapter(
+            source: invalidSource,
+            failuresBeforeSuccess: 1,
+            failure: .invalidResponse
+        )
+        let invalidRegistry = try SourceRegistry(
+            sources: [invalidSource],
+            adapters: [invalidAdapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await invalidRegistry.readData(
+                sourceID: invalidSource.id,
+                for: makeItem(sourceID: invalidSource.id),
+                range: nil
+            )
+        }
+        #expect(invalidAdapter.attempts == 1)
+    }
+
+    @Test("本地来源不参与自动重试")
+    func localSourceFailsWithoutRetry() async throws {
+        let source = makeSource(kind: .local)
+        let adapter = FlakyStubAdapter(
+            source: source,
+            failuresBeforeSuccess: 1,
+            failure: .networkUnavailable
+        )
+        let registry = try SourceRegistry(
+            sources: [source],
+            adapters: [adapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        await #expect(throws: ResourceSourceError.networkUnavailable) {
+            try await registry.connect(sourceID: source.id)
+        }
+        #expect(adapter.attempts == 1)
+    }
+
+    @Test("退避等待期间取消映射为 cancelled 且不再尝试")
+    func cancellationDuringBackoffStopsRetrying() async throws {
+        let source = makeSource(kind: .webdav)
+        let adapter = FlakyStubAdapter(
+            source: source,
+            failuresBeforeSuccess: 10,
+            failure: .networkUnavailable
+        )
+        let registry = try SourceRegistry(
+            sources: [source],
+            adapters: [adapter],
+            transientRetryDelays: [.seconds(5)]
+        )
+        let task = Task {
+            try await registry.connect(sourceID: source.id)
+        }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while adapter.attempts == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(adapter.attempts == 1)
+        task.cancel()
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await task.value
+        }
+        #expect(adapter.attempts == 1)
+    }
+
+    private func makeSource(kind: ResourceSource.SourceKind) -> ResourceSource {
+        ResourceSource(
+            id: UUID(),
+            name: "重试测试来源",
+            kind: kind,
+            endpoint: "https://retry.test/dav/",
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+    }
+
+    private func makeItem(sourceID: UUID) -> ResourceItem {
+        ResourceItem(
+            sourceID: sourceID,
+            logicalPath: ResourcePath(rawValue: "/flaky.txt")!,
+            name: "flaky.txt",
+            kind: .text,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
+            accent: .blue
+        )
+    }
 }
 
 /// 内容会话专用桩：可观察 metadata/read 次数，并可在读取前挂起以验证取消。

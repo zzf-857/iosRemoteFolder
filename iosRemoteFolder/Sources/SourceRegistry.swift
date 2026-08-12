@@ -39,6 +39,13 @@ enum SourceRegistryError: LocalizedError, Hashable, Sendable {
 /// UI、SourcesStore 和内容会话只通过下列窄接口访问来源；adapter、factory、
 /// ResourceReference、URLSession、FileManager 和请求头都不会越过 registry 边界。
 actor SourceRegistry {
+    /// 远端来源瞬时失败的默认自动重试间隔（指数退避），共两次重试。
+    /// 只覆盖幂等只读操作（探测、列举、元数据、读取），本地来源不参与。
+    static let defaultTransientRetryDelays: [Duration] = [
+        .milliseconds(500),
+        .milliseconds(1500)
+    ]
+
     /// 初始快照只用于同步构造 `SourcesStore`；动态变更必须通过 actor 的
     /// `currentSnapshots()` 读取，避免把可变 adapter 映射泄漏出 registry。
     nonisolated let initialSnapshots: [SourceRegistrySnapshot]
@@ -46,11 +53,14 @@ actor SourceRegistry {
     private var sources: [UUID: ResourceSource]
     private var adapters: [UUID: any ResourceSourceAdapter]
     private var adapterRevisions: [UUID: UUID]
+    private let transientRetryDelays: [Duration]
 
     init(
         sources: [ResourceSource],
-        adapters: [any ResourceSourceAdapter]
+        adapters: [any ResourceSourceAdapter],
+        transientRetryDelays: [Duration] = SourceRegistry.defaultTransientRetryDelays
     ) throws {
+        self.transientRetryDelays = transientRetryDelays
         var sourceIDs = Set<UUID>()
         var sourceMap: [UUID: ResourceSource] = [:]
         var sourceOrder: [UUID] = []
@@ -175,17 +185,23 @@ actor SourceRegistry {
 
     func connect(sourceID: UUID) async throws {
         let adapter = try adapter(for: sourceID)
-        try await adapter.connect()
+        try await withTransientRetry(sourceID: sourceID) {
+            try await adapter.connect()
+        }
     }
 
     func listResources(sourceID: UUID, at path: ResourcePath) async throws -> [ResourceItem] {
         let adapter = try adapter(for: sourceID)
-        return try await adapter.listResources(at: path)
+        return try await withTransientRetry(sourceID: sourceID) {
+            try await adapter.listResources(at: path)
+        }
     }
 
     func fetchMetadata(sourceID: UUID, for item: ResourceItem) async throws -> ResourceMetadata {
         let adapter = try adapter(for: sourceID)
-        return try await adapter.fetchMetadata(for: item)
+        return try await withTransientRetry(sourceID: sourceID) {
+            try await adapter.fetchMetadata(for: item)
+        }
     }
 
     func readData(
@@ -194,7 +210,9 @@ actor SourceRegistry {
         range: ResourceByteRange?
     ) async throws -> Data {
         let adapter = try adapter(for: sourceID)
-        return try await adapter.readData(for: item, range: range)
+        return try await withTransientRetry(sourceID: sourceID) {
+            try await adapter.readData(for: item, range: range)
+        }
     }
 
     private func adapter(for sourceID: UUID) throws -> any ResourceSourceAdapter {
@@ -202,5 +220,59 @@ actor SourceRegistry {
             throw ResourceSourceError.capabilityUnavailable
         }
         return adapter
+    }
+
+    /// 远端来源的幂等只读操作在明确瞬时失败时按退避序列自动重试。
+    ///
+    /// 协议违约（invalidResponse）、认证/权限、取消与预算类错误立即上抛，
+    /// 不进入重试；等待期间被取消时映射为 `cancelled`，不再发起下一次尝试。
+    private func withTransientRetry<T: Sendable>(
+        sourceID: UUID,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        let isRemote = sources[sourceID].map(Self.isRemoteKind) ?? false
+        guard isRemote, !transientRetryDelays.isEmpty else {
+            return try await operation()
+        }
+        var attempt = 0
+        while true {
+            do {
+                return try await operation()
+            } catch {
+                let mapped = ResourceSourceError.mapping(error)
+                guard attempt < transientRetryDelays.count,
+                      Self.isTransientFailure(mapped),
+                      !Task.isCancelled else {
+                    throw error
+                }
+                do {
+                    try await Task.sleep(for: transientRetryDelays[attempt])
+                } catch {
+                    throw ResourceSourceError.cancelled
+                }
+                attempt += 1
+            }
+        }
+    }
+
+    private static func isRemoteKind(_ source: ResourceSource) -> Bool {
+        switch source.kind {
+        case .alist, .webdav, .http, .lan:
+            return true
+        case .local:
+            return false
+        }
+    }
+
+    /// 只有明确的瞬时网络失败参与自动重试。
+    private static func isTransientFailure(_ error: ResourceSourceError) -> Bool {
+        switch error {
+        case .timedOut, .networkUnavailable, .unavailable:
+            return true
+        case .httpStatus(let code):
+            return code >= 500
+        default:
+            return false
+        }
     }
 }
