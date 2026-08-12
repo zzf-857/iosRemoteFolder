@@ -46,10 +46,16 @@ actor ResourceIndexStore {
             }
         }
 
-        let records = try fetchRecords()
-        let directoryRecords = records.filter {
-            $0.sourceID == sourceID && $0.parentPath == parentPath.normalized
-        }
+        // 谓词下推：只取该来源该目录的记录，写入范围与目录大小成正比，
+        // 不随索引总量线性增长。
+        let parent = parentPath.normalized
+        let directoryRecords = try fetchRecords(
+            FetchDescriptor<ResourceIndexRecord>(
+                predicate: #Predicate {
+                    $0.sourceID == sourceID && $0.parentPath == parent
+                }
+            )
+        )
         var existingByIdentity = Dictionary(
             uniqueKeysWithValues: directoryRecords.map { ($0.identityKey, $0) }
         )
@@ -78,6 +84,9 @@ actor ResourceIndexStore {
 
     /// Searches resource names and canonical logical paths. An empty query is
     /// deliberately not an all-items query, keeping the UI and fetch bounded.
+    ///
+    /// 匹配谓词下推到持久层，只解码命中的记录；无法解码的损坏记录在读取
+    /// 时确定性删除（自愈），不再被静默跳过。
     func search(
         _ query: String,
         kind: ResourceKind? = nil,
@@ -88,15 +97,36 @@ actor ResourceIndexStore {
         guard !term.isEmpty else { return [] }
         let boundedLimit = min(max(limit, 1), 500)
 
-        return try fetchRecords()
-            .lazy
-            .filter { sourceID == nil || $0.sourceID == sourceID }
-            .compactMap { $0.resourceItem }
-            .filter { item in
-                (kind == nil || item.kind == kind)
-                    && (item.name.localizedStandardContains(term)
-                        || item.path.localizedStandardContains(term))
+        let records = try fetchRecords(
+            FetchDescriptor<ResourceIndexRecord>(
+                predicate: Self.searchPredicate(
+                    term: term,
+                    kindRawValue: kind?.rawValue,
+                    sourceID: sourceID
+                )
+            )
+        )
+        var matched: [ResourceItem] = []
+        matched.reserveCapacity(records.count)
+        var corrupted: [ResourceIndexRecord] = []
+        for record in records {
+            if let item = record.resourceItem {
+                matched.append(item)
+            } else {
+                corrupted.append(record)
             }
+        }
+        if !corrupted.isEmpty {
+            // 读路径尽力自愈：删除失败回滚并保留结果，下次读取再试。
+            corrupted.forEach(modelContext.delete)
+            do {
+                try modelContext.save()
+            } catch {
+                modelContext.rollback()
+            }
+        }
+
+        return matched
             .sorted { lhs, rhs in
                 let lhsRank = Self.searchRank(lhs, term: term)
                 let rhsRank = Self.searchRank(rhs, term: term)
@@ -109,35 +139,84 @@ actor ResourceIndexStore {
             .map { $0 }
     }
 
+    /// 计数走持久层 `fetchCount`，不再全表解码；尚未自愈的损坏记录会被
+    /// 计入，但会在下一次搜索读取时被删除。
     func indexedResourceCount(sourceID: UUID? = nil) throws -> Int {
-        try fetchRecords().reduce(into: 0) { count, record in
-            guard (sourceID == nil || record.sourceID == sourceID),
-                  record.resourceItem != nil else {
-                return
-            }
-            count += 1
+        var descriptor = FetchDescriptor<ResourceIndexRecord>()
+        if let sourceID {
+            descriptor.predicate = #Predicate { $0.sourceID == sourceID }
+        }
+        do {
+            return try modelContext.fetchCount(descriptor)
+        } catch {
+            throw ResourceIndexError.persistenceFailed
         }
     }
 
     func remove(sourceID: UUID) throws {
-        let records = try fetchRecords().filter { $0.sourceID == sourceID }
+        let records = try fetchRecords(
+            FetchDescriptor<ResourceIndexRecord>(
+                predicate: #Predicate { $0.sourceID == sourceID }
+            )
+        )
         guard !records.isEmpty else { return }
         records.forEach(modelContext.delete)
         try saveOrRollback()
     }
 
     func retain(sourceIDs: Set<UUID>) throws {
-        let records = try fetchRecords().filter { !sourceIDs.contains($0.sourceID) }
+        // 谓词捕获数组以转换为持久层 IN 查询。
+        let allowedIDs = Array(sourceIDs)
+        let records = try fetchRecords(
+            FetchDescriptor<ResourceIndexRecord>(
+                predicate: #Predicate { !allowedIDs.contains($0.sourceID) }
+            )
+        )
         guard !records.isEmpty else { return }
         records.forEach(modelContext.delete)
         try saveOrRollback()
     }
 
-    private func fetchRecords() throws -> [ResourceIndexRecord] {
+    private func fetchRecords(
+        _ descriptor: FetchDescriptor<ResourceIndexRecord> = FetchDescriptor()
+    ) throws -> [ResourceIndexRecord] {
         do {
-            return try modelContext.fetch(FetchDescriptor<ResourceIndexRecord>())
+            return try modelContext.fetch(descriptor)
         } catch {
             throw ResourceIndexError.persistenceFailed
+        }
+    }
+
+    private static func searchPredicate(
+        term: String,
+        kindRawValue: String?,
+        sourceID: UUID?
+    ) -> Predicate<ResourceIndexRecord> {
+        switch (sourceID, kindRawValue) {
+        case (nil, nil):
+            return #Predicate {
+                $0.name.localizedStandardContains(term)
+                    || $0.logicalPath.localizedStandardContains(term)
+            }
+        case (let source?, nil):
+            return #Predicate {
+                ($0.name.localizedStandardContains(term)
+                    || $0.logicalPath.localizedStandardContains(term))
+                    && $0.sourceID == source
+            }
+        case (nil, let kindRaw?):
+            return #Predicate {
+                ($0.name.localizedStandardContains(term)
+                    || $0.logicalPath.localizedStandardContains(term))
+                    && $0.kindRawValue == kindRaw
+            }
+        case (let source?, let kindRaw?):
+            return #Predicate {
+                ($0.name.localizedStandardContains(term)
+                    || $0.logicalPath.localizedStandardContains(term))
+                    && $0.sourceID == source
+                    && $0.kindRawValue == kindRaw
+            }
         }
     }
 

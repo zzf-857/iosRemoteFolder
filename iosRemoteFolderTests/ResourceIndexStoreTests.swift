@@ -306,6 +306,51 @@ struct ResourceIndexStoreTests {
         #expect(migratedMatches == [item])
     }
 
+    @Test("损坏索引记录在搜索时自愈删除而不是静默跳过")
+    func corruptedRecordsAreHealedDuringSearch() async throws {
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let store = ResourceIndexStore(modelContainer: container)
+        let sourceID = UUID()
+        let documentsPath = try #require(ResourcePath(rawValue: "/资料"))
+        let valid = try makeItem(
+            sourceID: sourceID,
+            path: "/资料/manual.pdf",
+            kind: .pdf,
+            metadata: ResourceMetadata(byteSize: 128),
+            capabilities: [.read]
+        )
+        try await store.replaceDirectory(
+            sourceID: sourceID,
+            parentPath: documentsPath,
+            items: [valid]
+        )
+
+        // 直接向同一容器写入一条无法解码的记录（kind 非法），
+        // 名称保证被同一搜索词的谓词命中。
+        let broken = try makeItem(
+            sourceID: sourceID,
+            path: "/资料/manual-broken.txt",
+            kind: .text,
+            metadata: ResourceMetadata(byteSize: 64),
+            capabilities: [.read]
+        )
+        let context = ModelContext(container)
+        let corruptRecord = ResourceIndexRecord(
+            item: broken,
+            parentPath: documentsPath,
+            indexedAt: Date()
+        )
+        corruptRecord.kindRawValue = "bogus"
+        context.insert(corruptRecord)
+        try context.save()
+
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 2)
+        let results = try await store.search("manual", sourceID: sourceID)
+        #expect(results == [valid])
+        // 自愈：损坏记录已被删除，而不是留在库里被反复跳过。
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 1)
+    }
+
     private func makeItem(
         sourceID: UUID,
         path: String,

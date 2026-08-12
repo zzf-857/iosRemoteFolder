@@ -82,22 +82,34 @@ struct ResourceSearchView: View {
                     if let indexWarning = appModel.resourceIndexError {
                         Text("\(indexWarning)。返回浏览页刷新对应目录后会再次更新。")
                     } else if indexedResourceCount > 0 {
-                        Text("已索引 \(indexedResourceCount) 个资源")
+                        Text("搜索范围仅限你已浏览过的目录，当前已索引 \(indexedResourceCount) 个资源。")
+                    } else {
+                        Text("搜索只覆盖你浏览过的目录。先到浏览页打开来源目录，再回来搜索。")
                     }
                 }
             } else if isSearching {
                 ProgressView("正在搜索…")
             } else if results.isEmpty {
-                ContentUnavailableView.search(text: trimmedQuery)
+                ContentUnavailableView {
+                    Label("没有找到 “\(trimmedQuery)”", systemImage: "magnifyingglass")
+                } description: {
+                    Text("搜索范围仅限你已浏览过的目录；未浏览过的目录不会出现在结果中。")
+                }
             } else {
-                List(results) { resource in
-                    resultRow(for: resource)
+                List {
+                    Section {
+                        ForEach(results) { resource in
+                            resultRow(for: resource)
+                        }
+                    } footer: {
+                        Text("结果仅来自你已浏览过的目录。")
+                    }
                 }
             }
         }
         .navigationTitle("搜索")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $query, prompt: "名称或路径")
+        .searchable(text: $query, prompt: "搜索已浏览目录（名称或路径）")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 filterMenu
@@ -190,7 +202,10 @@ struct ResourceSearchView: View {
                 sourceID: selectedSourceID
             )
             try Task.checkCancellation()
-            results = matches
+            // 读取侧命名空间守卫：即使清理写入失败留下旧记录，已移除来源的
+            // 结果也不会出现在界面上。
+            let registeredIDs = Set(appModel.sources.map(\.id))
+            results = matches.filter { registeredIDs.contains($0.sourceID) }
             indexedResourceCount = try await appModel.resourceIndexStore.indexedResourceCount()
             isSearching = false
         } catch is CancellationError {
