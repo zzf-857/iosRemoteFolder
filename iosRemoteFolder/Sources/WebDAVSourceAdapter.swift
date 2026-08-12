@@ -699,17 +699,20 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
         }
 
         // Do not forward any source-defined header to a signed storage URL.
-        // Only the Range request line survives the rebuild. If-Range carries
-        // the DAV origin's validator, which an unrelated signed content host
-        // would treat as a mismatch and answer with a full 200, so it must
-        // not cross the origin boundary.
+        // Only pure transport semantics survive the rebuild: Range (fragment
+        // addressing) and Accept-Encoding (the strict length contract requires
+        // identity bodies). If-Range carries the DAV origin's validator, which
+        // an unrelated signed content host would treat as a mismatch and
+        // answer with a full 200, so it must not cross the origin boundary.
         let originalRequest = task.originalRequest
         var safeRequest = URLRequest(url: url)
         safeRequest.httpShouldHandleCookies = false
         safeRequest.httpMethod = expectedMethod
         safeRequest.timeoutInterval = request.timeoutInterval
-        if let value = originalRequest?.value(forHTTPHeaderField: "Range") {
-            safeRequest.setValue(value, forHTTPHeaderField: "Range")
+        for field in ["Range", "Accept-Encoding"] {
+            if let value = originalRequest?.value(forHTTPHeaderField: field) {
+                safeRequest.setValue(value, forHTTPHeaderField: field)
+            }
         }
         completionHandler(safeRequest)
     }

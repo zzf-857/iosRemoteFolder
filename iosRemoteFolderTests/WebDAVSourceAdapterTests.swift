@@ -689,6 +689,7 @@ struct WebDAVSourceAdapterTests {
         let originIfRange = TestBox<String?>(nil)
         let redirectedIfRange = TestBox<String?>("unset")
         let redirectedRange = TestBox<String?>(nil)
+        let redirectedEncoding = TestBox<String?>(nil)
         WebDAVMockURLProtocol.register(Self.endpoint) { _ in
             .respond(
                 status: 207,
@@ -703,6 +704,7 @@ struct WebDAVSourceAdapterTests {
         WebDAVMockURLProtocol.register(crossOriginTarget) { request in
             redirectedIfRange.value = request.value(forHTTPHeaderField: "If-Range")
             redirectedRange.value = request.value(forHTTPHeaderField: "Range")
+            redirectedEncoding.value = request.value(forHTTPHeaderField: "Accept-Encoding")
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
             return .respond(
                 status: 206,
@@ -740,6 +742,8 @@ struct WebDAVSourceAdapterTests {
         #expect(originIfRange.value == "\"dav-revision\"")
         #expect(redirectedIfRange.value == nil)
         #expect(redirectedRange.value == "bytes=0-1")
+        // Accept-Encoding 属于传输语义：identity 合同必须跨越 origin 边界。
+        #expect(redirectedEncoding.value == "identity")
     }
 
     @Test("redirect 拒绝只归属到触发它的请求记录器")

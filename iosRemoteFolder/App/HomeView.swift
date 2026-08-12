@@ -175,7 +175,15 @@ struct ResourceSearchView: View {
 
     private func refreshIndexedResourceCount() async {
         do {
-            indexedResourceCount = try await appModel.resourceIndexStore.indexedResourceCount()
+            // 与结果的来源过滤一致：只统计当前注册来源，已移除来源的
+            // 残留记录不计入"已索引 N 个资源"。
+            var total = 0
+            for source in appModel.sources {
+                total += try await appModel.resourceIndexStore.indexedResourceCount(
+                    sourceID: source.id
+                )
+            }
+            indexedResourceCount = total
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -206,7 +214,7 @@ struct ResourceSearchView: View {
             // 结果也不会出现在界面上。
             let registeredIDs = Set(appModel.sources.map(\.id))
             results = matches.filter { registeredIDs.contains($0.sourceID) }
-            indexedResourceCount = try await appModel.resourceIndexStore.indexedResourceCount()
+            await refreshIndexedResourceCount()
             isSearching = false
         } catch is CancellationError {
             return

@@ -911,6 +911,59 @@ struct HTTPSourceAdapterTests {
         #expect(data == Data("01".utf8))
     }
 
+    @Test("无引号 DAV ETag 与带引号响应 ETag 归一后视为同一对象")
+    func etagQuoteNormalizationAcrossRepresentations() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/10",
+                    "Content-Length": "2",
+                    "ETag": "\"v1\""
+                ],
+                body: Data("01".utf8)
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        // 部分 WebDAV 实现的 PROPFIND getetag 无引号，而 GET 响应头带引号；
+        // 两者是同一对象，比较必须做引号归一。
+        let snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(
+                byteSize: 10,
+                acceptsRanges: true,
+                revision: .etag("v1")
+            )
+        )
+        let data = try await adapter.readData(
+            for: snapshotItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        #expect(data == Data("01".utf8))
+
+        // 归一后 opaque 值不同仍然必须拒绝。
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/10",
+                    "Content-Length": "2",
+                    "ETag": "\"v2\""
+                ],
+                body: Data("01".utf8)
+            )
+        }
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(
+                for: snapshotItem,
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeAdapter(

@@ -1433,13 +1433,20 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         }
     }
 
-    /// 比较 ETag 的 opaque 值：忽略弱标记前缀与首尾空白。
+    /// 比较 ETag 的 opaque 值：忽略弱标记前缀、首尾空白与成对引号。
     /// opaque 值不同即证明对象已变化；弱匹配足以用于变更检测。
+    ///
+    /// 引号归一是必要的：部分 WebDAV 实现在 PROPFIND `getetag` 里给无引号
+    /// 值，而同一对象的 GET 响应头给带引号的 RFC 形式；两者指向同一对象，
+    /// 不得因表示差异误判为版本替换。
     private static func etagOpaqueValue(_ value: String) -> String {
         var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("W/") || trimmed.hasPrefix("w/") {
             trimmed = String(trimmed.dropFirst(2))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if trimmed.count >= 2, trimmed.hasPrefix("\""), trimmed.hasSuffix("\"") {
+            trimmed = String(trimmed.dropFirst().dropLast())
         }
         return trimmed
     }

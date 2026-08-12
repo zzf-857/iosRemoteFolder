@@ -225,12 +225,14 @@ final class SourcesStore {
         }
     }
 
+    /// 与 registry 的瞬时失败白名单保持一致：`.unavailable` 兜底桶与
+    /// 501/505 确定性失败不自动重连，避免对永远失败的来源反复打服务器。
     private static func isRecoverableConnectionFailure(_ error: ResourceSourceError) -> Bool {
         switch error {
-        case .timedOut, .networkUnavailable, .unavailable:
+        case .timedOut, .networkUnavailable:
             return true
         case .httpStatus(let code):
-            return code >= 500
+            return code >= 500 && code != 501 && code != 505
         default:
             return false
         }

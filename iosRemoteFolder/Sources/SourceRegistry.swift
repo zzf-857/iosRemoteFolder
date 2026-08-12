@@ -184,22 +184,19 @@ actor SourceRegistry {
     }
 
     func connect(sourceID: UUID) async throws {
-        let adapter = try adapter(for: sourceID)
-        try await withTransientRetry(sourceID: sourceID) {
+        try await withTransientRetry(sourceID: sourceID) { adapter in
             try await adapter.connect()
         }
     }
 
     func listResources(sourceID: UUID, at path: ResourcePath) async throws -> [ResourceItem] {
-        let adapter = try adapter(for: sourceID)
-        return try await withTransientRetry(sourceID: sourceID) {
+        try await withTransientRetry(sourceID: sourceID) { adapter in
             try await adapter.listResources(at: path)
         }
     }
 
     func fetchMetadata(sourceID: UUID, for item: ResourceItem) async throws -> ResourceMetadata {
-        let adapter = try adapter(for: sourceID)
-        return try await withTransientRetry(sourceID: sourceID) {
+        try await withTransientRetry(sourceID: sourceID) { adapter in
             try await adapter.fetchMetadata(for: item)
         }
     }
@@ -209,8 +206,7 @@ actor SourceRegistry {
         for item: ResourceItem,
         range: ResourceByteRange?
     ) async throws -> Data {
-        let adapter = try adapter(for: sourceID)
-        return try await withTransientRetry(sourceID: sourceID) {
+        try await withTransientRetry(sourceID: sourceID) { adapter in
             try await adapter.readData(for: item, range: range)
         }
     }
@@ -225,24 +221,28 @@ actor SourceRegistry {
     /// 远端来源的幂等只读操作在明确瞬时失败时按退避序列自动重试。
     ///
     /// 协议违约（invalidResponse）、认证/权限、取消与预算类错误立即上抛，
-    /// 不进入重试；等待期间被取消时映射为 `cancelled`，不再发起下一次尝试。
+    /// 不进入重试；操作或等待期间被取消统一映射为 `cancelled`。每次尝试都
+    /// 重新解析 adapter：actor 在挂起点可重入，来源被替换后不得再用旧
+    /// adapter（及其旧凭证）发起重试。
     private func withTransientRetry<T: Sendable>(
         sourceID: UUID,
-        operation: @Sendable () async throws -> T
+        operation: @Sendable (any ResourceSourceAdapter) async throws -> T
     ) async throws -> T {
         let isRemote = sources[sourceID].map(Self.isRemoteKind) ?? false
         guard isRemote, !transientRetryDelays.isEmpty else {
-            return try await operation()
+            return try await operation(try adapter(for: sourceID))
         }
         var attempt = 0
         while true {
             do {
-                return try await operation()
+                return try await operation(try adapter(for: sourceID))
             } catch {
+                if Task.isCancelled {
+                    throw ResourceSourceError.cancelled
+                }
                 let mapped = ResourceSourceError.mapping(error)
                 guard attempt < transientRetryDelays.count,
-                      Self.isTransientFailure(mapped),
-                      !Task.isCancelled else {
+                      Self.isTransientFailure(mapped) else {
                     throw error
                 }
                 do {
@@ -265,12 +265,15 @@ actor SourceRegistry {
     }
 
     /// 只有明确的瞬时网络失败参与自动重试。
+    ///
+    /// `.unavailable` 是错误映射的兜底桶（含 TLS 证书不受信等确定性失败），
+    /// 不参与自动重试；501/505 属确定性服务端能力问题，同样排除。
     private static func isTransientFailure(_ error: ResourceSourceError) -> Bool {
         switch error {
-        case .timedOut, .networkUnavailable, .unavailable:
+        case .timedOut, .networkUnavailable:
             return true
         case .httpStatus(let code):
-            return code >= 500
+            return code >= 500 && code != 501 && code != 505
         default:
             return false
         }

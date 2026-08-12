@@ -1182,6 +1182,8 @@ private struct MediaPlaybackControls: View {
     /// 拖动中的目标位置：拖动期间只更新显示，松手后才执行一次精确 seek，
     /// 避免流式大文件在拖动过程中触发密集的随机读取。
     @State private var scrubbingTime: TimeInterval?
+    /// 是否处于连续拖动手势中（由 `onEditingChanged` 维护）。
+    @State private var isScrubbing = false
 
     private var displayedTime: TimeInterval {
         scrubbingTime ?? engine.currentTime
@@ -1194,10 +1196,20 @@ private struct MediaPlaybackControls: View {
             Slider(
                 value: Binding(
                     get: { displayedTime },
-                    set: { scrubbingTime = $0 }
+                    set: { value in
+                        if isScrubbing {
+                            scrubbingTime = value
+                        } else {
+                            // VoiceOver 可调节操作等离散调整不经过连续手势，
+                            // 保持即时提交语义，避免调整永不生效。
+                            engine.seek(to: value)
+                            onSeekCommitted?()
+                        }
+                    }
                 ),
                 in: 0...max(engine.duration, 0.001),
                 onEditingChanged: { isEditing in
+                    isScrubbing = isEditing
                     guard !isEditing, let target = scrubbingTime else { return }
                     scrubbingTime = nil
                     engine.seek(to: target)
@@ -1244,6 +1256,14 @@ private struct MediaPlaybackControls: View {
             .disabled(engine.playbackState.disablesControls)
             .labelStyle(.iconOnly)
             .accessibilityElement(children: .contain)
+        }
+        .onChange(of: engine.playbackState) { _, state in
+            // 手势中控件被禁用时 SwiftUI 不保证回调 onEditingChanged(false)，
+            // 显式清理拖动状态，避免时间显示永久停在悬挂的拖动值。
+            if state.disablesControls {
+                isScrubbing = false
+                scrubbingTime = nil
+            }
         }
     }
 

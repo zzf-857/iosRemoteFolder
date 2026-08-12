@@ -897,6 +897,40 @@ struct SourceTransientRetryTests {
             )
         }
         #expect(invalidAdapter.attempts == 1)
+
+        // unavailable 是映射兜底桶（含 TLS 证书不受信等确定性失败），不重试。
+        let fallbackSource = makeSource(kind: .http)
+        let fallbackAdapter = FlakyStubAdapter(
+            source: fallbackSource,
+            failuresBeforeSuccess: 1,
+            failure: .unavailable
+        )
+        let fallbackRegistry = try SourceRegistry(
+            sources: [fallbackSource],
+            adapters: [fallbackAdapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        await #expect(throws: ResourceSourceError.unavailable) {
+            try await fallbackRegistry.connect(sourceID: fallbackSource.id)
+        }
+        #expect(fallbackAdapter.attempts == 1)
+
+        // 501 Not Implemented 属确定性服务端能力问题，同样不重试。
+        let notImplementedSource = makeSource(kind: .webdav)
+        let notImplementedAdapter = FlakyStubAdapter(
+            source: notImplementedSource,
+            failuresBeforeSuccess: 1,
+            failure: .httpStatus(501)
+        )
+        let notImplementedRegistry = try SourceRegistry(
+            sources: [notImplementedSource],
+            adapters: [notImplementedAdapter],
+            transientRetryDelays: [.milliseconds(5), .milliseconds(5)]
+        )
+        await #expect(throws: ResourceSourceError.httpStatus(501)) {
+            try await notImplementedRegistry.connect(sourceID: notImplementedSource.id)
+        }
+        #expect(notImplementedAdapter.attempts == 1)
     }
 
     @Test("本地来源不参与自动重试")

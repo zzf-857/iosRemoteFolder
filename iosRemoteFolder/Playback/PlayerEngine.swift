@@ -525,10 +525,15 @@ private final class RemoteCommandTargetBag: @unchecked Sendable {
 
 @MainActor
 final class MediaNowPlayingController {
+    /// 当前持有全局 Now Playing 信息的控制器；注销时只有持有者才允许
+    /// 清空全局状态，防止视图交叠时后激活者被先注销者清场。
+    private static weak var activeOwner: MediaNowPlayingController?
+
     private weak var engine: AVMediaPlayerEngine?
     private let commandTargets = RemoteCommandTargetBag()
     private let sessionObservers = NotificationObserverBag()
     private var isActive = false
+    private var didActivateAudioSession = false
     private var title = ""
     private var isVideo = false
 
@@ -538,13 +543,14 @@ final class MediaNowPlayingController {
         self.title = title
         self.isVideo = isVideo
         isActive = true
+        Self.activeOwner = self
 
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(
+        // 只设置类别；会话激活推迟到真正开始播放，
+        // 打开查看器页面不打断其他 App 正在播放的音频。
+        try? AVAudioSession.sharedInstance().setCategory(
             .playback,
             mode: isVideo ? .moviePlayback : .default
         )
-        try? session.setActive(true)
 
         registerCommands()
         observeSessionNotifications()
@@ -554,7 +560,11 @@ final class MediaNowPlayingController {
     /// 播放状态或进度跳变后同步锁屏信息；系统按 rate 自行推进 elapsed，
     /// 因此只需要在状态变化和 seek 后调用，不需要按帧刷新。
     func refresh() {
-        guard isActive, let engine else { return }
+        guard isActive, let engine, Self.activeOwner === self else { return }
+        if engine.isPlaying, !didActivateAudioSession {
+            didActivateAudioSession = true
+            try? AVAudioSession.sharedInstance().setActive(true)
+        }
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: engine.currentTime,
@@ -575,11 +585,17 @@ final class MediaNowPlayingController {
         guard isActive else { return }
         isActive = false
         engine = nil
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        try? AVAudioSession.sharedInstance().setActive(
-            false,
-            options: [.notifyOthersOnDeactivation]
-        )
+        if Self.activeOwner === self {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            Self.activeOwner = nil
+        }
+        if didActivateAudioSession {
+            didActivateAudioSession = false
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
+        }
     }
 
     // MARK: - Remote commands
