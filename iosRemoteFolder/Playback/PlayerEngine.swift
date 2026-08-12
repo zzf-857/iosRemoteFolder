@@ -72,6 +72,10 @@ final class AVMediaPlayerEngine {
         case stopped
     }
 
+    /// 整个媒体准备流程（asset 属性加载 + item 就绪，含流式分片读取）的
+    /// 默认总时限。超时给出可重试的明确错误，而不是无限等待。
+    static let defaultPreparationTimeoutSeconds: TimeInterval = 120
+
     private(set) var playbackState: PlaybackState = .preparing
 
     @ObservationIgnored let player: AVPlayer
@@ -85,6 +89,8 @@ final class AVMediaPlayerEngine {
     @ObservationIgnored private var runtimeFailure: ResourceSourceError?
     @ObservationIgnored private var monitoringGeneration = UUID()
     @ObservationIgnored private var monitoringTask: Task<Void, Never>?
+    @ObservationIgnored private var preparationWatchdog: Task<Void, Never>?
+    @ObservationIgnored private var didHitPreparationDeadline = false
     @ObservationIgnored private let notificationObservers = NotificationObserverBag()
 
     convenience init(data: Data, metadata: ResourceMetadata, resourcePath: String) throws {
@@ -142,31 +148,60 @@ final class AVMediaPlayerEngine {
         playbackState == .playing
     }
 
-    func prepare(expectedMediaType: AVMediaType) async throws {
+    /// 统一 deadline 覆盖从 asset 属性加载到 item 就绪的完整准备流程；
+    /// 到期由 watchdog 取消 asset 加载并映射为 `.timedOut`，保留失败重试。
+    /// 调用方不传 deadline 时使用默认总时限。
+    func prepare(
+        expectedMediaType: AVMediaType,
+        deadline: ContinuousClock.Instant? = nil
+    ) async throws {
         playbackState = .preparing
+        let preparationDeadline = deadline
+            ?? ContinuousClock().now + .seconds(Self.defaultPreparationTimeoutSeconds)
+        startPreparationWatchdog(deadline: preparationDeadline)
+        defer {
+            preparationWatchdog?.cancel()
+            preparationWatchdog = nil
+        }
         do {
             try ensureActive()
+            try ensureWithinDeadline(preparationDeadline)
             let isPlayable = try await asset.load(.isPlayable)
             try ensureActive()
+            try ensureWithinDeadline(preparationDeadline)
             guard isPlayable else { throw ResourceSourceError.invalidResponse }
             let tracks = try await asset.load(.tracks)
             try ensureActive()
+            try ensureWithinDeadline(preparationDeadline)
             guard tracks.contains(where: { $0.mediaType == expectedMediaType }) else {
                 throw ResourceSourceError.invalidResponse
             }
             let duration = try await asset.load(.duration)
             try ensureActive()
+            try ensureWithinDeadline(preparationDeadline)
             guard duration.isNumeric, duration.seconds > 0 else {
                 throw ResourceSourceError.invalidResponse
             }
             preparedDuration = duration.seconds
-            try await waitUntilReadyToPlay()
+            try await waitUntilReadyToPlay(deadline: preparationDeadline)
             try ensureActive()
             isPrepared = true
             refreshPlaybackState()
         } catch {
+            // 调用方取消优先于 deadline；watchdog 取消 asset 加载产生的
+            // cancellation 不得伪装成用户取消。
+            if Task.isCancelled || isStopped {
+                stop()
+                throw ResourceSourceError.cancelled
+            }
+            if didHitPreparationDeadline
+                || ResourceSourceError.mapping(error) == .timedOut {
+                runtimeFailure = .timedOut
+                playbackState = .failed(.timedOut)
+                throw ResourceSourceError.timedOut
+            }
             let mapped = ResourceSourceError.mapping(error)
-            if mapped == .cancelled || Task.isCancelled || isStopped {
+            if mapped == .cancelled {
                 stop()
                 throw ResourceSourceError.cancelled
             }
@@ -220,6 +255,8 @@ final class AVMediaPlayerEngine {
         monitoringGeneration = UUID()
         monitoringTask?.cancel()
         monitoringTask = nil
+        preparationWatchdog?.cancel()
+        preparationWatchdog = nil
         removeNotificationObservers()
         asset.cancelLoading()
         resourceLoader.invalidate()
@@ -230,6 +267,7 @@ final class AVMediaPlayerEngine {
 
     deinit {
         monitoringTask?.cancel()
+        preparationWatchdog?.cancel()
         notificationObservers.removeAll()
         asset.cancelLoading()
         resourceLoader.invalidate()
@@ -241,14 +279,35 @@ final class AVMediaPlayerEngine {
         }
     }
 
-    private func waitUntilReadyToPlay() async throws {
+    private func ensureWithinDeadline(_ deadline: ContinuousClock.Instant) throws {
+        guard !didHitPreparationDeadline, ContinuousClock().now < deadline else {
+            throw ResourceSourceError.timedOut
+        }
+    }
+
+    /// Deadline watchdog：到期后取消 asset 加载，让挂起的 `load(...)` 与
+    /// 分片读取立即返回；`prepare` 的 catch 依据标志映射为 `.timedOut`。
+    private func startPreparationWatchdog(deadline: ContinuousClock.Instant) {
+        preparationWatchdog?.cancel()
+        didHitPreparationDeadline = false
+        preparationWatchdog = Task { @MainActor [weak self] in
+            try? await ContinuousClock().sleep(until: deadline)
+            guard !Task.isCancelled,
+                  let self,
+                  !self.isStopped,
+                  !self.isPrepared else { return }
+            self.didHitPreparationDeadline = true
+            self.asset.cancelLoading()
+        }
+    }
+
+    private func waitUntilReadyToPlay(deadline: ContinuousClock.Instant) async throws {
         guard let item = player.currentItem else {
             throw ResourceSourceError.invalidResponse
         }
         let clock = ContinuousClock()
-        let deadline = clock.now + .seconds(15)
 
-        while clock.now < deadline {
+        while clock.now < deadline, !didHitPreparationDeadline {
             try ensureActive()
             guard player.currentItem === item else {
                 throw ResourceSourceError.cancelled

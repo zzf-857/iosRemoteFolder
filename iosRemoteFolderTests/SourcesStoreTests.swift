@@ -972,6 +972,21 @@ struct ResourceAccessServiceTests {
         }
     }
 
+    @Test("完整读取交付前校验精确长度，截断正文违约")
+    func fullReadRejectsTruncatedBody() async throws {
+        let source = makeSource()
+        let shortAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: 10),
+            content: Data("hello".utf8)
+        )
+        let session = try await makeService(source: source, adapter: shortAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await session.readData(maximumBytes: 10)
+        }
+    }
+
     @Test("调用方取消会取消对应在途操作")
     func callerCancellationCancelsOperation() async throws {
         let source = makeSource()
@@ -1122,6 +1137,35 @@ struct SessionMediaPlayerTests {
         await #expect(throws: ResourceSourceError.cancelled) {
             _ = try await session.fetchMetadata()
         }
+    }
+
+    @Test("prepare 在统一 deadline 到期时映射为可重试的 timedOut 失败态")
+    func prepareFailsWithTimedOutAtExpiredDeadline() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.workSourceID }
+        )
+        let sampleItem = try #require(
+            SampleData.resources.first { $0.path == "/产品/路线图演示.wav" }
+        )
+        let bytes = try await SampleSourceAdapter(source: source).readData(for: sampleItem, range: nil)
+        let metadata = ResourceMetadata(
+            byteSize: Int64(bytes.count),
+            mimeType: "audio/wav",
+            typeIdentifier: "com.microsoft.waveform-audio"
+        )
+        let engine = try AVMediaPlayerEngine(
+            data: bytes,
+            metadata: metadata,
+            resourcePath: "/deadline.wav"
+        )
+        await #expect(throws: ResourceSourceError.timedOut) {
+            try await engine.prepare(
+                expectedMediaType: .audio,
+                deadline: ContinuousClock().now
+            )
+        }
+        #expect(engine.playbackState == .failed(.timedOut))
+        engine.stop()
     }
 
     @Test("视频通过有界 Range 会话完成准备并支持 seek")

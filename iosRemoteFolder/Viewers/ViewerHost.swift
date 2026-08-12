@@ -328,6 +328,8 @@ struct ResourceViewerHost: View {
         }
     }
 
+    /// 媒体准备（内容读取 + 引擎准备）共用一个统一 deadline，超时映射为
+    /// 可重试的 `.timedOut`，不再依赖各阶段自身的空闲超时兜底。
     @MainActor
     private func prepareMedia(
         from session: ResourceContentSession,
@@ -335,6 +337,8 @@ struct ResourceViewerHost: View {
         maximumBytes: Int64,
         expectedMediaType: AVMediaType
     ) async throws -> (engine: AVMediaPlayerEngine, ownsSession: Bool) {
+        let deadline = ContinuousClock().now
+            + .seconds(AVMediaPlayerEngine.defaultPreparationTimeoutSeconds)
         let shouldStream = mode == .online
             && metadata.acceptsRanges
             && (metadata.byteSize ?? 0) > maximumBytes
@@ -344,7 +348,11 @@ struct ResourceViewerHost: View {
                 metadata: metadata,
                 resourcePath: resource.path
             )
-            try await prepareEngine(engine, expectedMediaType: expectedMediaType)
+            try await prepareEngine(
+                engine,
+                expectedMediaType: expectedMediaType,
+                deadline: deadline
+            )
             return (engine, true)
         }
 
@@ -354,14 +362,19 @@ struct ResourceViewerHost: View {
                 from: session,
                 metadata: metadata,
                 maximumBytes: maximumBytes,
-                usePersistentCache: mode == .online
+                usePersistentCache: mode == .online,
+                deadline: deadline
             ) { data in
                 let candidate = try AVMediaPlayerEngine(
                     data: data,
                     metadata: metadata,
                     resourcePath: resource.path
                 )
-                try await prepareEngine(candidate, expectedMediaType: expectedMediaType)
+                try await prepareEngine(
+                    candidate,
+                    expectedMediaType: expectedMediaType,
+                    deadline: deadline
+                )
                 preparedDataEngine = candidate
             }
             guard let preparedDataEngine else {
@@ -377,11 +390,15 @@ struct ResourceViewerHost: View {
     @MainActor
     private func prepareEngine(
         _ engine: AVMediaPlayerEngine,
-        expectedMediaType: AVMediaType
+        expectedMediaType: AVMediaType,
+        deadline: ContinuousClock.Instant? = nil
     ) async throws {
         do {
             try await withTaskCancellationHandler {
-                try await engine.prepare(expectedMediaType: expectedMediaType)
+                try await engine.prepare(
+                    expectedMediaType: expectedMediaType,
+                    deadline: deadline
+                )
             } onCancel: {
                 Task { @MainActor in
                     engine.stop()
@@ -394,12 +411,37 @@ struct ResourceViewerHost: View {
         }
     }
 
+    /// 让一个可发送结果的异步操作受统一 deadline 约束；到期取消底层操作并
+    /// 抛出 `.timedOut`。deadline 为 nil 时保持原有无额外约束的行为。
+    private static func awaitWithDeadline<T: Sendable>(
+        _ deadline: ContinuousClock.Instant?,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let deadline else { return try await operation() }
+        return try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await ContinuousClock().sleep(until: deadline)
+                return nil
+            }
+            defer { group.cancelAll() }
+            while let outcome = try await group.next() {
+                guard let value = outcome else {
+                    throw ResourceSourceError.timedOut
+                }
+                return value
+            }
+            throw ResourceSourceError.cancelled
+        }
+    }
+
     @MainActor
     private func readContent(
         from session: ResourceContentSession,
         metadata: ResourceMetadata,
         maximumBytes: Int64,
         usePersistentCache: Bool,
+        deadline: ContinuousClock.Instant? = nil,
         validate: (Data) async throws -> Void
     ) async throws -> Data {
         let key = usePersistentCache
@@ -434,7 +476,9 @@ struct ResourceViewerHost: View {
             }
         }
 
-        let data = try await session.readData(maximumBytes: maximumBytes)
+        let data = try await Self.awaitWithDeadline(deadline) {
+            try await session.readData(maximumBytes: maximumBytes)
+        }
         try Task.checkCancellation()
         try await validate(data)
         try Task.checkCancellation()

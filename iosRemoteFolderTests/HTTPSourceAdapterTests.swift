@@ -703,6 +703,214 @@ struct HTTPSourceAdapterTests {
         #expect(observedAuth.value == "Bearer fixture-token")
     }
 
+    @Test("已知大小的完整读取执行有界下载与精确长度校验")
+    func boundedFullReadEnforcesExactLength() async throws {
+        MockURLProtocol.reset()
+        let body = Data("0123456789".utf8)
+        let observedEncoding = TestBox<String?>(nil)
+        MockURLProtocol.register(Self.fileURL) { request in
+            observedEncoding.value = request.value(forHTTPHeaderField: "Accept-Encoding")
+            return .respond(status: 200, headers: ["Content-Length": "10"], body: body)
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let snapshotItem = item(listedItem, metadata: ResourceMetadata(byteSize: 10))
+        let data = try await adapter.readData(for: snapshotItem, range: nil)
+        #expect(data == body)
+        #expect(observedEncoding.value == "identity")
+
+        // 短于声明大小的正文必须违约，不得把截断内容静默交给查看器。
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(status: 200, headers: [:], body: Data("01234567".utf8))
+        }
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(for: snapshotItem, range: nil)
+        }
+    }
+
+    @Test("完整读取超出声明大小时中止而不缓冲整个响应")
+    func boundedFullReadRejectsOversizedBody() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(status: 200, headers: [:], body: Data("0123456789".utf8))
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let snapshotItem = item(listedItem, metadata: ResourceMetadata(byteSize: 4))
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(for: snapshotItem, range: nil)
+        }
+    }
+
+    @Test("完整读取拒绝非 identity 内容编码")
+    func boundedFullReadRejectsNonIdentityEncoding() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 200,
+                headers: ["Content-Encoding": "x-compress", "Content-Length": "5"],
+                body: Data("01234".utf8)
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let snapshotItem = item(listedItem, metadata: ResourceMetadata(byteSize: 5))
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(for: snapshotItem, range: nil)
+        }
+    }
+
+    @Test("强 ETag 快照生成 If-Range，弱 ETag 不生成")
+    func strictRangeSendsIfRangeOnlyForStrongETag() async throws {
+        MockURLProtocol.reset()
+        let observedIfRange = TestBox<String?>("unset")
+        MockURLProtocol.register(Self.fileURL) { request in
+            observedIfRange.value = request.value(forHTTPHeaderField: "If-Range")
+            return .respond(
+                status: 206,
+                headers: ["Content-Range": "bytes 0-1/10", "Content-Length": "2"],
+                body: Data("01".utf8)
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let strongItem = item(
+            listedItem,
+            metadata: ResourceMetadata(
+                byteSize: 10,
+                acceptsRanges: true,
+                revision: .etag("\"v1\"")
+            )
+        )
+        _ = try await adapter.readData(
+            for: strongItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        #expect(observedIfRange.value == "\"v1\"")
+
+        observedIfRange.value = "unset"
+        let weakItem = item(
+            listedItem,
+            metadata: ResourceMetadata(
+                byteSize: 10,
+                acceptsRanges: true,
+                revision: .etag("W/\"v1\"")
+            )
+        )
+        _ = try await adapter.readData(
+            for: weakItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        #expect(observedIfRange.value == nil)
+    }
+
+    @Test("If-Range 收到 200 表示对象已变化且不清除 Range 能力")
+    func ifRange200PreservesVerifiedRangeCapability() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/10",
+                    "Content-Length": "2",
+                    "ETag": "\"v1\""
+                ],
+                body: Data("01".utf8)
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(
+                byteSize: 10,
+                acceptsRanges: true,
+                revision: .etag("\"v1\"")
+            )
+        )
+        _ = try await adapter.readData(
+            for: snapshotItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        guard case .remoteHTTP(let verified) = try await adapter.reference(for: listedItem) else {
+            Issue.record("预期 HTTP 引用")
+            return
+        }
+        #expect(verified.supportsRange)
+
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 200,
+                headers: ["Content-Length": "10"],
+                body: Data("0123456789".utf8)
+            )
+        }
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(
+                for: snapshotItem,
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+            )
+        }
+        guard case .remoteHTTP(let preserved) = try await adapter.reference(for: listedItem) else {
+            Issue.record("预期 HTTP 引用")
+            return
+        }
+        #expect(preserved.supportsRange)
+    }
+
+    @Test("同源 206 的 validator 与快照不一致时拒绝分片")
+    func strictRangeRejectsSameOriginValidatorMismatch() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/10",
+                    "Content-Length": "2",
+                    "ETag": "\"v2\""
+                ],
+                body: Data("01".utf8)
+            )
+        }
+        let adapter = makeAdapter(descriptors: [descriptor()])
+        let listedItem = try #require(try await adapter.listResources().first)
+        let snapshotItem = item(
+            listedItem,
+            metadata: ResourceMetadata(
+                byteSize: 10,
+                acceptsRanges: true,
+                revision: .etag("\"v1\"")
+            )
+        )
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            _ = try await adapter.readData(
+                for: snapshotItem,
+                range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+            )
+        }
+
+        // 弱 ETag 的 opaque 值一致时允许交付：弱比较足以检测对象替换。
+        MockURLProtocol.reset()
+        MockURLProtocol.register(Self.fileURL) { _ in
+            .respond(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/10",
+                    "Content-Length": "2",
+                    "ETag": "W/\"v1\""
+                ],
+                body: Data("01".utf8)
+            )
+        }
+        let data = try await adapter.readData(
+            for: snapshotItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        #expect(data == Data("01".utf8))
+    }
+
     // MARK: - Helpers
 
     private func makeAdapter(

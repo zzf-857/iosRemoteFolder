@@ -681,6 +681,121 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test("跨 origin 内容跳转保留 Range 但剥离 If-Range")
+    func crossOriginContentRedirectDropsIfRange() async throws {
+        let crossOriginTarget = URL(string: "https://cdn.test/object/file.txt?signature=short-lived")!
+        WebDAVMockURLProtocol.reset()
+        let originIfRange = TestBox<String?>(nil)
+        let redirectedIfRange = TestBox<String?>("unset")
+        let redirectedRange = TestBox<String?>(nil)
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .respond(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                body: Self.directoryResponse
+            )
+        }
+        WebDAVMockURLProtocol.register(Self.fileURL) { request in
+            originIfRange.value = request.value(forHTTPHeaderField: "If-Range")
+            return .redirect(status: 307, location: crossOriginTarget)
+        }
+        WebDAVMockURLProtocol.register(crossOriginTarget) { request in
+            redirectedIfRange.value = request.value(forHTTPHeaderField: "If-Range")
+            redirectedRange.value = request.value(forHTTPHeaderField: "Range")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
+            return .respond(
+                status: 206,
+                headers: ["Content-Range": "bytes 0-1/5", "Content-Length": "2"],
+                body: Data("ab".utf8)
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            username: "user",
+            password: "pass",
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        let listed = try #require(try await adapter.listResources(at: .root).first)
+        let snapshotItem = ResourceItem(
+            sourceID: listed.sourceID,
+            logicalPath: ResourcePath(rawValue: listed.path)!,
+            name: listed.name,
+            kind: listed.kind,
+            metadata: ResourceMetadata(
+                byteSize: 5,
+                acceptsRanges: true,
+                revision: .etag("\"dav-revision\"")
+            ),
+            capabilities: listed.capabilities.union(.rangeRead),
+            accent: listed.accent
+        )
+        let data = try await adapter.readData(
+            for: snapshotItem,
+            range: ResourceByteRange(lowerBound: 0, upperBound: 1)
+        )
+        #expect(data == Data("ab".utf8))
+        #expect(originIfRange.value == "\"dav-revision\"")
+        #expect(redirectedIfRange.value == nil)
+        #expect(redirectedRange.value == "bytes=0-1")
+    }
+
+    @Test("redirect 拒绝只归属到触发它的请求记录器")
+    func requestScopedRedirectAttributionStaysPerRequest() async throws {
+        final class RejectAllPolicy: NSObject,
+            URLSessionTaskDelegate,
+            HTTPRedirectFailureReporting,
+            @unchecked Sendable {
+            func consumeUnsafeRedirect() -> Bool { false }
+
+            func urlSession(
+                _ session: URLSession,
+                task: URLSessionTask,
+                willPerformHTTPRedirection response: HTTPURLResponse,
+                newRequest request: URLRequest,
+                completionHandler: @escaping @Sendable (URLRequest?) -> Void
+            ) {
+                completionHandler(nil)
+            }
+
+            func urlSession(
+                _ session: URLSession,
+                task: URLSessionTask,
+                didCompleteWithError error: (any Error)?
+            ) {}
+        }
+
+        let policy = RejectAllPolicy()
+        let reporterA = RequestScopedRedirectReporter(policy: policy)
+        let reporterB = RequestScopedRedirectReporter(policy: policy)
+        let session = URLSession(configuration: .ephemeral)
+        let url = URL(string: "https://origin.test/resource")!
+        let task = session.dataTask(with: url)
+        let response = try #require(HTTPURLResponse(
+            url: url,
+            statusCode: 302,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Location": "https://elsewhere.test/"]
+        ))
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            reporterA.urlSession(
+                session,
+                task: task,
+                willPerformHTTPRedirection: response,
+                newRequest: URLRequest(url: URL(string: "https://elsewhere.test/")!)
+            ) { decision in
+                #expect(decision == nil)
+                continuation.resume()
+            }
+        }
+        #expect(reporterA.consumeUnsafeRedirect())
+        #expect(!reporterA.consumeUnsafeRedirect())
+        #expect(!reporterB.consumeUnsafeRedirect())
+        task.cancel()
+    }
+
     private static let directoryResponse = Data(
         """
         <?xml version="1.0" encoding="utf-8"?>

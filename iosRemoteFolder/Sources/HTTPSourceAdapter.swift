@@ -23,6 +23,64 @@ protocol HTTPRedirectFailureReporting: AnyObject, Sendable {
     )
 }
 
+/// Scopes unsafe-redirect attribution to exactly one logical request.
+///
+/// The shared WebDAV redirect policy decides whether a redirect is allowed,
+/// but its decision must be attributed to the request that triggered it. A
+/// shared consumable flag lets concurrent requests steal each other's
+/// rejection, so every request wraps the policy in one of these reporters and
+/// consults only its own recorder after a failure.
+final class RequestScopedRedirectReporter: NSObject,
+    URLSessionTaskDelegate,
+    HTTPRedirectFailureReporting,
+    @unchecked Sendable {
+    private let policy: any HTTPRedirectFailureReporting
+    private let lock = NSLock()
+    private var sawRejection = false
+
+    init(policy: any HTTPRedirectFailureReporting) {
+        self.policy = policy
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        policy.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request
+        ) { [weak self] decision in
+            if decision == nil, let self {
+                self.lock.lock()
+                self.sawRejection = true
+                self.lock.unlock()
+            }
+            completionHandler(decision)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        policy.urlSession(session, task: task, didCompleteWithError: error)
+    }
+
+    func consumeUnsafeRedirect() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = sawRejection
+        sawRejection = false
+        return value
+    }
+}
+
 /// Per-task delegate for strict, snapshot-backed Range reads.
 ///
 /// `download(for:delegate:)` only guarantees task-level callbacks for its
@@ -44,16 +102,21 @@ private final class BoundedRangeTaskDelegate: NSObject,
     private let maximumBytes: Int64
     private let forwardingDelegate: (any HTTPRedirectFailureReporting)?
     private let validateResponse: @Sendable (HTTPURLResponse) -> ResourceSourceError?
+    /// `If-Range` 请求里 200 表示对象已变化而不是不支持 Range；此时失败
+    /// 不得清除已验证的 Range 能力。
+    private let treats200AsCapabilityLoss: Bool
     private let lock = NSLock()
     private var state = State()
 
     init(
         maximumBytes: Int64,
         forwardingDelegate: (any URLSessionTaskDelegate)?,
+        treats200AsCapabilityLoss: Bool = true,
         validateResponse: @escaping @Sendable (HTTPURLResponse) -> ResourceSourceError?
     ) {
         self.maximumBytes = maximumBytes
         self.forwardingDelegate = forwardingDelegate as? any HTTPRedirectFailureReporting
+        self.treats200AsCapabilityLoss = treats200AsCapabilityLoss
         self.validateResponse = validateResponse
     }
 
@@ -153,7 +216,8 @@ private final class BoundedRangeTaskDelegate: NSObject,
             state.responseWasChecked = true
             state.failure = validateResponse(response)
             if state.failure != nil,
-               response.statusCode == 200 {
+               response.statusCode == 200,
+               treats200AsCapabilityLoss {
                 state.invalidatesRangeCapability = true
             }
         }
@@ -442,7 +506,16 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         let descriptor = try descriptor(for: item)
         guard let range else {
-            // 完整读取保留既有行为与错误映射。
+            // 快照已声明完整大小时走有界下载：正文写入临时文件、超出预算即取消、
+            // 交付前执行精确长度校验，不再无界缓冲整个响应体。
+            if let expectedLength = item.metadata.byteSize, expectedLength >= 0 {
+                return try await readBoundedFullBody(
+                    descriptor: descriptor,
+                    expectedLength: expectedLength,
+                    snapshotRevision: item.metadata.revision
+                )
+            }
+            // 无已知大小的读取保留既有行为与错误映射。
             let (data, _) = try await performRequest(method: "GET", descriptor: descriptor, headers: [:])
             return data
         }
@@ -460,6 +533,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                 descriptor: descriptor,
                 range: range,
                 expectedTotalLength: expectedTotalLength,
+                snapshotRevision: item.metadata.revision,
                 key: key
             )
         }
@@ -615,10 +689,19 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     /// a temporary file, with the task delegate cancelling at the first
     /// documented progress update that proves a bad response or an oversized
     /// requested fragment.
+    ///
+    /// Object validator contract: when the session snapshot carries a strong
+    /// ETag, the request sends `If-Range` so an honoring origin answers a
+    /// changed object with 200 instead of fragments of a different version;
+    /// that 200 maps to `invalidResponse` without touching Range capability.
+    /// Same-origin 206 responses additionally have their ETag/Last-Modified
+    /// compared against the snapshot revision. Cross-origin signed content
+    /// hosts use unrelated validators, so the comparison stays same-origin.
     private func readStrictRange(
         descriptor: HTTPResourceDescriptor,
         range: ResourceByteRange,
         expectedTotalLength: Int64,
+        snapshotRevision: ResourceRevision,
         key: CapabilityKey
     ) async throws -> Data {
         guard let expectedLength = range.validatedLength,
@@ -627,9 +710,12 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             throw ResourceSourceError.invalidReference
         }
 
+        let ifRangeValue = Self.ifRangeValue(for: snapshotRevision)
+        let requestOrigin = descriptor.url
         let boundedDelegate = BoundedRangeTaskDelegate(
             maximumBytes: expectedLength,
-            forwardingDelegate: taskDelegate
+            forwardingDelegate: taskDelegate,
+            treats200AsCapabilityLoss: ifRangeValue == nil
         ) { response in
             if !(200..<300).contains(response.statusCode) {
                 return .http(statusCode: response.statusCode)
@@ -644,21 +730,32 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
                     expectedTotalLength: expectedTotalLength,
                     expectedLength: expectedLength
                 )
-                return nil
             } catch let error as ResourceSourceError {
                 return error
             } catch {
                 return .invalidResponse
             }
+            if Self.hasValidatorMismatch(
+                response: response,
+                snapshot: snapshotRevision,
+                requestOrigin: requestOrigin
+            ) {
+                return .invalidResponse
+            }
+            return nil
         }
         defer { boundedDelegate.stopObserving() }
+        var headers = [
+            "Range": range.httpHeaderValue,
+            "Accept-Encoding": "identity"
+        ]
+        if let ifRangeValue {
+            headers["If-Range"] = ifRangeValue
+        }
         let request = makeRequest(
             method: "GET",
             descriptor: descriptor,
-            headers: [
-                "Range": range.httpHeaderValue,
-                "Accept-Encoding": "identity"
-            ]
+            headers: headers
         )
 
         let temporaryURL: URL
@@ -695,7 +792,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             throw responseError(for: httpResponse)
         }
         guard httpResponse.statusCode == 206 else {
-            if httpResponse.statusCode == 200 {
+            if httpResponse.statusCode == 200, ifRangeValue == nil {
                 verifiedRangeCapability.set(false, for: key)
             }
             throw ResourceSourceError.invalidResponse
@@ -706,6 +803,13 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             expectedTotalLength: expectedTotalLength,
             expectedLength: expectedLength
         )
+        if Self.hasValidatorMismatch(
+            response: httpResponse,
+            snapshot: snapshotRevision,
+            requestOrigin: requestOrigin
+        ) {
+            throw ResourceSourceError.invalidResponse
+        }
         guard boundedDelegate.failure() == nil else {
             if boundedDelegate.invalidatesRangeCapability() {
                 verifiedRangeCapability.set(false, for: key)
@@ -728,6 +832,125 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
             throw ResourceSourceError.cancelled
         }
         verifiedRangeCapability.set(true, for: key)
+        return data
+    }
+
+    /// Bounded full-body path for reads whose session snapshot proves the
+    /// complete size. The body is streamed by URLSession into a temporary
+    /// file; the per-task delegate cancels as soon as the final response is
+    /// not a plain identity 200 or the transfer exceeds the declared size.
+    /// Delivery requires the exact snapshot length — a truncated or padded
+    /// body maps to `invalidResponse` instead of silently reaching viewers.
+    private func readBoundedFullBody(
+        descriptor: HTTPResourceDescriptor,
+        expectedLength: Int64,
+        snapshotRevision: ResourceRevision
+    ) async throws -> Data {
+        let requestOrigin = descriptor.url
+        let boundedDelegate = BoundedRangeTaskDelegate(
+            maximumBytes: expectedLength,
+            forwardingDelegate: taskDelegate
+        ) { response in
+            if !(200..<300).contains(response.statusCode) {
+                return .http(statusCode: response.statusCode)
+            }
+            // 完整读取只接受 200；206/204 等其他 2xx 都不是完整正文的合法应答。
+            guard response.statusCode == 200 else {
+                return .invalidResponse
+            }
+            if let contentEncoding = Self.headerValue("Content-Encoding", in: response),
+               contentEncoding.caseInsensitiveCompare("identity") != .orderedSame {
+                return .invalidResponse
+            }
+            if response.expectedContentLength >= 0,
+               response.expectedContentLength != expectedLength {
+                return .invalidResponse
+            }
+            if Self.hasValidatorMismatch(
+                response: response,
+                snapshot: snapshotRevision,
+                requestOrigin: requestOrigin
+            ) {
+                return .invalidResponse
+            }
+            return nil
+        }
+        defer { boundedDelegate.stopObserving() }
+        let request = makeRequest(
+            method: "GET",
+            descriptor: descriptor,
+            headers: ["Accept-Encoding": "identity"]
+        )
+
+        let temporaryURL: URL
+        let response: URLResponse
+        do {
+            (temporaryURL, response) = try await session.download(
+                for: request,
+                delegate: boundedDelegate
+            )
+        } catch {
+            if Task.isCancelled {
+                throw ResourceSourceError.cancelled
+            }
+            if boundedDelegate.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
+            if let failure = boundedDelegate.failure() {
+                throw failure
+            }
+            throw ResourceSourceError.mapping(error)
+        }
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        guard !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ResourceSourceError.unavailable
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw responseError(for: httpResponse)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw ResourceSourceError.invalidResponse
+        }
+        // 进度观察是提前中止的手段，不是唯一校验点：完成后的最终响应必须
+        // 重新通过同一套合同检查，避免快速完成的传输绕过响应头校验。
+        if let contentEncoding = Self.headerValue("Content-Encoding", in: httpResponse),
+           contentEncoding.caseInsensitiveCompare("identity") != .orderedSame {
+            throw ResourceSourceError.invalidResponse
+        }
+        if httpResponse.expectedContentLength >= 0,
+           httpResponse.expectedContentLength != expectedLength {
+            throw ResourceSourceError.invalidResponse
+        }
+        if Self.hasValidatorMismatch(
+            response: httpResponse,
+            snapshot: snapshotRevision,
+            requestOrigin: requestOrigin
+        ) {
+            throw ResourceSourceError.invalidResponse
+        }
+        guard boundedDelegate.failure() == nil else {
+            throw boundedDelegate.failure() ?? ResourceSourceError.invalidResponse
+        }
+
+        let data: Data
+        do {
+            data = try Self.readBoundedTemporaryFile(
+                at: temporaryURL,
+                expectedLength: expectedLength,
+                allowsEmpty: true
+            )
+        } catch let error as ResourceSourceError {
+            throw error
+        } catch {
+            throw ResourceSourceError.mapping(error)
+        }
+        guard !Task.isCancelled else {
+            throw ResourceSourceError.cancelled
+        }
         return data
     }
 
@@ -908,8 +1131,18 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     /// delayed or the temporary file changed unexpectedly.
     private static func readBoundedTemporaryFile(
         at url: URL,
-        expectedLength: Int64
+        expectedLength: Int64,
+        allowsEmpty: Bool = false
     ) throws -> Data {
+        if allowsEmpty, expectedLength == 0 {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let probe = try handle.read(upToCount: 1)
+            guard probe == nil || probe?.isEmpty == true else {
+                throw ResourceSourceError.invalidResponse
+            }
+            return Data()
+        }
         guard expectedLength > 0,
               expectedLength < Int64.max,
               let expectedCount = Int(exactly: expectedLength),
@@ -1156,6 +1389,69 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     private static func acceptsByteRanges(_ response: HTTPURLResponse) -> Bool {
         headerValue("Accept-Ranges", in: response)
             .map { $0.caseInsensitiveCompare("bytes") == .orderedSame } ?? false
+    }
+
+    /// `If-Range` 只允许强 validator：带引号且不含 `W/` 前缀的 ETag。
+    /// 弱 ETag 与 modified/size 证据不生成 `If-Range`，只参与响应侧比较。
+    private static func ifRangeValue(for revision: ResourceRevision) -> String? {
+        guard case .etag(let value) = revision else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2,
+              trimmed.hasPrefix("\""),
+              trimmed.hasSuffix("\"") else {
+            return nil
+        }
+        return trimmed
+    }
+
+    /// 同源响应携带与快照可比的 validator 时执行版本一致性比较。
+    ///
+    /// 返回 true 表示证据证明对象已被替换（同长度换版本也会被发现）。
+    /// 跨 origin 内容主机的 validator 与来源无关，因此跳过比较；缺失响应头
+    /// 视为无证据，不作为失败依据。
+    private static func hasValidatorMismatch(
+        response: HTTPURLResponse,
+        snapshot: ResourceRevision,
+        requestOrigin: URL
+    ) -> Bool {
+        guard let responseURL = response.url,
+              sameOrigin(responseURL, requestOrigin) else {
+            return false
+        }
+        switch snapshot {
+        case .etag(let expected):
+            guard let actual = headerValue("ETag", in: response) else { return false }
+            return etagOpaqueValue(expected) != etagOpaqueValue(actual)
+        case .modifiedAndSize(let expectedDate, _):
+            guard let actualText = headerValue("Last-Modified", in: response),
+                  let actualDate = parseHTTPDate(actualText) else {
+                return false
+            }
+            return actualDate != expectedDate
+        case .serverVersion, .unknown:
+            return false
+        }
+    }
+
+    /// 比较 ETag 的 opaque 值：忽略弱标记前缀与首尾空白。
+    /// opaque 值不同即证明对象已变化；弱匹配足以用于变更检测。
+    private static func etagOpaqueValue(_ value: String) -> String {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("W/") || trimmed.hasPrefix("w/") {
+            trimmed = String(trimmed.dropFirst(2))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+
+    private static func sameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.scheme?.lowercased() == rhs.scheme?.lowercased()
+            && lhs.host?.lowercased() == rhs.host?.lowercased()
+            && (lhs.port ?? defaultPort(for: lhs)) == (rhs.port ?? defaultPort(for: rhs))
+    }
+
+    private static func defaultPort(for url: URL) -> Int {
+        url.scheme?.lowercased() == "https" ? 443 : 80
     }
 
     /// 动态 Range 探测的统一证据规则，`connect()` 与 `fetchMetadata()` 共用。

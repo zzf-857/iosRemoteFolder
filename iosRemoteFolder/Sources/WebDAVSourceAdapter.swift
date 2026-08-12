@@ -146,11 +146,13 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
             url: resourceURL(for: path, isDirectory: false),
             headers: requestHeaders
         )
+        // 每个逻辑操作使用独立的 redirect 记录器，保证拒绝跳转的错误只
+        // 归属到触发它的请求，不被并发请求消费。
         let httpAdapter = HTTPSourceAdapter(
             source: source,
             descriptors: [descriptor],
             session: session,
-            taskDelegate: redirectDelegate,
+            taskDelegate: RequestScopedRedirectReporter(policy: redirectDelegate),
             timeout: timeout
         )
 
@@ -193,7 +195,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
             source: source,
             descriptors: [descriptor],
             session: session,
-            taskDelegate: redirectDelegate,
+            taskDelegate: RequestScopedRedirectReporter(policy: redirectDelegate),
             timeout: timeout
         )
         return try await httpAdapter.readData(for: item, range: range)
@@ -220,10 +222,11 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
         let data: Data
         let response: URLResponse
+        let redirectReporter = RequestScopedRedirectReporter(policy: redirectDelegate)
         do {
-            (data, response) = try await session.data(for: request, delegate: redirectDelegate)
+            (data, response) = try await session.data(for: request, delegate: redirectReporter)
         } catch {
-            if redirectDelegate.consumeUnsafeRedirect() {
+            if redirectReporter.consumeUnsafeRedirect() {
                 throw ResourceSourceError.unsafeRedirect
             }
             throw ResourceSourceError.mapping(error)
@@ -604,7 +607,6 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
     private let port: Int
     private let basePathComponents: [String]
     private let authorization: String?
-    private let rejection = OSAllocatedUnfairLock(initialState: 0)
     private let redirectStates = OSAllocatedUnfairLock(
         initialState: [Int: RedirectState]()
     )
@@ -697,17 +699,17 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
         }
 
         // Do not forward any source-defined header to a signed storage URL.
-        // Range and If-Range are transport semantics, so recover only those
-        // explicit values from the request that initiated the redirect.
+        // Only the Range request line survives the rebuild. If-Range carries
+        // the DAV origin's validator, which an unrelated signed content host
+        // would treat as a mismatch and answer with a full 200, so it must
+        // not cross the origin boundary.
         let originalRequest = task.originalRequest
         var safeRequest = URLRequest(url: url)
         safeRequest.httpShouldHandleCookies = false
         safeRequest.httpMethod = expectedMethod
         safeRequest.timeoutInterval = request.timeoutInterval
-        for field in ["Range", "If-Range"] {
-            if let value = originalRequest?.value(forHTTPHeaderField: field) {
-                safeRequest.setValue(value, forHTTPHeaderField: field)
-            }
+        if let value = originalRequest?.value(forHTTPHeaderField: "Range") {
+            safeRequest.setValue(value, forHTTPHeaderField: "Range")
         }
         completionHandler(safeRequest)
     }
@@ -722,19 +724,16 @@ private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate, HT
         }
     }
 
+    /// 拒绝归属由每个请求自己的 `RequestScopedRedirectReporter` 记录；
+    /// 共享策略不再保存可被并发请求错误消费的全局标志。
     func consumeUnsafeRedirect() -> Bool {
-        rejection.withLock {
-            guard $0 > 0 else { return false }
-            $0 -= 1
-            return true
-        }
+        false
     }
 
     private func reject(
         task: URLSessionTask,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        rejection.withLock { $0 += 1 }
         redirectStates.withLock { states in
             states[task.taskIdentifier] = nil
         }

@@ -206,7 +206,9 @@ actor ResourceContentSession {
             guard Int64(data.count) <= maximumBytes else {
                 throw ResourceSourceError.responseTooLarge
             }
-            if Int64(data.count) > byteSize {
+            // 已知长度的完整正文必须精确匹配快照大小：截断（短于声明）与
+            // 超长同样违约，不允许把不完整内容静默交给查看器或缓存。
+            guard Int64(data.count) == byteSize else {
                 throw ResourceSourceError.invalidResponse
             }
             return .data(data)
