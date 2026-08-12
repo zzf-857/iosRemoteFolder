@@ -704,6 +704,16 @@ struct SourceConfigurationMigrationTests {
             model.sources.first(where: { $0.id == sourceID })?.endpoint
                 == "http://127.0.0.1:49102/dav/"
         }
+        // 派生状态失效在描述同步之后异步执行；轮询失效链路的最后一步
+        // （索引清零），它完成即代表前序清理全部完成。
+        let cleanupDeadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < cleanupDeadline {
+            let count = try await model.resourceIndexStore.indexedResourceCount(
+                sourceID: sourceID
+            )
+            if count == 0 { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         #expect(!model.recentResources.contains { $0.id == resource.id })
         #expect(model.resumePosition(for: audio, metadata: metadata) == nil)
         #expect(model.readingPosition(for: resource, metadata: metadata) == nil)

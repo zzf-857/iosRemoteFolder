@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 import UniformTypeIdentifiers
@@ -796,6 +797,301 @@ struct WebDAVSourceAdapterTests {
         task.cancel()
     }
 
+    @Test(
+        "回环真实网络栈：Alist 形态大媒体经外跳完成流式播放、seek 与脱敏",
+        .timeLimit(.minutes(2))
+    )
+    @MainActor
+    func loopbackLargeMediaStreamsThroughRealNetworkStack() async throws {
+        let media = Self.makeLoopbackWAV(secondsOfAudio: 750)
+        let totalSize = media.count
+        #expect(totalSize > 8 * 1024 * 1024)
+
+        let signedAuthHeaders = TestBox<[String?]>([])
+        let signedIfRangeHeaders = TestBox<[String?]>([])
+        let signedCookieHeaders = TestBox<[String?]>([])
+        let signedRanges = TestBox<[ResourceByteRange]>([])
+        let requestLog = TestBox<[String]>([])
+
+        // 模拟 Alist 外部签名存储主机：不同端口即不同 origin。
+        let signedServer = try LoopbackHTTPServer { request in
+            requestLog.value.append("B \(request.method) \(request.target)")
+            guard request.method == "GET",
+                  request.target.hasPrefix("/signed/loopback-large.wav") else {
+                return .init(status: 404)
+            }
+            signedAuthHeaders.value.append(request.header("authorization"))
+            signedIfRangeHeaders.value.append(request.header("if-range"))
+            signedCookieHeaders.value.append(request.header("cookie"))
+            guard let range = Self.parseByteRange(
+                request.header("range"),
+                totalLength: totalSize
+            ) else {
+                return .init(status: 416)
+            }
+            signedRanges.value.append(range)
+            let slice = media.subdata(
+                in: Int(range.lowerBound)..<(Int(range.upperBound) + 1)
+            )
+            return .init(
+                status: 206,
+                headers: [
+                    "Content-Type": "audio/wav",
+                    "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound)/\(totalSize)",
+                    // 与 DAV etag 不同：证明跨 origin 响应不参与快照 validator 比较。
+                    "ETag": "\"signed-copy-v9\""
+                ],
+                body: slice
+            )
+        }
+        defer { signedServer.stop() }
+
+        let originIfRangeHeaders = TestBox<[String?]>([])
+        let signedLocation = "http://127.0.0.1:\(signedServer.port)/signed/loopback-large.wav?sig=fixture"
+        let davServer = try LoopbackHTTPServer { request in
+            requestLog.value.append("A \(request.method) \(request.target)")
+            switch (request.method, request.target) {
+            case ("PROPFIND", "/dav/"), ("PROPFIND", "/dav"):
+                return .init(
+                    status: 207,
+                    headers: ["Content-Type": "application/xml"],
+                    body: Self.loopbackDirectoryXML(size: totalSize)
+                )
+            // 适配器的 PROPFIND 统一使用目录形式 URL（带尾斜杠）。
+            case ("PROPFIND", "/dav/loopback-large.wav"),
+                 ("PROPFIND", "/dav/loopback-large.wav/"):
+                return .init(
+                    status: 207,
+                    headers: ["Content-Type": "application/xml"],
+                    body: Self.loopbackFileXML(size: totalSize)
+                )
+            case ("HEAD", "/dav/loopback-large.wav"):
+                // 与真实 Alist 一致：HEAD 报大小但不声明 Range。
+                return .init(
+                    status: 200,
+                    headers: [
+                        "Content-Type": "audio/wav",
+                        "Content-Length": "\(totalSize)"
+                    ]
+                )
+            case ("GET", "/dav/loopback-large.wav"):
+                originIfRangeHeaders.value.append(request.header("if-range"))
+                return .init(status: 302, headers: ["Location": signedLocation])
+            default:
+                return .init(status: 404)
+            }
+        }
+        defer { davServer.stop() }
+
+        let endpoint = try #require(URL(string: "http://127.0.0.1:\(davServer.port)/dav/"))
+        let source = ResourceSource(
+            id: UUID(),
+            name: "回环 Alist",
+            kind: .alist,
+            endpoint: endpoint.absoluteString,
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.timeoutIntervalForRequest = 10
+        let adapter = try WebDAVSourceAdapter(
+            source: source,
+            endpoint: endpoint,
+            username: "user",
+            password: "pass",
+            session: URLSession(configuration: sessionConfiguration)
+        )
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+
+        do {
+            try await runLoopbackPlaybackFlow(
+                adapter: adapter,
+                registry: registry,
+                totalSize: totalSize,
+                signedRanges: signedRanges,
+                signedAuthHeaders: signedAuthHeaders,
+                signedIfRangeHeaders: signedIfRangeHeaders,
+                signedCookieHeaders: signedCookieHeaders,
+                originIfRangeHeaders: originIfRangeHeaders
+            )
+        } catch {
+            Issue.record("回环流程失败：\(error)；请求轨迹：\(requestLog.value)")
+            throw error
+        }
+    }
+
+    @MainActor
+    private func runLoopbackPlaybackFlow(
+        adapter: WebDAVSourceAdapter,
+        registry: SourceRegistry,
+        totalSize: Int,
+        signedRanges: TestBox<[ResourceByteRange]>,
+        signedAuthHeaders: TestBox<[String?]>,
+        signedIfRangeHeaders: TestBox<[String?]>,
+        signedCookieHeaders: TestBox<[String?]>,
+        originIfRangeHeaders: TestBox<[String?]>
+    ) async throws {
+        let item = try #require(try await adapter.listResources(at: .root).first)
+        #expect(item.metadata.byteSize == Int64(totalSize))
+
+        let session = try await ResourceAccessService(registry: registry).makeSession(for: item)
+        let metadata = try await session.fetchMetadata()
+        #expect(metadata.acceptsRanges)
+        #expect(metadata.byteSize == Int64(totalSize))
+        #expect(metadata.revision == .etag("\"loopback-v1\""))
+
+        let engine = try AVMediaPlayerEngine(
+            session: session,
+            metadata: metadata,
+            resourcePath: item.path
+        )
+        try await engine.prepare(expectedMediaType: .audio)
+        #expect(engine.duration > 600)
+        #expect(engine.play())
+        try await Task.sleep(for: .milliseconds(300))
+        engine.seek(to: engine.duration * 0.85)
+        _ = engine.play()
+
+        let deadline = ContinuousClock.now + .seconds(20)
+        while ContinuousClock.now < deadline {
+            if signedRanges.value.contains(where: { $0.upperBound >= Int64(totalSize / 2) }) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        engine.pause()
+
+        let ranges = signedRanges.value
+        #expect(!ranges.isEmpty)
+        #expect(ranges.allSatisfy { ($0.validatedLength ?? .max) <= 4 * 1024 * 1024 })
+        #expect(ranges.contains { $0.upperBound >= Int64(totalSize / 2) })
+        // 脱敏：外部签名主机绝不接收来源凭证、Cookie 或 DAV validator。
+        #expect(signedAuthHeaders.value.allSatisfy { $0 == nil })
+        #expect(signedIfRangeHeaders.value.allSatisfy { $0 == nil })
+        #expect(signedCookieHeaders.value.allSatisfy { $0 == nil })
+        // 同源 origin 的分片请求携带快照强 ETag 的 If-Range。
+        #expect(originIfRangeHeaders.value.contains("\"loopback-v1\""))
+
+        engine.stop()
+        try await Task.sleep(for: .milliseconds(100))
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await session.fetchMetadata()
+        }
+    }
+
+    /// 以 1 秒 PCM 块拼接生成指定时长的标准 WAV，头部块大小与总长一致。
+    private static func makeLoopbackWAV(secondsOfAudio: Int) -> Data {
+        let sampleRate: UInt32 = 8_000
+        let channels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let blockAlign = UInt32(channels * bitsPerSample / 8)
+        let frameCount = UInt32(secondsOfAudio) * sampleRate
+        let dataSize = frameCount * blockAlign
+
+        var header = Data()
+        func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+            var littleEndianValue = value.littleEndian
+            withUnsafeBytes(of: &littleEndianValue) { data.append(contentsOf: $0) }
+        }
+        header.append(contentsOf: Data("RIFF".utf8))
+        appendLittleEndian(UInt32(36) + dataSize, to: &header)
+        header.append(contentsOf: Data("WAVE".utf8))
+        header.append(contentsOf: Data("fmt ".utf8))
+        appendLittleEndian(UInt32(16), to: &header)
+        appendLittleEndian(UInt16(1), to: &header)
+        appendLittleEndian(channels, to: &header)
+        appendLittleEndian(sampleRate, to: &header)
+        appendLittleEndian(sampleRate * blockAlign, to: &header)
+        appendLittleEndian(UInt16(blockAlign), to: &header)
+        appendLittleEndian(bitsPerSample, to: &header)
+        header.append(contentsOf: Data("data".utf8))
+        appendLittleEndian(dataSize, to: &header)
+
+        // 预生成 1 秒 400Hz 正弦块（周期整除采样率，块间无相位断裂），重复拼接。
+        var secondBlock = Data()
+        secondBlock.reserveCapacity(Int(sampleRate) * Int(blockAlign))
+        let amplitude = Double(Int16.max) * 0.2
+        for frame in 0..<Int(sampleRate) {
+            let phase = 2 * Double.pi * 400 * Double(frame) / Double(sampleRate)
+            appendLittleEndian(Int16(sin(phase) * amplitude), to: &secondBlock)
+        }
+
+        var wav = header
+        wav.reserveCapacity(header.count + Int(dataSize))
+        for _ in 0..<secondsOfAudio {
+            wav.append(secondBlock)
+        }
+        return wav
+    }
+
+    /// 解析 `bytes=a-b` 请求头；只接受显式双边界且落在总长内的区间。
+    private static func parseByteRange(
+        _ headerValue: String?,
+        totalLength: Int
+    ) -> ResourceByteRange? {
+        guard let headerValue,
+              headerValue.hasPrefix("bytes="),
+              let dashIndex = headerValue.dropFirst(6).firstIndex(of: "-") else {
+            return nil
+        }
+        let spec = headerValue.dropFirst(6)
+        guard let lower = Int64(spec[spec.startIndex..<dashIndex]),
+              let upper = Int64(spec[spec.index(after: dashIndex)...]),
+              lower >= 0,
+              upper >= lower,
+              upper < Int64(totalLength) else {
+            return nil
+        }
+        return ResourceByteRange(lowerBound: lower, upperBound: upper)
+    }
+
+    private static func loopbackDirectoryXML(size: Int) -> Data {
+        Data(
+            """
+            <?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/</d:href>
+                <d:propstat><d:prop>
+                  <d:displayname>dav</d:displayname>
+                  <d:resourcetype><d:collection/></d:resourcetype>
+                </d:prop></d:propstat>
+              </d:response>
+              <d:response>
+                <d:href>/dav/loopback-large.wav</d:href>
+                <d:propstat><d:prop>
+                  <d:displayname>loopback-large.wav</d:displayname>
+                  <d:resourcetype/>
+                  <d:getcontentlength>\(size)</d:getcontentlength>
+                  <d:getetag>"loopback-v1"</d:getetag>
+                  <d:getcontenttype>audio/wav</d:getcontenttype>
+                </d:prop></d:propstat>
+              </d:response>
+            </d:multistatus>
+            """.utf8
+        )
+    }
+
+    private static func loopbackFileXML(size: Int) -> Data {
+        Data(
+            """
+            <?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/loopback-large.wav</d:href>
+                <d:propstat><d:prop>
+                  <d:displayname>loopback-large.wav</d:displayname>
+                  <d:resourcetype/>
+                  <d:getcontentlength>\(size)</d:getcontentlength>
+                  <d:getetag>"loopback-v1"</d:getetag>
+                  <d:getcontenttype>audio/wav</d:getcontenttype>
+                </d:prop></d:propstat>
+              </d:response>
+            </d:multistatus>
+            """.utf8
+        )
+    }
+
     private static let directoryResponse = Data(
         """
         <?xml version="1.0" encoding="utf-8"?>
@@ -938,6 +1234,225 @@ struct WebDAVSourceAdapterTests {
         </d:multistatus>
         """.utf8
     )
+}
+
+/// 真实回环 TCP HTTP 服务器：线程每连接、keep-alive、可编程路由。
+///
+/// 只用于集成测试。与 `URLProtocol` 桩不同，请求经过真实的 URLSession
+/// 网络栈（连接复用、重定向、超时），能验证传输契约在真实 socket 上的行为。
+/// handler 在连接线程同步执行，必须自身线程安全。
+private final class LoopbackHTTPServer: @unchecked Sendable {
+    struct Request {
+        let method: String
+        /// 路径（含可选 query），未做百分号解码。
+        let target: String
+        /// 头字段名统一小写。
+        let headers: [String: String]
+        let body: Data
+
+        func header(_ name: String) -> String? {
+            headers[name.lowercased()]
+        }
+    }
+
+    struct Response {
+        var status: Int
+        var headers: [String: String]
+        var body: Data
+
+        init(status: Int, headers: [String: String] = [:], body: Data = Data()) {
+            self.status = status
+            self.headers = headers
+            self.body = body
+        }
+    }
+
+    typealias Handler = @Sendable (Request) -> Response
+
+    let port: UInt16
+    private let listenFD: Int32
+    private let handler: Handler
+    private let lock = NSLock()
+    private var isStopped = false
+
+    init(handler: @escaping Handler) throws {
+        self.handler = handler
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fd, 16) == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
+
+        var assigned = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &assigned) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        self.listenFD = fd
+        self.port = UInt16(bigEndian: assigned.sin_port)
+
+        let acceptThread = Thread { [weak self] in
+            self?.acceptLoop()
+        }
+        acceptThread.name = "LoopbackHTTPServer.accept"
+        acceptThread.start()
+    }
+
+    func stop() {
+        lock.lock()
+        let alreadyStopped = isStopped
+        isStopped = true
+        lock.unlock()
+        guard !alreadyStopped else { return }
+        // shutdown 会唤醒阻塞中的 accept；单独 close 在 Darwin 上不保证。
+        shutdown(listenFD, SHUT_RDWR)
+        close(listenFD)
+    }
+
+    deinit {
+        stop()
+    }
+
+    private var stopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isStopped
+    }
+
+    private func acceptLoop() {
+        while !stopped {
+            var clientAddress = sockaddr_in()
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let clientFD = withUnsafeMutablePointer(to: &clientAddress) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(listenFD, $0, &length)
+                }
+            }
+            guard clientFD >= 0 else {
+                if stopped { return }
+                continue
+            }
+            var timeout = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            var noSigpipe: Int32 = 1
+            setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+            let connectionThread = Thread { [weak self] in
+                self?.serve(clientFD)
+            }
+            connectionThread.name = "LoopbackHTTPServer.connection"
+            connectionThread.start()
+        }
+    }
+
+    private func serve(_ fd: Int32) {
+        defer { close(fd) }
+        var buffer = Data()
+        while !stopped {
+            guard let request = readRequest(fd, buffer: &buffer) else { return }
+            let response = handler(request)
+            guard write(response, method: request.method, to: fd) else { return }
+        }
+    }
+
+    private func readRequest(_ fd: Int32, buffer: inout Data) -> Request? {
+        let separator = Data("\r\n\r\n".utf8)
+        while buffer.range(of: separator) == nil {
+            guard receiveChunk(fd, into: &buffer) else { return nil }
+        }
+        guard let separatorRange = buffer.range(of: separator) else { return nil }
+        let headData = Data(buffer[buffer.startIndex..<separatorRange.lowerBound])
+        var remainder = Data(buffer[separatorRange.upperBound...])
+
+        guard let head = String(data: headData, encoding: .utf8) else { return nil }
+        var lines = head.components(separatedBy: "\r\n")
+        guard !lines.isEmpty else { return nil }
+        let requestLine = lines.removeFirst().split(separator: " ")
+        guard requestLine.count >= 3 else { return nil }
+        let method = String(requestLine[0]).uppercased()
+        let target = String(requestLine[1])
+        var headers: [String: String] = [:]
+        for line in lines {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            headers[name] = value
+        }
+
+        let contentLength = headers["content-length"].flatMap(Int.init) ?? 0
+        while remainder.count < contentLength {
+            guard receiveChunk(fd, into: &remainder) else { return nil }
+        }
+        let body = Data(remainder.prefix(contentLength))
+        buffer = Data(remainder.dropFirst(contentLength))
+        return Request(method: method, target: target, headers: headers, body: body)
+    }
+
+    private func receiveChunk(_ fd: Int32, into buffer: inout Data) -> Bool {
+        var chunk = [UInt8](repeating: 0, count: 16 * 1024)
+        let received = recv(fd, &chunk, chunk.count, 0)
+        guard received > 0 else { return false }
+        buffer.append(contentsOf: chunk[0..<received])
+        return true
+    }
+
+    private func write(_ response: Response, method: String, to fd: Int32) -> Bool {
+        var headers = response.headers
+        // HEAD 允许 handler 显式声明完整大小；其余响应由服务器按正文计算。
+        if headers["Content-Length"] == nil {
+            headers["Content-Length"] = String(response.body.count)
+        }
+        if headers["Connection"] == nil {
+            headers["Connection"] = "keep-alive"
+        }
+        var head = "HTTP/1.1 \(response.status) \(Self.reason(for: response.status))\r\n"
+        for (name, value) in headers {
+            head += "\(name): \(value)\r\n"
+        }
+        head += "\r\n"
+        var payload = Data(head.utf8)
+        if method != "HEAD" {
+            payload.append(response.body)
+        }
+        return payload.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return raw.isEmpty }
+            var offset = 0
+            while offset < raw.count {
+                let sent = send(fd, base.advanced(by: offset), raw.count - offset, 0)
+                guard sent > 0 else { return false }
+                offset += sent
+            }
+            return true
+        }
+    }
+
+    private static func reason(for status: Int) -> String {
+        switch status {
+        case 200: "OK"
+        case 206: "Partial Content"
+        case 207: "Multi-Status"
+        case 302: "Found"
+        case 404: "Not Found"
+        case 416: "Range Not Satisfiable"
+        default: "Status"
+        }
+    }
 }
 
 /// WebDAV tests use an isolated protocol because the existing HTTP fixture is
