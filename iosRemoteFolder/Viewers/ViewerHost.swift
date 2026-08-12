@@ -994,6 +994,7 @@ struct VideoPlayerView: View {
     let engine: AVMediaPlayerEngine
     let onRetry: () -> Void
     @State private var restoredPosition = false
+    @State private var nowPlaying = MediaNowPlayingController()
 
     init(
         resource: ResourceItem,
@@ -1018,7 +1019,10 @@ struct VideoPlayerView: View {
                         .allowsHitTesting(!engine.playbackState.disablesControls)
                         .accessibilityLabel(Text("\(resource.name)，视频播放器"))
 
-                    MediaPlaybackControls(engine: engine) {
+                    MediaPlaybackControls(
+                        engine: engine,
+                        onSeekCommitted: { nowPlaying.refresh() }
+                    ) {
                         savePosition(engine)
                         onRetry()
                     }
@@ -1029,10 +1033,15 @@ struct VideoPlayerView: View {
         }
         .onAppear {
             restorePositionIfNeeded(engine)
+            nowPlaying.activate(title: resource.name, engine: engine, isVideo: true)
         }
         .onDisappear {
             savePosition(engine)
             engine.stop()
+            nowPlaying.deactivate()
+        }
+        .onChange(of: engine.playbackState) { _, _ in
+            nowPlaying.refresh()
         }
     }
 
@@ -1078,6 +1087,7 @@ struct MusicPlayerView: View {
     let engine: AVMediaPlayerEngine
     let onRetry: () -> Void
     @State private var restoredPosition = false
+    @State private var nowPlaying = MediaNowPlayingController()
 
     init(
         resource: ResourceItem,
@@ -1107,7 +1117,10 @@ struct MusicPlayerView: View {
                     Text(resource.name)
                         .font(.title2.bold())
                         .multilineTextAlignment(.center)
-                    MediaPlaybackControls(engine: engine) {
+                    MediaPlaybackControls(
+                        engine: engine,
+                        onSeekCommitted: { nowPlaying.refresh() }
+                    ) {
                         savePosition(engine)
                         onRetry()
                     }
@@ -1118,10 +1131,15 @@ struct MusicPlayerView: View {
         }
         .onAppear {
             restorePositionIfNeeded(engine)
+            nowPlaying.activate(title: resource.name, engine: engine, isVideo: false)
         }
         .onDisappear {
             savePosition(engine)
             engine.stop()
+            nowPlaying.deactivate()
+        }
+        .onChange(of: engine.playbackState) { _, _ in
+            nowPlaying.refresh()
         }
     }
 
@@ -1158,7 +1176,16 @@ struct MusicPlayerView: View {
 @MainActor
 private struct MediaPlaybackControls: View {
     let engine: AVMediaPlayerEngine
+    var onSeekCommitted: (() -> Void)? = nil
     let onRetry: () -> Void
+
+    /// 拖动中的目标位置：拖动期间只更新显示，松手后才执行一次精确 seek，
+    /// 避免流式大文件在拖动过程中触发密集的随机读取。
+    @State private var scrubbingTime: TimeInterval?
+
+    private var displayedTime: TimeInterval {
+        scrubbingTime ?? engine.currentTime
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1166,19 +1193,25 @@ private struct MediaPlaybackControls: View {
 
             Slider(
                 value: Binding(
-                    get: { engine.currentTime },
-                    set: { engine.seek(to: $0) }
+                    get: { displayedTime },
+                    set: { scrubbingTime = $0 }
                 ),
-                in: 0...max(engine.duration, 0.001)
+                in: 0...max(engine.duration, 0.001),
+                onEditingChanged: { isEditing in
+                    guard !isEditing, let target = scrubbingTime else { return }
+                    scrubbingTime = nil
+                    engine.seek(to: target)
+                    onSeekCommitted?()
+                }
             )
             .disabled(engine.playbackState.disablesControls)
             .accessibilityLabel("播放进度")
             .accessibilityValue(
-                Text("\(Self.timeLabel(engine.currentTime)) / \(Self.timeLabel(engine.duration))")
+                Text("\(Self.timeLabel(displayedTime)) / \(Self.timeLabel(engine.duration))")
             )
 
             HStack {
-                Text(Self.timeLabel(engine.currentTime))
+                Text(Self.timeLabel(displayedTime))
                 Spacer()
                 Text(Self.timeLabel(engine.duration))
             }
@@ -1188,6 +1221,7 @@ private struct MediaPlaybackControls: View {
             HStack(spacing: 32) {
                 Button("后退 10 秒", systemImage: "gobackward.10") {
                     engine.seek(to: engine.currentTime - 10)
+                    onSeekCommitted?()
                 }
                 Button(
                     engine.playbackState.showsPauseControl ? "暂停" : "播放",
@@ -1204,6 +1238,7 @@ private struct MediaPlaybackControls: View {
                 .font(.largeTitle)
                 Button("前进 10 秒", systemImage: "goforward.10") {
                     engine.seek(to: engine.currentTime + 10)
+                    onSeekCommitted?()
                 }
             }
             .disabled(engine.playbackState.disablesControls)

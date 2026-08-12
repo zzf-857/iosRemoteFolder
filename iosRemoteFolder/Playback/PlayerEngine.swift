@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import MediaPlayer
 import Observation
 import UniformTypeIdentifiers
 
@@ -485,6 +486,214 @@ final class AVMediaPlayerEngine {
             throw ResourceSourceError.invalidReference
         }
         return url
+    }
+}
+
+/// 系统媒体集成：AVAudioSession 播放会话、Now Playing 信息与锁屏/耳机远程控制。
+///
+/// 只有真正呈现给用户的播放器视图才持有并激活本控制器；缓存校验、内容
+/// 探测等临时引擎不注册系统媒体状态。音频在后台继续播放（配合
+/// `UIBackgroundModes: audio`）；视频遵循系统默认的后台暂停行为，但同样
+/// 获得静音开关下有声与耳机线控。
+/// Owns remote command targets behind a lock so cleanup stays safe even from
+/// a nonisolated deinitializer; the normal path is an explicit `deactivate()`.
+private final class RemoteCommandTargetBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var targets: [(command: MPRemoteCommand, target: Any)] = []
+
+    func append(_ command: MPRemoteCommand, target: Any) {
+        lock.lock()
+        targets.append((command, target))
+        lock.unlock()
+    }
+
+    func removeAll() {
+        let removed: [(command: MPRemoteCommand, target: Any)]
+        lock.lock()
+        removed = targets
+        targets.removeAll()
+        lock.unlock()
+        for entry in removed {
+            entry.command.removeTarget(entry.target)
+        }
+    }
+
+    deinit {
+        removeAll()
+    }
+}
+
+@MainActor
+final class MediaNowPlayingController {
+    private weak var engine: AVMediaPlayerEngine?
+    private let commandTargets = RemoteCommandTargetBag()
+    private let sessionObservers = NotificationObserverBag()
+    private var isActive = false
+    private var title = ""
+    private var isVideo = false
+
+    func activate(title: String, engine: AVMediaPlayerEngine, isVideo: Bool) {
+        deactivate()
+        self.engine = engine
+        self.title = title
+        self.isVideo = isVideo
+        isActive = true
+
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(
+            .playback,
+            mode: isVideo ? .moviePlayback : .default
+        )
+        try? session.setActive(true)
+
+        registerCommands()
+        observeSessionNotifications()
+        refresh()
+    }
+
+    /// 播放状态或进度跳变后同步锁屏信息；系统按 rate 自行推进 elapsed，
+    /// 因此只需要在状态变化和 seek 后调用，不需要按帧刷新。
+    func refresh() {
+        guard isActive, let engine else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: title,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: engine.currentTime,
+            MPNowPlayingInfoPropertyPlaybackRate: engine.isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyMediaType: (isVideo
+                ? MPNowPlayingInfoMediaType.video
+                : MPNowPlayingInfoMediaType.audio).rawValue
+        ]
+        if engine.duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = engine.duration
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    func deactivate() {
+        commandTargets.removeAll()
+        sessionObservers.removeAll()
+        guard isActive else { return }
+        isActive = false
+        engine = nil
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: [.notifyOthersOnDeactivation]
+        )
+    }
+
+    // MARK: - Remote commands
+
+    private func registerCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        register(center.playCommand) { engine in
+            engine.play() ? .success : .commandFailed
+        }
+        register(center.pauseCommand) { engine in
+            engine.pause()
+            return .success
+        }
+        register(center.togglePlayPauseCommand) { engine in
+            if engine.isPlaying {
+                engine.pause()
+                return .success
+            }
+            return engine.play() ? .success : .commandFailed
+        }
+
+        center.skipForwardCommand.preferredIntervals = [10]
+        register(center.skipForwardCommand) { engine in
+            engine.seek(to: engine.currentTime + 10)
+            return .success
+        }
+        center.skipBackwardCommand.preferredIntervals = [10]
+        register(center.skipBackwardCommand) { engine in
+            engine.seek(to: engine.currentTime - 10)
+            return .success
+        }
+        register(center.changePlaybackPositionCommand) { engine, event in
+            guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            engine.seek(to: positionEvent.positionTime)
+            return .success
+        }
+    }
+
+    private func register(
+        _ command: MPRemoteCommand,
+        handler: @escaping @MainActor (AVMediaPlayerEngine) -> MPRemoteCommandHandlerStatus
+    ) {
+        register(command) { engine, _ in handler(engine) }
+    }
+
+    private func register(
+        _ command: MPRemoteCommand,
+        handler: @escaping @MainActor (AVMediaPlayerEngine, MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus
+    ) {
+        let target = command.addTarget { [weak self] event in
+            // MPRemoteCommandCenter 在主线程回调。
+            MainActor.assumeIsolated {
+                guard let self, self.isActive, let engine = self.engine else {
+                    return .noActionableNowPlayingItem
+                }
+                let status = handler(engine, event)
+                self.refresh()
+                return status
+            }
+        }
+        commandTargets.append(command, target: target)
+    }
+
+    // MARK: - Session notifications
+
+    private func observeSessionNotifications() {
+        sessionObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: AVAudioSession.sharedInstance(),
+                queue: .main
+            ) { [weak self] notification in
+                let userInfo = notification.userInfo
+                let typeValue = userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                let optionsValue = userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+                MainActor.assumeIsolated {
+                    guard let self, self.isActive, let engine = self.engine else { return }
+                    switch typeValue.flatMap(AVAudioSession.InterruptionType.init) {
+                    case .began:
+                        engine.pause()
+                    case .ended:
+                        let options = AVAudioSession.InterruptionOptions(
+                            rawValue: optionsValue ?? 0
+                        )
+                        if options.contains(.shouldResume) {
+                            _ = engine.play()
+                        }
+                    default:
+                        break
+                    }
+                    self.refresh()
+                }
+            }
+        )
+        sessionObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: AVAudioSession.routeChangeNotification,
+                object: AVAudioSession.sharedInstance(),
+                queue: .main
+            ) { [weak self] notification in
+                let reasonValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+                MainActor.assumeIsolated {
+                    guard let self, self.isActive, let engine = self.engine else { return }
+                    // 拔出耳机等旧输出设备不可用时暂停，避免外放泄漏。
+                    if reasonValue.flatMap(AVAudioSession.RouteChangeReason.init) == .oldDeviceUnavailable {
+                        engine.pause()
+                        self.refresh()
+                    }
+                }
+            }
+        )
     }
 }
 

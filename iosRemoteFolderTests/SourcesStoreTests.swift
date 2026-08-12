@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import MediaPlayer
 import PDFKit
 import Testing
 import UIKit
@@ -1421,6 +1422,40 @@ struct SessionMediaPlayerTests {
             )
         }
         #expect(engine.playbackState == .failed(.timedOut))
+        engine.stop()
+    }
+
+    @Test("Now Playing 激活发布锁屏信息，注销后清空")
+    func nowPlayingControllerPublishesAndClearsInfo() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.workSourceID }
+        )
+        let sampleItem = try #require(
+            SampleData.resources.first { $0.path == "/产品/路线图演示.wav" }
+        )
+        let bytes = try await SampleSourceAdapter(source: source).readData(for: sampleItem, range: nil)
+        let metadata = ResourceMetadata(
+            byteSize: Int64(bytes.count),
+            mimeType: "audio/wav",
+            typeIdentifier: "com.microsoft.waveform-audio"
+        )
+        let engine = try AVMediaPlayerEngine(
+            data: bytes,
+            metadata: metadata,
+            resourcePath: "/nowplaying.wav"
+        )
+        try await engine.prepare(expectedMediaType: .audio)
+
+        let controller = MediaNowPlayingController()
+        controller.activate(title: "锁屏标题", engine: engine, isVideo: false)
+        let info = MPNowPlayingInfoCenter.default().nowPlayingInfo
+        #expect(info?[MPMediaItemPropertyTitle] as? String == "锁屏标题")
+        #expect((info?[MPMediaItemPropertyPlaybackDuration] as? TimeInterval ?? 0) > 0)
+
+        controller.deactivate()
+        #expect(MPNowPlayingInfoCenter.default().nowPlayingInfo == nil)
+        // deactivate 幂等，重复调用无副作用。
+        controller.deactivate()
         engine.stop()
     }
 
