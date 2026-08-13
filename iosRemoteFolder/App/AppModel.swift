@@ -306,10 +306,10 @@ final class AppModel {
         }
     }
 
-    /// 在没有历史记录的首次启动上保留演示内容；一旦用户打开真实资源，
-    /// Home 的继续/最近区域只显示最近记录，避免静态样例遮蔽真实路径。
+    /// Home 的继续与最近区域只投影真实打开历史。
+    /// 当前浏览目录即使非空，也不能在用户清空历史后回填 Home。
     var homeResources: [ResourceItem] {
-        recentResources.isEmpty ? resources : recentResources
+        recentResources
     }
 
     /// 只有查看器已经完成 metadata/内容准备后才写入最近记录。

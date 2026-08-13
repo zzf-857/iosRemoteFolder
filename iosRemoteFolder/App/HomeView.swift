@@ -9,14 +9,17 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     HomeHeader()
-                    if appModel.homeResources.isEmpty {
-                        EmptyLibraryCard {
-                            appModel.currentTab = .sources
-                        }
+                    if appModel.recentResources.isEmpty {
+                        EmptyLibraryCard(
+                            hasSources: !appModel.sources.isEmpty,
+                            action: {
+                                appModel.currentTab = appModel.sources.isEmpty ? .sources : .browse
+                            }
+                        )
                     } else {
-                        ContinueSection(resources: Array(appModel.homeResources.prefix(3)))
+                        ContinueSection(resources: Array(appModel.recentResources.prefix(3)))
                         RecentSection(
-                            resources: appModel.homeResources,
+                            resources: appModel.recentResources,
                             removeRecent: { appModel.removeRecent(identity: $0) }
                         )
                     }
@@ -427,13 +430,14 @@ private struct ContinueCard: View {
     }
 }
 
-/// 空库引导卡：没有任何最近内容时，指引用户先添加来源。
+/// 空历史引导卡：根据是否已有来源，进入浏览或添加来源。
 private struct EmptyLibraryCard: View {
-    let openSources: () -> Void
+    let hasSources: Bool
+    let action: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "externaldrive.badge.plus")
+            Image(systemName: hasSources ? "clock" : "externaldrive.badge.plus")
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 68, height: 68)
@@ -444,17 +448,21 @@ private struct EmptyLibraryCard: View {
                 .shadow(color: AppTheme.accent.opacity(0.32), radius: 12, y: 5)
                 .accessibilityHidden(true)
             VStack(spacing: 5) {
-                Text("从一个来源开始")
+                Text(hasSources ? "暂无最近打开" : "从一个来源开始")
                     .font(.headline)
                     .fontDesign(.rounded)
-                Text("添加 Alist、WebDAV 或本地文件夹后，打开过的内容会出现在这里。")
+                Text(
+                    hasSources
+                        ? "浏览并打开一个文件后，它会出现在这里。"
+                        : "添加 Alist、WebDAV 或本地文件夹后，打开过的内容会出现在这里。"
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Button(action: openSources) {
-                Text("添加来源")
+            Button(action: action) {
+                Text(hasSources ? "浏览资源" : "添加来源")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                     .padding(.horizontal, 22)
