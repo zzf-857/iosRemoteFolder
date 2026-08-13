@@ -50,6 +50,7 @@ final class AppModel {
     var resourceIndexError: String?
 
     @ObservationIgnored let resourceAccessService: ResourceAccessService
+    @ObservationIgnored let resourcePreviewPipeline: ResourcePreviewPipeline
     @ObservationIgnored let cacheCoordinator: CacheCoordinator
     @ObservationIgnored let resourceIndexStore: ResourceIndexStore
     @ObservationIgnored private let registry: SourceRegistry
@@ -230,9 +231,13 @@ final class AppModel {
         let resourceIndexStore = ResourceIndexStore(modelContainer: store.modelContainer)
         self.resourceIndexStore = resourceIndexStore
         self.sourcesStore = SourcesStore(registry: registry)
-        self.resourceAccessService = ResourceAccessService(
+        let resourceAccessService = ResourceAccessService(
             registry: registry,
             cacheCoordinator: cacheCoordinator
+        )
+        self.resourceAccessService = resourceAccessService
+        self.resourcePreviewPipeline = ResourcePreviewPipeline(
+            accessService: resourceAccessService
         )
         self.managedRemoteSourceIDs = restoredRemoteIDs
         self.sourceActionError = startupError
