@@ -184,24 +184,29 @@ struct ResourcePreviewPipelineTests {
         #expect(unknownDiskEntries.isEmpty)
     }
 
-    @Test("不支持类型零读取且文本超预算不会下载正文")
+    @Test("文件夹、视频与音频预览零探测零读取")
     func rejectsUnsupportedAndOversizedResourcesBeforeRead() async throws {
-        let unsupported = makeFixture(
-            kind: .video,
-            revision: .etag("video-v1"),
-            readsReleased: true
-        )
-        let unsupportedRequest = try makeRequest(item: unsupported.item)
-        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
-            try await unsupported.pipeline.preview(for: unsupportedRequest)
+        for kind in [ResourceKind.folder, .video, .audio] {
+            let unsupported = makeFixture(
+                kind: kind,
+                revision: .etag("unsupported-v1"),
+                readsReleased: true
+            )
+            let unsupportedRequest = try makeRequest(item: unsupported.item)
+            await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+                try await unsupported.pipeline.preview(for: unsupportedRequest)
+            }
+            let unsupportedSnapshot = await unsupported.adapter.snapshot()
+            #expect(unsupportedSnapshot.metadataCalls == 0)
+            #expect(unsupportedSnapshot.readCalls == 0)
         }
-        let unsupportedSnapshot = await unsupported.adapter.snapshot()
-        #expect(unsupportedSnapshot.metadataCalls == 0)
-        #expect(unsupportedSnapshot.readCalls == 0)
+    }
 
+    @Test("文本超预算不会下载正文")
+    func rejectsOversizedTextBeforeRead() async throws {
         let oversized = makeFixture(
             revision: .etag("large-v1"),
-            resolvedByteSize: 256 * 1024 + 1,
+            metadataByteSize: .some(256 * 1024 + 1),
             readsReleased: true
         )
         let oversizedRequest = try makeRequest(item: oversized.item)
@@ -211,6 +216,119 @@ struct ResourcePreviewPipelineTests {
         let oversizedSnapshot = await oversized.adapter.snapshot()
         #expect(oversizedSnapshot.metadataCalls == 1)
         #expect(oversizedSnapshot.readCalls == 0)
+    }
+
+    @Test("未知类型缺少大小、超预算或无合法扩展名时不会读取正文")
+    func rejectsUnsafeQuickLookMaterializationBeforeRead() async throws {
+        let missingSize = makeFixture(
+            kind: .unknown,
+            path: "/测试.pages",
+            revision: .unknown,
+            metadataByteSize: .some(nil),
+            readsReleased: true
+        )
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            try await missingSize.pipeline.preview(for: makeRequest(item: missingSize.item))
+        }
+        let missingSizeSnapshot = await missingSize.adapter.snapshot()
+        #expect(missingSizeSnapshot.metadataCalls == 1)
+        #expect(missingSizeSnapshot.readCalls == 0)
+
+        let oversized = makeFixture(
+            kind: .unknown,
+            path: "/测试.pages",
+            revision: .unknown,
+            metadataByteSize: .some(4 * 1024 * 1024 + 1),
+            readsReleased: true
+        )
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            try await oversized.pipeline.preview(for: makeRequest(item: oversized.item))
+        }
+        let oversizedSnapshot = await oversized.adapter.snapshot()
+        #expect(oversizedSnapshot.metadataCalls == 1)
+        #expect(oversizedSnapshot.readCalls == 0)
+
+        let invalidExtension = makeFixture(
+            kind: .unknown,
+            path: "/测试.文档",
+            revision: .unknown,
+            readsReleased: true
+        )
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            try await invalidExtension.pipeline.preview(
+                for: makeRequest(item: invalidExtension.item)
+            )
+        }
+        let invalidExtensionSnapshot = await invalidExtension.adapter.snapshot()
+        #expect(invalidExtensionSnapshot.metadataCalls == 1)
+        #expect(invalidExtensionSnapshot.readCalls == 0)
+    }
+
+    @Test("有界未知文件至多读取一次且 Quick Look 终态清理物化目录")
+    func quickLookMaterializationReadsOnceAndCleansUp() async throws {
+        let materializationRoot = quickLookMaterializationRoot()
+        try? FileManager.default.removeItem(at: materializationRoot)
+        defer { try? FileManager.default.removeItem(at: materializationRoot) }
+
+        let content = Data("不是有效的 Pages 文档".utf8)
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/测试.pages",
+            revision: .unknown,
+            metadataByteSize: .some(Int64(content.count)),
+            content: content,
+            readsReleased: true
+        )
+
+        do {
+            let artifact = try await fixture.pipeline.preview(
+                for: makeRequest(item: fixture.item)
+            )
+            guard case .encodedImage = artifact else {
+                Issue.record("Quick Look 成功时只能返回真实缩略图")
+                return
+            }
+        } catch {
+            let sourceError = ResourceSourceError.mapping(error)
+            #expect(isDegradableQuickLookError(sourceError))
+        }
+
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+        #expect(snapshot.activeReads == 0)
+        #expect(try materializationDirectories(at: materializationRoot).isEmpty)
+    }
+
+    @Test("未知文件在正文读取阶段取消会关闭读取并清理物化目录")
+    func cancellingQuickLookReadLeavesNoMaterializedFile() async throws {
+        let materializationRoot = quickLookMaterializationRoot()
+        try? FileManager.default.removeItem(at: materializationRoot)
+        defer { try? FileManager.default.removeItem(at: materializationRoot) }
+
+        let content = Data("等待取消".utf8)
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/测试.pages",
+            revision: .unknown,
+            metadataByteSize: .some(Int64(content.count)),
+            content: content,
+            readsReleased: false
+        )
+        let request = try makeRequest(item: fixture.item)
+        let task = Task { try await fixture.pipeline.preview(for: request) }
+
+        #expect(try await waitUntil { await fixture.adapter.snapshot().activeReads == 1 })
+        task.cancel()
+        await #expect(throws: ResourceSourceError.cancelled) {
+            try await task.value
+        }
+        #expect(try await waitUntil { await fixture.adapter.snapshot().activeReads == 0 })
+
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+        #expect(try materializationDirectories(at: materializationRoot).isEmpty)
     }
 
     @Test("请求尺寸与 scale 规范化并设置像素上限")
@@ -258,9 +376,11 @@ struct ResourcePreviewPipelineTests {
 
     private func makeFixture(
         kind: ResourceKind = .text,
+        path: String? = nil,
         revision: ResourceRevision,
         resolvedRevision: ResourceRevision? = nil,
-        resolvedByteSize: Int64? = nil,
+        metadataByteSize: Int64?? = nil,
+        content: Data = Data("预览正文".utf8),
         readsReleased: Bool,
         cacheDirectory: URL? = nil
     ) -> PreviewFixture {
@@ -272,9 +392,8 @@ struct ResourcePreviewPipelineTests {
             status: .connected,
             itemCountDescription: ""
         )
-        let content = Data("预览正文".utf8)
         let metadata = ResourceMetadata(
-            byteSize: resolvedByteSize ?? Int64(content.count),
+            byteSize: metadataByteSize ?? Int64(content.count),
             modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
             mimeType: kind == .video ? "video/mp4" : "text/plain",
             typeIdentifier: kind == .video ? "public.mpeg-4" : "public.plain-text",
@@ -282,7 +401,7 @@ struct ResourcePreviewPipelineTests {
         )
         let item = try! makeItem(
             sourceID: source.id,
-            path: kind == .video ? "/测试.mp4" : "/测试.txt",
+            path: path ?? defaultFixturePath(for: kind),
             kind: kind,
             byteSize: revision.isKnown ? metadata.byteSize : nil,
             revision: revision
@@ -311,6 +430,19 @@ struct ResourcePreviewPipelineTests {
                 cacheDirectory: directory
             )
         )
+    }
+
+    private func defaultFixturePath(for kind: ResourceKind) -> String {
+        switch kind {
+        case .folder: "/测试文件夹"
+        case .video: "/测试.mp4"
+        case .audio: "/测试.mp3"
+        case .image: "/测试.png"
+        case .pdf: "/测试.pdf"
+        case .markdown: "/测试.md"
+        case .text: "/测试.txt"
+        case .unknown: "/测试.pages"
+        }
     }
 
     private func makeRequest(item: ResourceItem) throws -> ResourcePreviewRequest {
@@ -350,6 +482,30 @@ struct ResourcePreviewPipelineTests {
             .appendingPathComponent("iosRemoteFolder-preview-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func quickLookMaterializationRoot() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder", isDirectory: true)
+            .appendingPathComponent("preview-materialization-v1", isDirectory: true)
+    }
+
+    private func materializationDirectories(at root: URL) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: root.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    private func isDegradableQuickLookError(_ error: ResourceSourceError) -> Bool {
+        switch error {
+        case .capabilityUnavailable, .invalidResponse, .unavailable:
+            true
+        default:
+            false
+        }
     }
 
     private func waitUntil(
