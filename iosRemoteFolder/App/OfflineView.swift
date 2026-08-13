@@ -52,12 +52,11 @@ struct OfflineView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("清理预览缓存", systemImage: "trash") {
+                        Button("清理缓存", systemImage: "trash") {
                             Task {
                                 await appModel.clearOfflineCache()
                             }
                         }
-                        .disabled(appModel.offlineResourceIDs.isEmpty)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }

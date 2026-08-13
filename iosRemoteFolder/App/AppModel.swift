@@ -236,9 +236,10 @@ final class AppModel {
             cacheCoordinator: cacheCoordinator
         )
         self.resourceAccessService = resourceAccessService
-        self.resourcePreviewPipeline = ResourcePreviewPipeline(
+        let resourcePreviewPipeline = ResourcePreviewPipeline(
             accessService: resourceAccessService
         )
+        self.resourcePreviewPipeline = resourcePreviewPipeline
         self.managedRemoteSourceIDs = restoredRemoteIDs
         self.sourceActionError = startupError
         self.resourceIndexError = nil
@@ -250,9 +251,11 @@ final class AppModel {
             with: registry.initialSnapshots,
             failures: startupFailures
         )
-        Task { @MainActor [weak self] in
+        let initialSourceIDs = Set(allSources.map(\.id))
+        Task { @MainActor [weak self, resourcePreviewPipeline, initialSourceIDs] in
+            await resourcePreviewPipeline.retain(sourceIDs: initialSourceIDs)
             guard let self else { return }
-            await self.retainResourceIndex(sourceIDs: Set(self.sources.map(\.id)))
+            await self.retainResourceIndex(sourceIDs: initialSourceIDs)
         }
         #if DEBUG
         applyDebugSourcePrefillIfRequested()
@@ -404,6 +407,7 @@ final class AppModel {
     /// Removes only this app's managed content cache. Source files are untouched.
     func clearOfflineCache() async {
         await cacheCoordinator.removeAll()
+        await resourcePreviewPipeline.removeAll()
         offlineResourceIDs.removeAll()
         offlineByteCount = 0
     }
@@ -906,6 +910,7 @@ final class AppModel {
         resourceProgressStore.retain(sourceIDs: sourceIDs)
         resourceReadingStore.retain(sourceIDs: sourceIDs)
         await cacheCoordinator.retain(sourceIDs: sourceIDs)
+        await resourcePreviewPipeline.retain(sourceIDs: sourceIDs)
         await retainResourceIndex(sourceIDs: sourceIDs)
         await refreshOfflineCache()
     }
@@ -919,6 +924,7 @@ final class AppModel {
         resourceProgressStore.remove(sourceID: sourceID)
         resourceReadingStore.remove(sourceID: sourceID)
         await cacheCoordinator.remove(sourceID: sourceID)
+        await resourcePreviewPipeline.remove(sourceID: sourceID)
         do {
             try await resourceIndexStore.remove(sourceID: sourceID)
             resourceIndexError = nil
