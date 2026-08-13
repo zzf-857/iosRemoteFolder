@@ -1000,6 +1000,9 @@ struct WebDAVSourceAdapterTests {
               let logicalPath = ResourcePath(rawValue: mediaPath) else {
             return
         }
+        let isVideo = environment["ALIST_MEDIA_KIND"] == "video"
+        let mediaKind: ResourceKind = isVideo ? .video : .audio
+        let expectedMediaType: AVMediaType = isVideo ? .video : .audio
 
         let source = ResourceSource(
             id: UUID(),
@@ -1027,7 +1030,7 @@ struct WebDAVSourceAdapterTests {
             sourceID: source.id,
             logicalPath: logicalPath,
             name: logicalPath.components.last ?? "media",
-            kind: .audio,
+            kind: mediaKind,
             metadata: ResourceMetadata(),
             capabilities: [.read],
             accent: .pink
@@ -1045,7 +1048,7 @@ struct WebDAVSourceAdapterTests {
             metadata: metadata,
             resourcePath: item.path
         )
-        try await engine.prepare(expectedMediaType: .audio)
+        try await engine.prepare(expectedMediaType: expectedMediaType)
         #expect(engine.duration > 0)
         #expect(engine.play())
         try await Task.sleep(for: .seconds(1))

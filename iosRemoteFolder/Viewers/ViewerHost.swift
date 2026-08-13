@@ -27,8 +27,16 @@ struct ResourceViewerHost: View {
     private enum LoadState {
         case loading
         case ready(ResourceIdentity, ResourceMetadata, ViewerResolution, ViewerContentPayload?)
-        case failed(ResourceIdentity, ResourceSourceError)
+        case failed(ResourceIdentity, ResourceSourceError, diagnostic: String?)
         case cancelled(ResourceIdentity)
+    }
+
+    /// 打开流程的阶段标记：失败时随错误一起展示，直接定位失败环节。
+    private enum LoadPhase: String {
+        case session = "创建会话"
+        case metadata = "获取元数据"
+        case content = "读取内容"
+        case enginePreparation = "准备播放引擎"
     }
 
     private var loadRequest: LoadRequest {
@@ -50,8 +58,8 @@ struct ResourceViewerHost: View {
                 loadingView
             case .ready(let identity, let metadata, let resolution, let payload) where identity == resource.id:
                 readyView(metadata: metadata, resolution: resolution, payload: payload)
-            case .failed(let identity, let error) where identity == resource.id:
-                failureView(error: error)
+            case .failed(let identity, let error, let diagnostic) where identity == resource.id:
+                failureView(error: error, diagnostic: diagnostic)
             case .cancelled(let identity) where identity == resource.id:
                 cancelledView
             default:
@@ -181,11 +189,22 @@ struct ResourceViewerHost: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func failureView(error: ResourceSourceError) -> some View {
+    private func failureView(error: ResourceSourceError, diagnostic: String?) -> some View {
         ContentUnavailableView {
             Label("无法打开资源", systemImage: "exclamationmark.triangle")
         } description: {
-            Text(error.localizedDescription)
+            VStack(spacing: 6) {
+                Text(error.localizedDescription)
+                #if DEBUG
+                // 调试构建显示失败环节与底层错误，便于真机排障。
+                if let diagnostic {
+                    Text(diagnostic)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                }
+                #endif
+            }
         } actions: {
             Button("重试", systemImage: "arrow.clockwise") {
                 retry()
@@ -223,6 +242,7 @@ struct ResourceViewerHost: View {
         var session: ResourceContentSession?
         var preparedMediaEngine: AVMediaPlayerEngine?
         var mediaEngineOwnsSession = false
+        var phase: LoadPhase = .session
         let result: LoadState
         do {
             let createdSession: ResourceContentSession
@@ -233,7 +253,9 @@ struct ResourceViewerHost: View {
                 createdSession = try await appModel.resourceAccessService.makeOfflineSession(for: resource)
             }
             session = createdSession
+            phase = .metadata
             let metadata = try await createdSession.fetchMetadata()
+            phase = .content
             let resolution = ViewerRegistry.resolve(resource: resource, metadata: metadata)
             let payload: ViewerContentPayload?
             switch resolution.preparation {
@@ -272,6 +294,7 @@ struct ResourceViewerHost: View {
                 }
                 payload = .image(data)
             case .audio(let maximumBytes):
+                phase = .enginePreparation
                 let prepared = try await prepareMedia(
                     from: createdSession,
                     metadata: metadata,
@@ -282,6 +305,7 @@ struct ResourceViewerHost: View {
                 mediaEngineOwnsSession = prepared.ownsSession
                 payload = .audio(prepared.engine)
             case .video(let maximumBytes):
+                phase = .enginePreparation
                 let prepared = try await prepareMedia(
                     from: createdSession,
                     metadata: metadata,
@@ -299,7 +323,7 @@ struct ResourceViewerHost: View {
             }
             result = .ready(request.identity, metadata, resolution, payload)
         } catch {
-            result = state(for: error, identity: request.identity)
+            result = state(for: error, identity: request.identity, phase: phase)
         }
 
         let shouldPublish = request == loadRequest && !Task.isCancelled
@@ -492,7 +516,11 @@ struct ResourceViewerHost: View {
         return data
     }
 
-    private func state(for error: any Error, identity: ResourceIdentity) -> LoadState {
+    private func state(
+        for error: any Error,
+        identity: ResourceIdentity,
+        phase: LoadPhase
+    ) -> LoadState {
         if Task.isCancelled {
             return .cancelled(identity)
         }
@@ -500,7 +528,9 @@ struct ResourceViewerHost: View {
         if sourceError == .cancelled {
             return .cancelled(identity)
         }
-        return .failed(identity, sourceError)
+        // 诊断串只含阶段与错误结构，不含 URL、请求头或凭证。
+        let diagnostic = "阶段：\(phase.rawValue)｜\(String(reflecting: error))"
+        return .failed(identity, sourceError, diagnostic: diagnostic)
     }
 }
 
