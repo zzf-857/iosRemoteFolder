@@ -137,6 +137,9 @@ struct VideoPlayerScreen: View {
         }
         .onChange(of: engine.playbackState) { _, state in
             nowPlaying.refresh()
+            if state == .playing, controlsVisible, !isLocked, !voiceOverEnabled {
+                scheduleControlsAutoHide()
+            }
             if state.disablesControls {
                 isSliderScrubbing = false
                 scrubPreviewTime = nil
@@ -332,17 +335,19 @@ struct VideoPlayerScreen: View {
 
     private func handleDoubleTap(at location: CGPoint, width: CGFloat) {
         if location.x < width / 3 {
-            commitSeek((pendingSeekTime ?? engine.currentTime) - 10)
+            let shouldResume = engine.playbackState.showsPauseControl
+            commitSeek((pendingSeekTime ?? engine.currentTime) - 10, resumeAfterSeek: shouldResume)
             showFeedback(.backward, value: "后退 10 秒")
         } else if location.x > width * 2 / 3 {
-            commitSeek((pendingSeekTime ?? engine.currentTime) + 10)
+            let shouldResume = engine.playbackState.showsPauseControl
+            commitSeek((pendingSeekTime ?? engine.currentTime) + 10, resumeAfterSeek: shouldResume)
             showFeedback(.forward, value: "前进 10 秒")
         } else {
             togglePlayback()
         }
     }
 
-    private func commitSeek(_ target: TimeInterval) {
+    private func commitSeek(_ target: TimeInterval, resumeAfterSeek: Bool = true) {
         let clamped = min(max(target, 0), engine.duration)
         seekGeneration &+= 1
         let generation = seekGeneration
@@ -350,9 +355,11 @@ struct VideoPlayerScreen: View {
         engine.seek(to: clamped) { finished in
             guard isPresented,
                   seekGeneration == generation,
-                  finished,
-                  engine.play() else { return }
+                  finished else { return }
             pendingSeekTime = nil
+            if resumeAfterSeek, engine.play() {
+                scheduleControlsAutoHide()
+            }
             nowPlaying.refresh()
         }
     }
