@@ -153,9 +153,7 @@ private struct PreviewTaskView: View {
     private func load(expectedTaskID: PreviewTaskID) async {
         activeTaskID = expectedTaskID
         guard let request,
-              resource.kind != .folder,
-              resource.kind != .video,
-              resource.kind != .audio else {
+              resource.kind != .folder else {
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
             state = .fallback
             return

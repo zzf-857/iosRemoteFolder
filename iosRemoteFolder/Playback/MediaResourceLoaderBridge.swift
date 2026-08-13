@@ -7,6 +7,11 @@ import UniformTypeIdentifiers
 final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     static let chunkByteBudget: Int64 = 4 * 1024 * 1024
 
+    enum SessionTerminationOwnership: Sendable {
+        case loader
+        case caller
+    }
+
     private enum Backing: Sendable {
         case memory(Data)
         case session(ResourceContentSession)
@@ -38,9 +43,12 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
     private let contentLength: Int64
     private let contentTypes: [String]
     private let cumulativeByteBudget: Int64?
+    private let sessionTerminationOwnership: SessionTerminationOwnership
     private var invalidated = false
+    private var automaticSessionCloseScheduled = false
     private var scheduledByteCount: Int64 = 0
     private var loadingStates: [ObjectIdentifier: LoadingState] = [:]
+    private var activeChunkTasks: [UUID: Task<Void, Never>] = [:]
 
     init(
         data: Data,
@@ -51,18 +59,21 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
         self.contentLength = Int64(data.count)
         self.contentTypes = contentTypes
         self.cumulativeByteBudget = cumulativeByteBudget.map { max(0, $0) }
+        self.sessionTerminationOwnership = .loader
     }
 
     init(
         session: ResourceContentSession,
         contentLength: Int64,
         contentTypes: [String],
-        cumulativeByteBudget: Int64? = nil
+        cumulativeByteBudget: Int64? = nil,
+        sessionTerminationOwnership: SessionTerminationOwnership = .loader
     ) {
         self.backing = .session(session)
         self.contentLength = contentLength
         self.contentTypes = contentTypes
         self.cumulativeByteBudget = cumulativeByteBudget.map { max(0, $0) }
+        self.sessionTerminationOwnership = sessionTerminationOwnership
     }
 
     var isSessionBacked: Bool {
@@ -72,16 +83,36 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
 
     func invalidate() {
         queue.async { [self] in
-            invalidateOnQueue()
+            let tasks = invalidateOnQueue()
+            guard let session = claimAutomaticallyClosedSessionOnQueue() else { return }
+            Task { [self] in
+                for task in tasks {
+                    await task.value
+                }
+                await withCheckedContinuation { continuation in
+                    queue.async {
+                        continuation.resume()
+                    }
+                }
+                await session.close()
+            }
         }
     }
 
-    /// Preview leases await this queue-confined terminal point before closing
-    /// their session. Playback keeps using fire-and-forget `invalidate()`.
+    /// Caller-owned preview leases await queue-confined request termination,
+    /// every cancelled chunk task and their queued delivery callbacks. The
+    /// caller remains responsible for closing its ResourceContentSession.
     func invalidateAndWait() async {
-        await withCheckedContinuation { continuation in
+        let tasks: [Task<Void, Never>] = await withCheckedContinuation { continuation in
             queue.async { [self] in
-                invalidateOnQueue()
+                continuation.resume(returning: invalidateOnQueue())
+            }
+        }
+        for task in tasks {
+            await task.value
+        }
+        await withCheckedContinuation { continuation in
+            queue.async {
                 continuation.resume()
             }
         }
@@ -288,6 +319,7 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
 
         case .session(let session):
             let deliveryQueue = queue
+            let chunkTaskID = UUID()
             let task = Task { [weak self] in
                 let result: Result<Data, ResourceSourceError>
                 do {
@@ -306,7 +338,9 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
                     )
                 }
                 deliveryQueue.async { [weak self] in
-                    self?.receiveChunkOnQueue(
+                    guard let self else { return }
+                    self.activeChunkTasks[chunkTaskID] = nil
+                    self.receiveChunkOnQueue(
                         result,
                         range: range,
                         identifier: identifier,
@@ -315,6 +349,7 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
                 }
             }
             state.task = task
+            activeChunkTasks[chunkTaskID] = task
         }
     }
 
@@ -417,21 +452,32 @@ final class MediaResourceLoaderBridge: NSObject, AVAssetResourceLoaderDelegate, 
         loadingStates.removeValue(forKey: identifier)
     }
 
-    private func invalidateOnQueue() {
+    private func invalidateOnQueue() -> [Task<Void, Never>] {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard !invalidated else { return }
-        invalidated = true
+        if !invalidated {
+            invalidated = true
+            for (identifier, state) in Array(loadingStates) {
+                completeOnQueue(
+                    identifier: identifier,
+                    token: state.token,
+                    error: .cancelled
+                )
+            }
+        }
+        let tasks = Array(activeChunkTasks.values)
+        tasks.forEach { $0.cancel() }
+        return tasks
+    }
 
-        for (identifier, state) in Array(loadingStates) {
-            completeOnQueue(
-                identifier: identifier,
-                token: state.token,
-                error: .cancelled
-            )
+    private func claimAutomaticallyClosedSessionOnQueue() -> ResourceContentSession? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard sessionTerminationOwnership == .loader,
+              !automaticSessionCloseScheduled,
+              case .session(let session) = backing else {
+            return nil
         }
-        if case .session(let session) = backing {
-            Task { await session.close() }
-        }
+        automaticSessionCloseScheduled = true
+        return session
     }
 
     private func reserveScheduledBytesOnQueue(_ byteCount: Int64) -> Bool {

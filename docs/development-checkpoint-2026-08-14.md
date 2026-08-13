@@ -1,8 +1,10 @@
-# D-065B2 媒体预览开发现场
+# D-065B2 媒体预览恢复与完成记录
 
 日期：2026-08-14
 
-状态：开发中断存档，不可直接合并到 `main`，不可视为已构建或已验收。
+状态：历史 checkpoint 已恢复；D-065B2-1 实现及主程自动化验收已完成，等待真机 + 真实 Alist 验收。
+
+> 本文前半部分保留 2026-08-14 00:28 checkpoint 时的现场，便于追溯；“尚未完成”描述仅代表当时状态，不再代表当前代码。
 
 ## 已完成主线
 
@@ -46,3 +48,17 @@
 
 - 半成品产生前的媒体播放器与预览专项基线为 18/18。
 - B2-1 完成后必须由 Codex 主程重跑 `SessionMediaPlayerTests`、`ResourcePreviewPipelineTests`、完整测试、Simulator Debug build、Analyze、工程校验、敏感信息扫描与 iPhone UI/真机验收。
+
+## 恢复后的最终实现（2026-08-14）
+
+- `MediaResourceLoaderBridge` 已接入 App target，并由播放器与预览共用；播放器保持既有无限累计 Range 行为。
+- preview-only `PreviewMediaAssetLease` 以 16 MiB 累计调度预算和 4 MiB 单分片上限工作，幂等关闭顺序为 generator -> asset -> loader -> session。
+- 视频只生成一张真实代表帧；音频只读取 common、ID3 APIC、iTunes 与 QuickTime embedded artwork；无 Range、无封面、超预算或不可解码均返回明确降级。
+- 列表已允许视频与音频进入统一预览管线；renderer version 升至 2，避免复用旧降级缓存。
+- 未创建 `AVPlayer`/`AVPlayerItem`，未激活 `AVAudioSession`、Now Playing 或后台播放。
+
+## 主程验证（2026-08-14）
+
+- 完整 iPhone 17 Pro / iOS 26.5 模拟器测试：172/172 通过；其中 `ResourcePreviewPipelineTests` 17/17、`SessionMediaPlayerTests` 6/6。
+- `xcodebuild analyze`、generic Simulator Debug build、工程 plist、diff 与敏感信息扫描作为最终提交门执行；结果以 canonical `Project/todolist/alist-media-player/development.md` 完成记录为准。
+- 真机 + 真实 Alist 的封面命中率、弱网取消、滚动资源峰值与真实媒体交互仍属于运行态验收，不由 fixture 自动化替代。

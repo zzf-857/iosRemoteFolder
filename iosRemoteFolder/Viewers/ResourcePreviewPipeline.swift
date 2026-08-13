@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreGraphics
 import CryptoKit
 import Foundation
@@ -7,7 +8,7 @@ import QuickLookThumbnailing
 import UniformTypeIdentifiers
 
 struct ResourcePreviewRequest: Hashable, Sendable {
-    static let currentRendererVersion = 1
+    static let currentRendererVersion = 2
     private static let pointPrecision: CGFloat = 100
     private static let minimumPointDimension: CGFloat = 1
     private static let maximumPointDimension: CGFloat = 512
@@ -163,6 +164,7 @@ actor ResourcePreviewPipeline {
     }
 
     private static let imageByteBudget: Int64 = 12 * 1024 * 1024
+    private static let artworkByteBudget: Int64 = 12 * 1024 * 1024
     private static let pdfByteBudget: Int64 = 16 * 1024 * 1024
     private static let textByteBudget: Int64 = 256 * 1024
     private static let quickLookByteBudget: Int64 = 4 * 1024 * 1024
@@ -526,9 +528,9 @@ actor ResourcePreviewPipeline {
         limiter: PreviewConcurrencyLimiter
     ) async throws -> GeneratedPreview {
         switch request.item.kind {
-        case .folder, .video, .audio:
+        case .folder:
             throw ResourceSourceError.capabilityUnavailable
-        case .image, .pdf, .text, .markdown, .unknown:
+        case .video, .audio, .image, .pdf, .text, .markdown, .unknown:
             break
         }
 
@@ -547,7 +549,8 @@ actor ResourcePreviewPipeline {
 
     private static func render(
         request: ResourcePreviewRequest,
-        session: ResourceContentSession
+        session: ResourceContentSession,
+        installMediaLease: @Sendable (PreviewMediaAssetLease) async -> Bool
     ) async throws -> GeneratedPreview {
         try Task.checkCancellation()
         let metadata = try await session.fetchMetadata()
@@ -581,7 +584,37 @@ actor ResourcePreviewPipeline {
                 metadata: metadata,
                 request: request
             )
-        case .folder, .video, .audio:
+        case .video, .audio:
+            guard metadata.acceptsRanges else {
+                throw ResourceSourceError.capabilityUnavailable
+            }
+            let lease = try PreviewMediaAssetLease(
+                session: session,
+                metadata: metadata,
+                resourcePath: request.item.path
+            )
+            guard await installMediaLease(lease) else {
+                await lease.close()
+                throw ResourceSourceError.cancelled
+            }
+            switch request.item.kind {
+            case .video:
+                let image = try await lease.videoFrame(
+                    maximumSize: CGSize(
+                        width: request.pixelWidth,
+                        height: request.pixelHeight
+                    )
+                )
+                artifact = try encodedImageArtifact(image)
+            case .audio:
+                let artwork = try await lease.embeddedArtwork(
+                    maximumBytes: artworkByteBudget
+                )
+                artifact = try renderImage(artwork, request: request)
+            default:
+                throw ResourceSourceError.invalidResponse
+            }
+        case .folder:
             throw ResourceSourceError.capabilityUnavailable
         }
         try Task.checkCancellation()
@@ -806,6 +839,17 @@ actor ResourcePreviewPipeline {
         return output as Data
     }
 
+    private static func encodedImageArtifact(
+        _ image: CGImage
+    ) throws -> ResourcePreviewArtifact {
+        .encodedImage(
+            data: try encodePNG(image),
+            format: .png,
+            pixelWidth: image.width,
+            pixelHeight: image.height
+        )
+    }
+
     /// Races rendering against the product-level deadline without making the
     /// timeout wait for a renderer that is slow to observe cancellation.
     private actor PreviewRenderRace {
@@ -817,6 +861,7 @@ actor ResourcePreviewPipeline {
         private var terminalResult: Result<GeneratedPreview, ResourceSourceError>?
         private var continuation: CheckedContinuation<GeneratedPreview, any Error>?
         private var activeSession: ResourceContentSession?
+        private var activeMediaLease: PreviewMediaAssetLease?
         private var renderTask: Task<Void, Never>?
         private var deadlineTask: Task<Void, Never>?
 
@@ -874,7 +919,10 @@ actor ResourcePreviewPipeline {
                         }
                         result = .success(try await ResourcePreviewPipeline.render(
                             request: request,
-                            session: session
+                            session: session,
+                            installMediaLease: { lease in
+                                await owner.install(mediaLease: lease)
+                            }
                         ))
                         await limiter.release()
                     } catch {
@@ -906,6 +954,13 @@ actor ResourcePreviewPipeline {
             return true
         }
 
+        private func install(mediaLease: PreviewMediaAssetLease) -> Bool {
+            guard terminalResult == nil else { return false }
+            activeMediaLease = mediaLease
+            activeSession = nil
+            return true
+        }
+
         private func finish(
             _ result: Result<GeneratedPreview, ResourceSourceError>
         ) async {
@@ -919,10 +974,16 @@ actor ResourcePreviewPipeline {
             deadlineTask = nil
             let session = activeSession
             activeSession = nil
+            let mediaLease = activeMediaLease
+            activeMediaLease = nil
 
-            // Close before publication so timeout and cancellation immediately
-            // terminate source operations instead of waiting for rendering cleanup.
-            await session?.close()
+            if let mediaLease {
+                await mediaLease.close()
+            } else {
+                // Close before publication so timeout and cancellation immediately
+                // terminate source operations instead of waiting for rendering cleanup.
+                await session?.close()
+            }
             if let continuation {
                 Self.resume(continuation, with: result)
             }
