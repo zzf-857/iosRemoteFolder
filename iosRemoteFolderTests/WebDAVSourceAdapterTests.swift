@@ -983,6 +983,95 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test(
+        "真实 Alist：目录、元数据与大媒体流式播放（需环境变量，缺省跳过）",
+        .timeLimit(.minutes(3))
+    )
+    @MainActor
+    func realAlistLargeMediaStreamsEndToEnd() async throws {
+        // 凭证与 endpoint 只经环境变量注入（TEST_RUNNER_ 前缀），
+        // 不进入源码、fixture 或项目记录；未配置时本用例直接通过。
+        let environment = ProcessInfo.processInfo.environment
+        guard let endpointText = environment["ALIST_ENDPOINT"],
+              let endpoint = URL(string: endpointText),
+              let username = environment["ALIST_USERNAME"],
+              let password = environment["ALIST_PASSWORD"],
+              let mediaPath = environment["ALIST_MEDIA_PATH"],
+              let logicalPath = ResourcePath(rawValue: mediaPath) else {
+            return
+        }
+
+        let source = ResourceSource(
+            id: UUID(),
+            name: "真实 Alist 验证",
+            kind: .alist,
+            endpoint: endpoint.absoluteString,
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+        let adapter = try WebDAVSourceAdapter(
+            source: source,
+            endpoint: endpoint,
+            username: username,
+            password: password
+        )
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+
+        // 目录闭环：连接 + 根目录列举非空。
+        try await registry.connect(sourceID: source.id)
+        let rootItems = try await registry.listResources(sourceID: source.id, at: .root)
+        #expect(!rootItems.isEmpty)
+
+        // 会话闭环：直接寻址目标媒体，元数据必须给出大小、Range 与已知版本。
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: logicalPath,
+            name: logicalPath.components.last ?? "media",
+            kind: .audio,
+            metadata: ResourceMetadata(),
+            capabilities: [.read],
+            accent: .pink
+        )
+        let session = try await ResourceAccessService(registry: registry).makeSession(for: item)
+        let metadata = try await session.fetchMetadata()
+        let byteSize = try #require(metadata.byteSize)
+        #expect(byteSize > 0)
+        #expect(metadata.acceptsRanges)
+        #expect(metadata.revision.isKnown)
+
+        // 播放闭环：真实网络流式 prepare、起播、高位 seek 后继续播放。
+        let engine = try AVMediaPlayerEngine(
+            session: session,
+            metadata: metadata,
+            resourcePath: item.path
+        )
+        try await engine.prepare(expectedMediaType: .audio)
+        #expect(engine.duration > 0)
+        #expect(engine.play())
+        try await Task.sleep(for: .seconds(1))
+        #expect(engine.currentTime > 0)
+
+        engine.seek(to: engine.duration * 0.8)
+        _ = engine.play()
+        let seekDeadline = ContinuousClock.now + .seconds(20)
+        var reachedHighPosition = false
+        while ContinuousClock.now < seekDeadline {
+            if case .failed = engine.playbackState { break }
+            if engine.currentTime > engine.duration * 0.7 {
+                reachedHighPosition = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        #expect(reachedHighPosition, "高位 seek 后应继续播放，state=\(engine.playbackState)")
+
+        engine.stop()
+        try await Task.sleep(for: .milliseconds(100))
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await session.fetchMetadata()
+        }
+    }
+
     /// 以 1 秒 PCM 块拼接生成指定时长的标准 WAV，头部块大小与总长一致。
     private static func makeLoopbackWAV(secondsOfAudio: Int) -> Data {
         let sampleRate: UInt32 = 8_000

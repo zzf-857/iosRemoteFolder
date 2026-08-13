@@ -40,7 +40,13 @@ private struct BrowseContentView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .glassNavigationBar()
-        .task { store.connectAll() }
+        .task {
+            store.connectAll()
+            // 未选来源时自动选中第一个可浏览来源，省去一次必然的点击。
+            if selectedSourceID == nil {
+                selectedSourceID = store.entries.first(where: \.hasAdapter)?.id
+            }
+        }
         .onChange(of: selectedSourceID) { _, newID in
             guard let newID else { return }
             store.ensureConnected(newID)

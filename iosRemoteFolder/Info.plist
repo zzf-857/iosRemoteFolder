@@ -22,7 +22,10 @@
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsLocalNetworking</key>
+		<!-- 注意：与 NSAllowsLocalNetworking 等窄键同时存在时，
+		     ArbitraryLoads 会被系统忽略；此处必须单独声明。
+		     Arbitrary loads 已涵盖本地网络连接。 -->
+		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>

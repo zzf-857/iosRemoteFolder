@@ -249,7 +249,46 @@ final class AppModel {
             guard let self else { return }
             await self.retainResourceIndex(sourceIDs: Set(self.sources.map(\.id)))
         }
+        #if DEBUG
+        applyDebugSourcePrefillIfRequested()
+        #endif
     }
+
+    #if DEBUG
+    /// 仅调试构建：从启动参数预填一个远端来源，免去真机验证时重复输入。
+    ///
+    /// 机制随代码提交，但凭证只存在于安装方的启动命令中（不进源码、
+    /// fixture 或仓库历史），App 收到后走既有 addRemoteSource 流程——
+    /// 配置进 SwiftData、凭证进 Keychain。同 endpoint 已存在时不重复添加。
+    /// 参数：`-prefillSourceKind alist|webdav -prefillSourceName <名称>
+    /// -prefillSourceEndpoint <URL> -prefillSourceUsername <用户名>
+    /// -prefillSourcePassword <密码>`。
+    private func applyDebugSourcePrefillIfRequested() {
+        let arguments = ProcessInfo.processInfo.arguments
+        func value(after flag: String) -> String? {
+            guard let index = arguments.firstIndex(of: flag),
+                  arguments.indices.contains(index + 1) else {
+                return nil
+            }
+            return arguments[index + 1]
+        }
+        guard let endpoint = value(after: "-prefillSourceEndpoint"),
+              !endpoint.isEmpty else {
+            return
+        }
+        guard !sources.contains(where: { $0.endpoint == endpoint }) else { return }
+
+        let kind: ResourceSource.SourceKind =
+            value(after: "-prefillSourceKind") == "webdav" ? .webdav : .alist
+        addRemoteSource(
+            name: value(after: "-prefillSourceName") ?? "我的 Alist",
+            endpoint: endpoint,
+            kind: kind,
+            username: value(after: "-prefillSourceUsername") ?? "",
+            password: value(after: "-prefillSourcePassword") ?? ""
+        )
+    }
+    #endif
 
     var filteredResources: [ResourceItem] {
         resources.filter { resource in
