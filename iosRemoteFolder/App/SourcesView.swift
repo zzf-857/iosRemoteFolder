@@ -103,22 +103,30 @@ struct SourcesView: View {
                 }
 
                 Section("我的来源") {
-                    ForEach(store.entries) { entry in
-                        SourceConnectionRow(
-                            entry: entry,
-                            retry: { store.retry(entry.id) },
-                            edit: appModel.isManagedSource(entry.id) ? {
-                                beginEditing(entry)
-                            } : nil,
-                            reauthorize: canReauthorize(entry) ? {
-                                appModel.dismissSourceError()
-                                reauthorizationSourceID = entry.id
-                                isShowingFolderImporter = true
-                            } : nil,
-                            remove: appModel.isManagedSource(entry.id) ? {
-                                pendingAction = .remove(entry.id)
-                            } : nil
-                        )
+                    if store.entries.isEmpty {
+                        ContentUnavailableView {
+                            Label("还没有来源", systemImage: "externaldrive.badge.plus")
+                        } description: {
+                            Text("从上方添加你的 Alist、WebDAV 或本地文件夹。")
+                        }
+                    } else {
+                        ForEach(store.entries) { entry in
+                            SourceConnectionRow(
+                                entry: entry,
+                                retry: { store.retry(entry.id) },
+                                edit: appModel.isManagedSource(entry.id) ? {
+                                    beginEditing(entry)
+                                } : nil,
+                                reauthorize: canReauthorize(entry) ? {
+                                    appModel.dismissSourceError()
+                                    reauthorizationSourceID = entry.id
+                                    isShowingFolderImporter = true
+                                } : nil,
+                                remove: appModel.isManagedSource(entry.id) ? {
+                                    pendingAction = .remove(entry.id)
+                                } : nil
+                            )
+                        }
                     }
                 }
             }
@@ -492,17 +500,10 @@ private struct SourceConnectionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SourceRowView(source: displaySource)
-
-            if let edit {
-                HStack {
-                    Spacer(minLength: 0)
-                    Button(action: edit) {
-                        Label("编辑来源", systemImage: "pencil")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(AppTheme.accent)
-                    .frame(minHeight: 44)
+            HStack(alignment: .top, spacing: 8) {
+                SourceRowView(source: displaySource)
+                if edit != nil || remove != nil || reauthorize != nil {
+                    managementMenu
                 }
             }
 
@@ -566,6 +567,40 @@ private struct SourceConnectionRow: View {
                 }
             }
         }
+    }
+
+    /// 可见的管理入口：滑动操作保留，但不再是唯一路径。
+    private var managementMenu: some View {
+        Menu {
+            if let edit {
+                Button(action: edit) {
+                    Label("编辑来源", systemImage: "pencil")
+                }
+            }
+            if let reauthorize {
+                Button(action: reauthorize) {
+                    Label("重新授权", systemImage: "folder.badge.gearshape")
+                }
+            }
+            if case .failed = entry.state {
+                Button(action: retry) {
+                    Label("重试连接", systemImage: "arrow.clockwise")
+                }
+            }
+            if let remove {
+                Divider()
+                Button(role: .destructive, action: remove) {
+                    Label("移除来源", systemImage: "trash")
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(Text("管理来源 \(entry.source.name)"))
     }
 
     private var displaySource: ResourceSource {

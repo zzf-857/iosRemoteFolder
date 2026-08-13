@@ -136,15 +136,16 @@ final class AppModel {
             startupError = startupError ?? error.localizedDescription
         }
 
-        let demoSources = SampleData.sources
-        var allSources = demoSources
-        var adapters = Self.makeDemoAdapters(for: demoSources)
+        // 生产组合根只注册用户配置的来源（D-061）：演示来源退出生产
+        // 启动路径，SampleData 仅保留给测试与受控 fixture 使用。
+        var allSources: [ResourceSource] = []
+        var adapters: [any ResourceSourceAdapter] = []
         var startupFailures: [UUID: ResourceSourceError] = [:]
-        var sourceIDs = Set(demoSources.map(\.id))
+        var sourceIDs = Set<UUID>()
         var restoredRemoteIDs: Set<UUID> = []
 
         for configuration in restoredConfigurations {
-            // demo 来源与持久化来源不能共享 ID；保留 demo 并把冲突显示为配置错误，
+            // 持久化来源不能共享 ID；冲突显示为配置错误，
             // 不静默覆盖 registry 中已有 adapter。
             guard sourceIDs.insert(configuration.id).inserted else {
                 startupError = LocalSourceConfigurationError.duplicateSourceID(configuration.id)
@@ -206,12 +207,13 @@ final class AppModel {
         do {
             registry = try SourceRegistry(sources: allSources, adapters: adapters)
         } catch {
-            // demo 接线是固定代码；如果它自身无效，继续启动会破坏唯一 registry
-            // 契约，因此保持原有明确失败行为。
+            // 接线冲突已在上方按配置去重；此处失败意味着组合根自身矛盾，
+            // 继续启动会破坏唯一 registry 契约，保持明确失败行为。
             fatalError("来源接线无效：\(error.localizedDescription)")
         }
 
-        self.resources = SampleData.resources
+        // 无演示数据：Home 的继续/最近区域完全由真实最近记录驱动。
+        self.resources = []
         let recentStore = RecentResourceStore()
         recentStore.retain(sourceIDs: Set(allSources.map(\.id)))
         self.recentResourceStore = recentStore
@@ -945,44 +947,6 @@ final class AppModel {
         return name.isEmpty ? "本地文件夹" : name
     }
 
-    /// 演示来源的装配只属于 composition root；SourcesStore 不创建 adapter。
-    private static func makeDemoAdapters(
-        for sources: [ResourceSource]
-    ) -> [any ResourceSourceAdapter] {
-        var adapters: [any ResourceSourceAdapter] = []
-        for source in sources {
-            switch source.kind {
-            case .local:
-                adapters.append(
-                    LocalFilesSourceAdapter(source: source, rootURL: URL.documentsDirectory)
-                )
-            case .http:
-                adapters.append(
-                    HTTPSourceAdapter(source: source, descriptors: demoHTTPDescriptors)
-                )
-            case .alist, .webdav:
-                adapters.append(SampleSourceAdapter(source: source))
-            case .lan:
-                break
-            }
-        }
-        return adapters
-    }
-
-    private static let demoHTTPDescriptors: [HTTPResourceDescriptor] = [
-        HTTPResourceDescriptor(
-            path: "/示例/产品手册.pdf",
-            name: "产品手册.pdf",
-            kind: .pdf,
-            url: URL(string: "http://127.0.0.1:48080/files/product-handbook.pdf")!
-        ),
-        HTTPResourceDescriptor(
-            path: "/示例/团队合影.jpg",
-            name: "团队合影.jpg",
-            kind: .image,
-            url: URL(string: "http://127.0.0.1:48080/files/team-photo.jpg")!
-        )
-    ]
 }
 
 /// 临时的最近资源窄存储。

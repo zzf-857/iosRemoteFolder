@@ -9,9 +9,17 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     HomeHeader()
-                    ContinueSection(resources: Array(appModel.homeResources.prefix(3)))
-                    RecentSection(resources: appModel.homeResources)
-                    SourceAttentionSection(sources: appModel.sources)
+                    if appModel.homeResources.isEmpty {
+                        EmptyLibraryCard {
+                            appModel.currentTab = .sources
+                        }
+                    } else {
+                        ContinueSection(resources: Array(appModel.homeResources.prefix(3)))
+                        RecentSection(resources: appModel.homeResources)
+                    }
+                    if !appModel.sources.isEmpty {
+                        SourceAttentionSection(sources: appModel.sources)
+                    }
                 }
                 .padding(.horizontal)
                 .padding(.top, 12)
@@ -50,6 +58,12 @@ struct ResourceSearchView: View {
     @State private var isSearching = false
     @State private var errorMessage: String?
     @State private var retryRevision = 0
+    @State private var isSearchFieldPresented = true
+
+    /// 从浏览页进入时预选当前来源，搜索范围立即对齐用户所在上下文。
+    init(initialSourceID: UUID? = nil) {
+        _selectedSourceID = State(initialValue: initialSourceID)
+    }
 
     private var request: ResourceSearchRequest {
         ResourceSearchRequest(
@@ -111,7 +125,11 @@ struct ResourceSearchView: View {
         }
         .navigationTitle("搜索")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $query, prompt: "搜索已浏览目录（名称或路径）")
+        .searchable(
+            text: $query,
+            isPresented: $isSearchFieldPresented,
+            prompt: "搜索已浏览目录（名称或路径）"
+        )
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 filterMenu
@@ -406,6 +424,49 @@ private struct ContinueCard: View {
         .accessibilityLabel(Text(resource.name))
         .accessibilityValue(Text("\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))"))
         .accessibilityHint(Text("继续查看"))
+    }
+}
+
+/// 空库引导卡：没有任何最近内容时，指引用户先添加来源。
+private struct EmptyLibraryCard: View {
+    let openSources: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "externaldrive.badge.plus")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 68, height: 68)
+                .background(
+                    AppTheme.brandGradient,
+                    in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+                )
+                .shadow(color: AppTheme.accent.opacity(0.32), radius: 12, y: 5)
+                .accessibilityHidden(true)
+            VStack(spacing: 5) {
+                Text("从一个来源开始")
+                    .font(.headline)
+                    .fontDesign(.rounded)
+                Text("添加 Alist、WebDAV 或本地文件夹后，打开过的内容会出现在这里。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button(action: openSources) {
+                Text("添加来源")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 22)
+                    .frame(minHeight: 44)
+                    .background(AppTheme.brandGradient, in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 20)
+        .modernCard(cornerRadius: 26)
     }
 }
 

@@ -24,7 +24,6 @@ private struct BrowseContentView: View {
 
     @Binding var selectedSourceID: UUID?
     @State private var selectedKind: ResourceKind?
-    @State private var searchText: String = ""
 
     private var selectedEntry: SourcesStore.Entry? {
         guard let id = selectedSourceID else { return nil }
@@ -39,7 +38,6 @@ private struct BrowseContentView: View {
         .ambientScreenBackground()
         .navigationTitle("浏览")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $searchText, prompt: "搜索当前目录")
         .toolbar { toolbarContent }
         .glassNavigationBar()
         .task { store.connectAll() }
@@ -83,24 +81,36 @@ private struct BrowseContentView: View {
             }
         }
         ToolbarItem(placement: .topBarTrailing) {
+            // 唯一搜索入口：进入全局深搜索并预选当前来源。
             NavigationLink {
-                ResourceSearchView()
+                ResourceSearchView(initialSourceID: selectedSourceID)
             } label: {
                 Image(systemName: "magnifyingglass")
             }
-            .accessibilityLabel("搜索已浏览资源")
+            .accessibilityLabel("搜索资源")
         }
         ToolbarItem(placement: .topBarTrailing) {
-            Picker("类型", selection: $selectedKind) {
-                Text("全部").tag(ResourceKind?.none)
-                Text("PDF").tag(ResourceKind?.some(.pdf))
-                Text("Markdown").tag(ResourceKind?.some(.markdown))
-                Text("TXT").tag(ResourceKind?.some(.text))
-                Text("图片").tag(ResourceKind?.some(.image))
-                Text("视频").tag(ResourceKind?.some(.video))
-                Text("音乐").tag(ResourceKind?.some(.audio))
+            // 纯图标筛选菜单：激活时以实心图标提示，不再占用文字宽度。
+            Menu {
+                Picker("类型", selection: $selectedKind) {
+                    Label("全部", systemImage: "square.grid.2x2").tag(ResourceKind?.none)
+                    ForEach(
+                        [ResourceKind.pdf, .markdown, .text, .image, .video, .audio],
+                        id: \.self
+                    ) { kind in
+                        Label(kind.title, systemImage: kind.systemImage)
+                            .tag(ResourceKind?.some(kind))
+                    }
+                }
+            } label: {
+                Image(
+                    systemName: selectedKind == nil
+                        ? "line.3.horizontal.decrease.circle"
+                        : "line.3.horizontal.decrease.circle.fill"
+                )
             }
-            .pickerStyle(.menu)
+            .accessibilityLabel("按类型筛选")
+            .accessibilityValue(Text(selectedKind?.title ?? "全部"))
         }
     }
 
@@ -182,10 +192,21 @@ private struct BrowseContentView: View {
                 )
             }
         } else {
+            let visibleItems = filteredItems(browse.items)
             List {
                 breadcrumbSection(entry: entry, browse: browse)
-                ForEach(filteredItems(browse.items)) { item in
-                    row(for: item, entry: entry)
+                if visibleItems.isEmpty {
+                    ContentUnavailableView {
+                        Label("没有符合筛选的项目", systemImage: "line.3.horizontal.decrease.circle")
+                    } description: {
+                        Text("当前目录没有「\(selectedKind?.title ?? "全部")」类型的资源。")
+                    } actions: {
+                        Button("清除筛选") { selectedKind = nil }
+                    }
+                } else {
+                    ForEach(visibleItems) { item in
+                        row(for: item, entry: entry)
+                    }
                 }
             }
             .scrollContentBackground(.hidden)
@@ -203,12 +224,9 @@ private struct BrowseContentView: View {
     }
 
     private func filteredItems(_ items: [ResourceItem]) -> [ResourceItem] {
-        items.filter { item in
-            let matchesKind = selectedKind == nil || item.kind == selectedKind
-            let matchesSearch = searchText.isEmpty
-                || item.name.localizedCaseInsensitiveContains(searchText)
-            return matchesKind && matchesSearch
-        }
+        guard let selectedKind else { return items }
+        // 文件夹始终可见，保证筛选状态下仍能下钻目录。
+        return items.filter { $0.kind == .folder || $0.kind == selectedKind }
     }
 
     @ViewBuilder
