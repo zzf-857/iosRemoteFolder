@@ -334,6 +334,13 @@ final class AppModel {
         recentResources = recentResourceStore.items
     }
 
+    /// Removes only the local recent-history entry. Reading/playback progress,
+    /// content caches, preview caches and the source resource stay untouched.
+    func removeRecent(identity: ResourceIdentity) {
+        recentResourceStore.remove(identity: identity)
+        recentResources = recentResourceStore.items
+    }
+
     /// Returns a persisted media position only when the current resource facts
     /// still match the identity and known revision captured at save time.
     func resumePosition(
@@ -1165,6 +1172,13 @@ final class RecentResourceStore {
 
     func remove(sourceID: UUID) {
         let retained = items.filter { $0.sourceID != sourceID }
+        guard retained.count != items.count else { return }
+        items = retained
+        persist()
+    }
+
+    func remove(identity: ResourceIdentity) {
+        let retained = items.filter { $0.id != identity }
         guard retained.count != items.count else { return }
         items = retained
         persist()

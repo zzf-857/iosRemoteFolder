@@ -1,22 +1,43 @@
 import SwiftUI
 import UIKit
 
-/// A bounded, decorative preview used by resource rows.
+enum ResourcePreviewFallbackPresentation: Equatable {
+    case label
+    case symbol
+}
+
+/// A bounded, decorative preview used by resource rows and Home cards.
 /// The pipeline is obtained from AppModel so rows never create their own
 /// cache or source-reading lifetime.
 struct ResourcePreviewView: View {
     let resource: ResourceItem
+    let targetSize: CGSize
+    let cornerRadius: CGFloat
+    let fallbackPresentation: ResourcePreviewFallbackPresentation
+    let fillsAvailableWidth: Bool
 
     @Environment(AppModel.self) private var appModel
     @Environment(\.displayScale) private var displayScale
 
-    private let side: CGFloat = 40
+    init(
+        resource: ResourceItem,
+        targetSize: CGSize = CGSize(width: 40, height: 40),
+        cornerRadius: CGFloat = 8,
+        fallbackPresentation: ResourcePreviewFallbackPresentation = .label,
+        fillsAvailableWidth: Bool = false
+    ) {
+        self.resource = resource
+        self.targetSize = targetSize
+        self.cornerRadius = cornerRadius
+        self.fallbackPresentation = fallbackPresentation
+        self.fillsAvailableWidth = fillsAvailableWidth
+    }
 
     private var request: ResourcePreviewRequest? {
         guard resource.kind != .folder else { return nil }
         return ResourcePreviewRequest(
             item: resource,
-            targetSize: CGSize(width: side, height: side),
+            targetSize: targetSize,
             displayScale: displayScale
         )
     }
@@ -24,15 +45,36 @@ struct ResourcePreviewView: View {
     @ViewBuilder
     var body: some View {
         if resource.kind == .folder {
-            ResourceIconTile(kind: .folder, side: side)
+            if fallbackPresentation == .symbol {
+                ResourcePreviewSymbolFallback(resource: resource)
+                    .previewFrame(
+                        targetSize: targetSize,
+                        fillsAvailableWidth: fillsAvailableWidth
+                    )
+                    .clipShape(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    )
+                    .accessibilityHidden(true)
+            } else {
+                ResourceIconTile(
+                    kind: .folder,
+                    side: min(targetSize.width, targetSize.height)
+                )
+            }
         } else {
             PreviewTaskView(
                 resource: resource,
                 request: request,
-                pipeline: appModel.resourcePreviewPipeline
+                pipeline: appModel.resourcePreviewPipeline,
+                fallbackPresentation: fallbackPresentation
             )
-            .frame(width: side, height: side)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .previewFrame(
+                targetSize: targetSize,
+                fillsAvailableWidth: fillsAvailableWidth
+            )
+            .clipShape(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
             .accessibilityHidden(true)
         }
     }
@@ -42,6 +84,7 @@ private struct PreviewTaskView: View {
     let resource: ResourceItem
     let request: ResourcePreviewRequest?
     let pipeline: ResourcePreviewPipeline
+    let fallbackPresentation: ResourcePreviewFallbackPresentation
 
     @State private var state: PreviewState = .placeholder
     @State private var activeTaskID: PreviewTaskID?
@@ -92,8 +135,7 @@ private struct PreviewTaskView: View {
 
     private func placeholder(showsProgress: Bool) -> some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.secondary.opacity(0.12))
+            Color.secondary.opacity(0.12)
             if showsProgress {
                 ProgressView()
                     .controlSize(.small)
@@ -115,26 +157,43 @@ private struct PreviewTaskView: View {
             }
         case .textExcerpt(let excerpt):
             Text(excerpt)
-                .font(.system(size: 7, weight: .regular, design: .monospaced))
+                .font(
+                    .system(
+                        size: fallbackPresentation == .symbol ? 11 : 7,
+                        weight: .regular,
+                        design: .monospaced
+                    )
+                )
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.leading)
-                .lineLimit(4)
-                .padding(4)
+                .lineLimit(fallbackPresentation == .symbol ? 5 : 4)
+                .padding(fallbackPresentation == .symbol ? 10 : 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(Color.secondary.opacity(0.10))
+                .background(resource.kind.gradient.opacity(0.12))
         }
     }
 
+    @ViewBuilder
     private var fallback: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(resource.kind.gradient.opacity(0.18))
-            Text(fallbackLabel)
-                .font(.system(size: fallbackLabel.count > 3 ? 9 : 11, weight: .bold, design: .rounded))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .padding(3)
+        switch fallbackPresentation {
+        case .label:
+            ZStack {
+                resource.kind.gradient.opacity(0.18)
+                Text(fallbackLabel)
+                    .font(
+                        .system(
+                            size: fallbackLabel.count > 3 ? 9 : 11,
+                            weight: .bold,
+                            design: .rounded
+                        )
+                    )
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .padding(3)
+            }
+        case .symbol:
+            ResourcePreviewSymbolFallback(resource: resource)
         }
     }
 
@@ -171,6 +230,35 @@ private struct PreviewTaskView: View {
         } catch {
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
             state = .fallback
+        }
+    }
+}
+
+private struct ResourcePreviewSymbolFallback: View {
+    let resource: ResourceItem
+
+    var body: some View {
+        ZStack {
+            resource.kind.gradient
+            Image(systemName: resource.kind.systemImage)
+                .font(.system(size: 36, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.95))
+                .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+        }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func previewFrame(
+        targetSize: CGSize,
+        fillsAvailableWidth: Bool
+    ) -> some View {
+        if fillsAvailableWidth {
+            frame(maxWidth: .infinity)
+                .frame(height: targetSize.height)
+        } else {
+            frame(width: targetSize.width, height: targetSize.height)
         }
     }
 }

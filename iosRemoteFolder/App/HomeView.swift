@@ -15,7 +15,10 @@ struct HomeView: View {
                         }
                     } else {
                         ContinueSection(resources: Array(appModel.homeResources.prefix(3)))
-                        RecentSection(resources: appModel.homeResources)
+                        RecentSection(
+                            resources: appModel.homeResources,
+                            removeRecent: { appModel.removeRecent(identity: $0) }
+                        )
                     }
                     if !appModel.sources.isEmpty {
                         SourceAttentionSection(sources: appModel.sources)
@@ -387,16 +390,13 @@ private struct ContinueCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // 类型渐变横幅：内容层的视觉锚点。
-            ZStack {
-                resource.kind.gradient
-                Image(systemName: resource.kind.systemImage)
-                    .font(.system(size: 40, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.95))
-                    .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
-            }
-            .frame(height: 96)
-            .accessibilityHidden(true)
+            ResourcePreviewView(
+                resource: resource,
+                targetSize: CGSize(width: 260, height: 96),
+                cornerRadius: 0,
+                fallbackPresentation: .symbol,
+                fillsAvailableWidth: true
+            )
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(resource.name)
@@ -413,7 +413,7 @@ private struct ContinueCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(
-            minWidth: fillsWidth ? 0 : 200,
+            minWidth: fillsWidth ? 0 : 260,
             maxWidth: fillsWidth ? .infinity : 260,
             alignment: .leading
         )
@@ -472,24 +472,42 @@ private struct EmptyLibraryCard: View {
 
 private struct RecentSection: View {
     let resources: [ResourceItem]
+    let removeRecent: (ResourceIdentity) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             ModernSectionHeader(title: "最近打开")
-            VStack(spacing: 0) {
+            LazyVStack(spacing: 0) {
                 ForEach(Array(resources.enumerated()), id: \.element.id) { index, resource in
-                    NavigationLink(value: resource) {
-                        ResourceRowView(
-                            resource: resource,
-                            interaction: .actionable(
-                                resultHint: resource.kind == .folder ? "进入文件夹" : "打开资源"
-                            ),
-                            disclosureOwnership: .resourceRow
-                        )
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 4)
+                    HStack(spacing: 4) {
+                        NavigationLink(value: resource) {
+                            ResourceRowView(
+                                resource: resource,
+                                interaction: .actionable(resultHint: "打开资源"),
+                                disclosureOwnership: .container
+                            )
+                            .padding(.leading, 16)
+                            .padding(.vertical, 4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+
+                        Menu {
+                            Button(role: .destructive) {
+                                removeRecent(resource.id)
+                            } label: {
+                                Label("从最近打开中移除", systemImage: "trash")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.title3)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("更多操作，\(resource.name)")
+                        .padding(.trailing, 8)
                     }
-                    .buttonStyle(.plain)
                     if index < resources.count - 1 {
                         Divider()
                             .padding(.leading, 70)
