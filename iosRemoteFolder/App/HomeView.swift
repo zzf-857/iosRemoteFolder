@@ -304,7 +304,7 @@ private struct ResourceSearchResultRow: View {
     }
 
     private var icon: some View {
-        ResourceIconTile(kind: resource.kind, side: 40)
+        ResourcePreviewView(resource: resource)
     }
 
     private var details: some View {

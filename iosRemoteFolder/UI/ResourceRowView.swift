@@ -114,7 +114,7 @@ struct ResourceRowView: View {
     }
 
     private var resourceIcon: some View {
-        ResourceIconTile(kind: resource.kind, side: 40)
+        ResourcePreviewView(resource: resource)
     }
 
     private var disclosure: some View {
