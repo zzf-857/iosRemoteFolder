@@ -2,12 +2,16 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         @Bindable var appModel = appModel
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
+                VStack(
+                    alignment: .leading,
+                    spacing: dynamicTypeSize.isAccessibilitySize ? 24 : 28
+                ) {
                     HomeHeader()
                     if appModel.recentResources.isEmpty {
                         EmptyLibraryCard(
@@ -30,9 +34,18 @@ struct HomeView: View {
                 .padding(.horizontal)
                 .padding(.top, 12)
                 .padding(.bottom, 24)
+                .fixedSize(horizontal: false, vertical: true)
             }
+            .contentMargins(
+                .bottom,
+                dynamicTypeSize.isAccessibilitySize ? 128 : 40,
+                for: .scrollContent
+            )
             .ambientScreenBackground()
             .navigationTitle("首页")
+            .navigationBarTitleDisplayMode(
+                dynamicTypeSize.isAccessibilitySize ? .inline : .automatic
+            )
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
@@ -335,10 +348,17 @@ private struct ResourceSearchResultRow: View {
 }
 
 private struct HomeHeader: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("你的资源台")
-                .font(.system(size: 34, weight: .bold, design: .rounded))
+                .font(
+                    dynamicTypeSize.isAccessibilitySize
+                        ? .headline.bold()
+                        : .system(size: 34, weight: .bold, design: .rounded)
+                )
+                .fontDesign(.rounded)
                 .foregroundStyle(
                     LinearGradient(
                         colors: [.primary, .primary.opacity(0.75)],
@@ -346,9 +366,11 @@ private struct HomeHeader: View {
                         endPoint: .trailing
                     )
                 )
+                .fixedSize(horizontal: false, vertical: true)
             Text("从上次停下的位置继续。")
-                .font(.body)
+                .font(dynamicTypeSize.isAccessibilitySize ? .subheadline : .body)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
     }
@@ -451,6 +473,8 @@ private struct EmptyLibraryCard: View {
                 Text(hasSources ? "暂无最近打开" : "从一个来源开始")
                     .font(.headline)
                     .fontDesign(.rounded)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(
                     hasSources
                         ? "浏览并打开一个文件后，它会出现在这里。"
@@ -465,15 +489,20 @@ private struct EmptyLibraryCard: View {
                 Text(hasSources ? "浏览资源" : "添加来源")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 22)
+                    .padding(.vertical, 10)
                     .frame(minHeight: 44)
                     .background(AppTheme.brandGradient, in: Capsule())
             }
             .buttonStyle(.plain)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
         .padding(.horizontal, 20)
+        .fixedSize(horizontal: false, vertical: true)
         .modernCard(cornerRadius: 26)
     }
 }
