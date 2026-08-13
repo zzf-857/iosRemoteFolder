@@ -155,8 +155,7 @@ private struct PreviewTaskView: View {
         guard let request,
               resource.kind != .folder,
               resource.kind != .video,
-              resource.kind != .audio,
-              resource.kind != .unknown else {
+              resource.kind != .audio else {
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
             state = .fallback
             return

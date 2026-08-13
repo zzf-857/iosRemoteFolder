@@ -404,7 +404,7 @@ final class AppModel {
         offlineByteCount = await cacheCoordinator.storedByteCount()
     }
 
-    /// Removes only this app's managed content cache. Source files are untouched.
+    /// 清理本 App 管理的内容与预览缓存，来源文件不受影响。
     func clearOfflineCache() async {
         await cacheCoordinator.removeAll()
         await resourcePreviewPipeline.removeAll()

@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import ImageIO
 import PDFKit
+import QuickLookThumbnailing
 import UniformTypeIdentifiers
 
 struct ResourcePreviewRequest: Hashable, Sendable {
@@ -164,12 +165,16 @@ actor ResourcePreviewPipeline {
     private static let imageByteBudget: Int64 = 12 * 1024 * 1024
     private static let pdfByteBudget: Int64 = 16 * 1024 * 1024
     private static let textByteBudget: Int64 = 256 * 1024
+    private static let quickLookByteBudget: Int64 = 4 * 1024 * 1024
     private static let requestDeadline: Duration = .seconds(8)
     private static let memoryCostBudget = 16 * 1024 * 1024
     private static let diskByteBudget: Int64 = 64 * 1024 * 1024
     private static let maximumDiskRecordBytes: Int64 = 20 * 1024 * 1024
     private static let maximumManifestBytes: Int64 = 2 * 1024 * 1024
     private static let manifestFilename = "manifest.json"
+    private static let materializationRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("iosRemoteFolder", isDirectory: true)
+        .appendingPathComponent("preview-materialization-v1", isDirectory: true)
 
     private let accessService: ResourceAccessService
     private let cacheDirectory: URL
@@ -521,9 +526,9 @@ actor ResourcePreviewPipeline {
         limiter: PreviewConcurrencyLimiter
     ) async throws -> GeneratedPreview {
         switch request.item.kind {
-        case .folder, .video, .audio, .unknown:
+        case .folder, .video, .audio:
             throw ResourceSourceError.capabilityUnavailable
-        case .image, .pdf, .text, .markdown:
+        case .image, .pdf, .text, .markdown, .unknown:
             break
         }
 
@@ -570,7 +575,13 @@ actor ResourcePreviewPipeline {
                 maximumBytes: textByteBudget
             )
             artifact = try renderText(data)
-        case .folder, .video, .audio, .unknown:
+        case .unknown:
+            artifact = try await renderQuickLookThumbnail(
+                session: session,
+                metadata: metadata,
+                request: request
+            )
+        case .folder, .video, .audio:
             throw ResourceSourceError.capabilityUnavailable
         }
         try Task.checkCancellation()
@@ -588,6 +599,88 @@ actor ResourcePreviewPipeline {
             throw ResourceSourceError.responseTooLarge
         }
         return try await session.readData(maximumBytes: maximumBytes)
+    }
+
+    private static func renderQuickLookThumbnail(
+        session: ResourceContentSession,
+        metadata: ResourceMetadata,
+        request: ResourcePreviewRequest
+    ) async throws -> ResourcePreviewArtifact {
+        guard let byteSize = metadata.byteSize,
+              byteSize >= 0,
+              byteSize <= quickLookByteBudget else {
+            throw ResourceSourceError.responseTooLarge
+        }
+        guard let filename = quickLookFilename(for: request.item.name) else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
+        try Task.checkCancellation()
+
+        let data = try await session.readData(maximumBytes: quickLookByteBudget)
+        try Task.checkCancellation()
+
+        let directory = materializationRoot
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let fileURL = directory.appendingPathComponent(
+                filename,
+                isDirectory: false
+            )
+            try data.write(to: fileURL, options: .atomic)
+            try Task.checkCancellation()
+            return try await generateQuickLookThumbnail(
+                for: fileURL,
+                request: request
+            )
+        } catch {
+            throw mapError(error)
+        }
+    }
+
+    private static func quickLookFilename(for resourceName: String) -> String? {
+        let rawExtension = URL(fileURLWithPath: resourceName).pathExtension
+        let sanitized = rawExtension.utf8.filter { byte in
+            switch byte {
+            case 48...57, 65...90, 97...122:
+                true
+            default:
+                false
+            }
+        }
+        let boundedExtension = String(decoding: sanitized.prefix(10), as: UTF8.self)
+        guard !boundedExtension.isEmpty else { return nil }
+        return "resource.\(boundedExtension)"
+    }
+
+    private static func generateQuickLookThumbnail(
+        for fileURL: URL,
+        request: ResourcePreviewRequest
+    ) async throws -> ResourcePreviewArtifact {
+        let thumbnailRequest = QLThumbnailGenerator.Request(
+            fileAt: fileURL,
+            size: request.targetSize,
+            scale: request.displayScale,
+            representationTypes: [.thumbnail]
+        )
+        thumbnailRequest.iconMode = false
+
+        let image = try await QuickLookThumbnailContinuation(
+            request: thumbnailRequest
+        ).value()
+        try Task.checkCancellation()
+        let encoded = try encodePNG(image)
+        return .encodedImage(
+            data: encoded,
+            format: .png,
+            pixelWidth: image.width,
+            pixelHeight: image.height
+        )
     }
 
     private static func renderImage(
@@ -924,6 +1017,121 @@ actor ResourcePreviewPipeline {
         SHA256.hash(data: Data(token.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+}
+
+private final class QuickLookThumbnailContinuation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let request: QLThumbnailGenerator.Request
+    private var continuation: CheckedContinuation<CGImage, any Error>?
+    private var terminalResult: Result<CGImage, ResourceSourceError>?
+
+    init(request: QLThumbnailGenerator.Request) {
+        self.request = request
+    }
+
+    func value() async throws -> CGImage {
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<CGImage, any Error>) in
+                guard install(continuation) else { return }
+                submit()
+            }
+        }, onCancel: {
+            self.cancel()
+        })
+    }
+
+    private func install(
+        _ continuation: CheckedContinuation<CGImage, any Error>
+    ) -> Bool {
+        lock.lock()
+        if let terminalResult {
+            lock.unlock()
+            Self.resume(continuation, with: terminalResult)
+            return false
+        }
+        self.continuation = continuation
+        lock.unlock()
+        return true
+    }
+
+    private func submit() {
+        lock.lock()
+        let shouldSubmit = terminalResult == nil
+        lock.unlock()
+        guard shouldSubmit else { return }
+
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) {
+            [weak self] representation, error in
+            self?.complete(representation: representation, error: error)
+        }
+
+        // Cancellation may win after the preflight check but before Quick Look
+        // accepts the request. Cancel again after submission in that narrow race.
+        lock.lock()
+        let wasCancelled: Bool
+        if case .failure(.cancelled)? = terminalResult {
+            wasCancelled = true
+        } else {
+            wasCancelled = false
+        }
+        lock.unlock()
+        if wasCancelled {
+            QLThumbnailGenerator.shared.cancel(request)
+        }
+    }
+
+    private func complete(
+        representation: QLThumbnailRepresentation?,
+        error: (any Error)?
+    ) {
+        let result: Result<CGImage, ResourceSourceError>
+        if let error {
+            result = .failure(ResourceSourceError.mapping(error))
+        } else if let representation, representation.type == .thumbnail {
+            result = .success(representation.cgImage)
+        } else {
+            result = .failure(.capabilityUnavailable)
+        }
+        finish(result)
+    }
+
+    private func cancel() {
+        guard finish(.failure(.cancelled)) else { return }
+        QLThumbnailGenerator.shared.cancel(request)
+    }
+
+    @discardableResult
+    private func finish(
+        _ result: Result<CGImage, ResourceSourceError>
+    ) -> Bool {
+        lock.lock()
+        guard terminalResult == nil else {
+            lock.unlock()
+            return false
+        }
+        terminalResult = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+
+        if let continuation {
+            Self.resume(continuation, with: result)
+        }
+        return true
+    }
+
+    private static func resume(
+        _ continuation: CheckedContinuation<CGImage, any Error>,
+        with result: Result<CGImage, ResourceSourceError>
+    ) {
+        switch result {
+        case .success(let image):
+            continuation.resume(returning: image)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
     }
 }
 
