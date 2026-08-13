@@ -22,6 +22,8 @@
 		B00000000000000000000013 /* PlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000013 /* PlayerEngine.swift */; };
 		B00000000000000000000014 /* ViewerRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000014 /* ViewerRegistry.swift */; };
 		B00000000000000000000015 /* ViewerHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000015 /* ViewerHost.swift */; };
+		B00000000000000000000043 /* VideoPlayerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000043 /* VideoPlayerScreen.swift */; };
+		B00000000000000000000044 /* OrientationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000044 /* OrientationPolicy.swift */; };
 		B00000000000000000000016 /* AppTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000016 /* AppTheme.swift */; };
 		B00000000000000000000017 /* ResourceCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000017 /* ResourceCardView.swift */; };
 		B00000000000000000000018 /* ResourceRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000018 /* ResourceRowView.swift */; };
@@ -77,6 +79,8 @@
 		C00000000000000000000013 /* PlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerEngine.swift; sourceTree = "<group>"; };
 		C00000000000000000000014 /* ViewerRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerRegistry.swift; sourceTree = "<group>"; };
 		C00000000000000000000015 /* ViewerHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerHost.swift; sourceTree = "<group>"; };
+		C00000000000000000000044 /* OrientationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrientationPolicy.swift; sourceTree = "<group>"; };
+		C00000000000000000000043 /* VideoPlayerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlayerScreen.swift; sourceTree = "<group>"; };
 		C00000000000000000000016 /* AppTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTheme.swift; sourceTree = "<group>"; };
 		C00000000000000000000017 /* ResourceCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceCardView.swift; sourceTree = "<group>"; };
 		C00000000000000000000018 /* ResourceRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceRowView.swift; sourceTree = "<group>"; };
@@ -160,13 +164,13 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		A00000000000000000000010 /* App */ = {isa = PBXGroup; children = (C00000000000000000000001, C00000000000000000000002, C00000000000000000000003, C00000000000000000000004, C00000000000000000000005, C00000000000000000000006, C00000000000000000000007, ); path = App; sourceTree = "<group>"; };
+		A00000000000000000000010 /* App */ = {isa = PBXGroup; children = (C00000000000000000000001, C00000000000000000000002, C00000000000000000000003, C00000000000000000000004, C00000000000000000000005, C00000000000000000000006, C00000000000000000000007, C00000000000000000000044, ); path = App; sourceTree = "<group>"; };
 		A00000000000000000000011 /* Domain */ = {isa = PBXGroup; children = (C00000000000000000000008, C00000000000000000000009, C00000000000000000000020, C00000000000000000000021, C00000000000000000000025, ); path = Domain; sourceTree = "<group>"; };
 		A00000000000000000000012 /* Sources */ = {isa = PBXGroup; children = (C00000000000000000000010, C00000000000000000000022, C00000000000000000000023, C00000000000000000000024, C00000000000000000000027, C00000000000000000000028, C00000000000000000000029, C00000000000000000000035, C00000000000000000000036, C00000000000000000000037, C00000000000000000000039, C00000000000000000000041, ); path = Sources; sourceTree = "<group>"; };
 		A00000000000000000000013 /* Indexing */ = {isa = PBXGroup; children = (C00000000000000000000011, ); path = Indexing; sourceTree = "<group>"; };
 		A00000000000000000000014 /* Cache */ = {isa = PBXGroup; children = (C00000000000000000000012, ); path = Cache; sourceTree = "<group>"; };
 		A00000000000000000000015 /* Playback */ = {isa = PBXGroup; children = (C00000000000000000000013, ); path = Playback; sourceTree = "<group>"; };
-		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, ); path = Viewers; sourceTree = "<group>"; };
+		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, C00000000000000000000043, ); path = Viewers; sourceTree = "<group>"; };
 		A00000000000000000000017 /* UI */ = {isa = PBXGroup; children = (C00000000000000000000016, C00000000000000000000017, C00000000000000000000018, C00000000000000000000019, C00000000000000000000026, ); path = UI; sourceTree = "<group>"; };
 		A00000000000000000000018 /* iosRemoteFolderTests */ = {
 			isa = PBXGroup;
@@ -294,6 +298,8 @@
 				B00000000000000000000013 /* PlayerEngine.swift in Sources */,
 				B00000000000000000000014 /* ViewerRegistry.swift in Sources */,
 				B00000000000000000000015 /* ViewerHost.swift in Sources */,
+				B00000000000000000000043 /* VideoPlayerScreen.swift in Sources */,
+				B00000000000000000000044 /* OrientationPolicy.swift in Sources */,
 				B00000000000000000000016 /* AppTheme.swift in Sources */,
 				B00000000000000000000017 /* ResourceCardView.swift in Sources */,
 				B00000000000000000000018 /* ResourceRowView.swift in Sources */,

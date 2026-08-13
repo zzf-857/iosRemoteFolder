@@ -3,6 +3,7 @@ import SwiftData
 
 @main
 struct iosRemoteFolderApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     private let modelContainer: ModelContainer
     @State private var appModel: AppModel
 

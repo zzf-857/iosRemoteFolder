@@ -81,9 +81,19 @@ struct ResourceViewerHost: View {
         resolution: ViewerResolution,
         payload: ViewerContentPayload?
     ) -> some View {
-        VStack(spacing: 0) {
-            metadataSummary(metadata)
-            viewerView(resolution: resolution, metadata: metadata, payload: payload)
+        if resolution.kind == .videoPlayer,
+           case .video(let engine) = payload {
+            VideoPlayerScreen(
+                resource: resource,
+                metadata: metadata,
+                engine: engine,
+                onRetry: { retryMedia(engine) }
+            )
+        } else {
+            VStack(spacing: 0) {
+                metadataSummary(metadata)
+                viewerView(resolution: resolution, metadata: metadata, payload: payload)
+            }
         }
     }
 

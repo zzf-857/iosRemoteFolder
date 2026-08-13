@@ -88,6 +88,7 @@ final class AVMediaPlayerEngine {
     @ObservationIgnored private var isStopped = false
     @ObservationIgnored private var didReachEnd = false
     @ObservationIgnored private var runtimeFailure: ResourceSourceError?
+    @ObservationIgnored private var seekGeneration: UInt64 = 0
     @ObservationIgnored private var monitoringGeneration = UUID()
     @ObservationIgnored private var monitoringTask: Task<Void, Never>?
     @ObservationIgnored private var preparationWatchdog: Task<Void, Never>?
@@ -233,8 +234,23 @@ final class AVMediaPlayerEngine {
     }
 
     func seek(to time: TimeInterval) {
-        guard isPrepared, !isStopped, duration > 0 else { return }
-        if case .failed = playbackState { return }
+        seek(to: time, completion: nil)
+    }
+
+    func seek(
+        to time: TimeInterval,
+        completion: (@MainActor @Sendable (_ finished: Bool) -> Void)?
+    ) {
+        guard isPrepared, !isStopped, duration > 0 else {
+            completion?(false)
+            return
+        }
+        if case .failed = playbackState {
+            completion?(false)
+            return
+        }
+        seekGeneration &+= 1
+        let generation = seekGeneration
         let clamped = min(max(time, 0), duration)
         if clamped < duration {
             didReachEnd = false
@@ -242,7 +258,20 @@ final class AVMediaPlayerEngine {
         player.seek(
             to: CMTime(seconds: clamped, preferredTimescale: 600),
             toleranceBefore: .zero,
-            toleranceAfter: .zero
+            toleranceAfter: .zero,
+            completionHandler: { [weak self] finished in
+                Task { @MainActor in
+                    guard let self else {
+                        completion?(false)
+                        return
+                    }
+                    completion?(
+                        finished
+                            && !self.isStopped
+                            && self.seekGeneration == generation
+                    )
+                }
+            }
         )
         refreshPlaybackState()
     }
@@ -253,6 +282,7 @@ final class AVMediaPlayerEngine {
         isPrepared = false
         didReachEnd = false
         runtimeFailure = nil
+        seekGeneration &+= 1
         monitoringGeneration = UUID()
         monitoringTask?.cancel()
         monitoringTask = nil
