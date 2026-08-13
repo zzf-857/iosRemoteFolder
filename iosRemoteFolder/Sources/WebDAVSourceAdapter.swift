@@ -69,11 +69,11 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
     }
 
     func connect() async throws {
-        _ = try await propfind(path: .root, depth: 0)
+        _ = try await propfind(path: .root, depth: 0, isCollection: true)
     }
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
-        let entries = try await propfind(path: path, depth: 1)
+        let entries = try await propfind(path: path, depth: 1, isCollection: true)
         var seenKinds: [String: Bool] = [:]
         var items: [ResourceItem] = []
 
@@ -124,7 +124,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
     func fetchMetadata(for item: ResourceItem) async throws -> ResourceMetadata {
         let path = try validatedFilePath(for: item)
-        let entries = try await propfind(path: path, depth: 0)
+        let entries = try await propfind(path: path, depth: 0, isCollection: false)
         let matchingEntries = try entries.filter { entry in
             try logicalPath(from: entry.href) == path
         }
@@ -203,13 +203,17 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
     // MARK: - WebDAV request and response mapping
 
-    private func propfind(path: ResourcePath, depth: Int) async throws -> [DAVEntry] {
+    private func propfind(
+        path: ResourcePath,
+        depth: Int,
+        isCollection: Bool
+    ) async throws -> [DAVEntry] {
         guard depth == 0 || depth == 1 else {
             throw ResourceSourceError.invalidReference
         }
 
         var request = URLRequest(
-            url: resourceURL(for: path, isDirectory: true),
+            url: resourceURL(for: path, isDirectory: isCollection),
             timeoutInterval: timeout
         )
         request.httpMethod = "PROPFIND"

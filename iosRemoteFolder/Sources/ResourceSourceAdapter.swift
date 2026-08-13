@@ -88,13 +88,31 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
         }
     }
 
-    /// 值得让用户立即重试的错误。
+    /// 值得让用户通过界面手动重试的错误。
+    ///
+    /// 这个判定只表达手动重试 UI，不得作为后台自动恢复的白名单。
     var isRetryable: Bool {
         switch self {
         case .timedOut, .networkUnavailable, .unavailable, .invalidResponse:
             return true
         case .httpStatus(let code):
             return code >= 500
+        default:
+            return false
+        }
+    }
+
+    /// 可以由幂等只读操作在网络恢复时自动重试的明确瞬时失败。
+    ///
+    /// `.unavailable` 是可能包含 TLS 等确定性失败的兜底桶；501/505 表达
+    /// 服务端能力或协议版本问题。它们与认证、权限、协议违约、预算和取消
+    /// 一样，只能保留给用户行动，不能进入自动恢复循环。
+    var isAutomaticallyRecoverable: Bool {
+        switch self {
+        case .timedOut, .networkUnavailable:
+            return true
+        case .httpStatus(let code):
+            return (500...599).contains(code) && code != 501 && code != 505
         default:
             return false
         }

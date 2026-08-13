@@ -242,7 +242,7 @@ actor SourceRegistry {
                 }
                 let mapped = ResourceSourceError.mapping(error)
                 guard attempt < transientRetryDelays.count,
-                      Self.isTransientFailure(mapped) else {
+                      mapped.isAutomaticallyRecoverable else {
                     throw error
                 }
                 do {
@@ -264,18 +264,4 @@ actor SourceRegistry {
         }
     }
 
-    /// 只有明确的瞬时网络失败参与自动重试。
-    ///
-    /// `.unavailable` 是错误映射的兜底桶（含 TLS 证书不受信等确定性失败），
-    /// 不参与自动重试；501/505 属确定性服务端能力问题，同样排除。
-    private static func isTransientFailure(_ error: ResourceSourceError) -> Bool {
-        switch error {
-        case .timedOut, .networkUnavailable:
-            return true
-        case .httpStatus(let code):
-            return code >= 500 && code != 501 && code != 505
-        default:
-            return false
-        }
-    }
 }

@@ -213,29 +213,30 @@ final class SourcesStore {
         connect(sourceID, initialPath: targetPath)
     }
 
-    /// 弱网/断网恢复入口：自动重连所有因瞬时网络失败进入 failed 的来源。
+    /// 弱网/断网恢复入口：恢复连接级和当前目录级的明确瞬时失败。
     ///
     /// 认证、权限、协议违约等需要用户行动或提示确定性问题的失败不自动重连，
-    /// 避免用错误凭证反复打服务器或掩盖真实问题。
-    func reconnectFailedSources() {
+    /// 避免用错误凭证反复请求服务器或掩盖真实问题。连接中和目录加载中的
+    /// 来源由各自任务生命周期负责，重复的前台/网络恢复事件不会重启它们。
+    func recoverTransientFailures() {
         for entry in entries where entry.hasAdapter {
-            guard case .failed(let error) = entry.state,
-                  Self.isRecoverableConnectionFailure(error) else { continue }
-            retry(entry.id)
+            switch entry.state {
+            case .failed(let error) where error.isAutomaticallyRecoverable:
+                retry(entry.id)
+            case .ready:
+                guard !entry.browse.isLoading,
+                      let error = entry.browse.error,
+                      error.isAutomaticallyRecoverable else { continue }
+                loadDirectory(entry.id, at: entry.browse.currentPath)
+            case .disconnected, .connecting, .failed:
+                continue
+            }
         }
     }
 
-    /// 与 registry 的瞬时失败白名单保持一致：`.unavailable` 兜底桶与
-    /// 501/505 确定性失败不自动重连，避免对永远失败的来源反复打服务器。
-    private static func isRecoverableConnectionFailure(_ error: ResourceSourceError) -> Bool {
-        switch error {
-        case .timedOut, .networkUnavailable:
-            return true
-        case .httpStatus(let code):
-            return code >= 500 && code != 501 && code != 505
-        default:
-            return false
-        }
+    /// 兼容既有调用方；自动恢复行为统一由 `recoverTransientFailures()` 定义。
+    func reconnectFailedSources() {
+        recoverTransientFailures()
     }
 
     /// 若来源处于可连接状态则发起连接（用于来源被选中时按需连接）。
