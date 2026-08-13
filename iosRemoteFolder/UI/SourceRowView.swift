@@ -57,25 +57,14 @@ struct SourceRowView: View {
     }
 
     private var sourceIcon: some View {
-        Image(systemName: source.kind.systemImage)
-            .font(.title3)
-            .foregroundStyle(AppTheme.accent)
-            .frame(width: 42, height: 42)
-            .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-            .accessibilityHidden(true)
+        SourceIconTile(kind: source.kind, side: 44)
     }
 
     private var statusView: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(source.status == .connected ? AppTheme.accent : AppTheme.warmAccent)
-                .frame(width: 8, height: 8)
-                .accessibilityHidden(true)
-            Text(source.status.title)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
+        StatusPill(
+            title: source.status.title,
+            color: AppTheme.statusColor(for: source.status)
+        )
         .frame(minHeight: 44, alignment: .leading)
     }
 }

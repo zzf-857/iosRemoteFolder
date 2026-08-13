@@ -34,9 +34,9 @@ private struct BrowseContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             sourcePicker
-            Divider()
             listing
         }
+        .ambientScreenBackground()
         .navigationTitle("浏览")
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, prompt: "搜索当前目录")
@@ -188,6 +188,7 @@ private struct BrowseContentView: View {
                     row(for: item, entry: entry)
                 }
             }
+            .scrollContentBackground(.hidden)
         }
     }
 
@@ -243,19 +244,25 @@ private struct BrowseContentView: View {
         let path = browse.currentPath
         return Section {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
+                HStack(spacing: 6) {
                     Button {
                         store.loadDirectory(entry.id, at: .root)
                     } label: {
-                        Label("根目录", systemImage: "folder")
-                            .frame(minWidth: 44, minHeight: 44)
+                        Label("根目录", systemImage: "house.fill")
+                            .font(.footnote.weight(.medium))
+                            .padding(.horizontal, 12)
+                            .frame(minWidth: 44, minHeight: 36)
+                            .background(AppTheme.accent.opacity(0.12), in: Capsule())
+                            .foregroundStyle(AppTheme.accent)
                     }
                     .buttonStyle(.borderless)
+                    .frame(minHeight: 44)
                     .contentShape(Rectangle())
                     ForEach(Array(path.components.enumerated()), id: \.offset) { index, component in
                         let prefix = "/" + path.components.prefix(index + 1).joined(separator: "/")
-                        Text("/")
-                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
                             .accessibilityHidden(true)
                         Button {
                             if let crumb = ResourcePath(rawValue: prefix) {
@@ -263,10 +270,17 @@ private struct BrowseContentView: View {
                             }
                         } label: {
                             Text(component)
+                                .font(.footnote.weight(.medium))
                                 .fixedSize(horizontal: true, vertical: false)
-                                .frame(minWidth: 44, minHeight: 44)
+                                .padding(.horizontal, 12)
+                                .frame(minWidth: 44, minHeight: 36)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .overlay(
+                                    Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                                )
                         }
                         .buttonStyle(.borderless)
+                        .frame(minHeight: 44)
                         .contentShape(Rectangle())
                     }
                 }
@@ -286,22 +300,52 @@ private struct SourceChip: View {
 
     var body: some View {
         Button(action: action) {
-            Label(source.name, systemImage: source.kind.systemImage)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(
-                    isSelected ? AppTheme.accent.opacity(0.18) : Color(.secondarySystemFill),
-                    in: Capsule()
+            HStack(spacing: 8) {
+                Image(systemName: source.kind.systemImage)
+                    .font(.footnote.weight(.semibold))
+                Text(source.name)
+                    .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                Circle()
+                    .fill(
+                        isSelected
+                            ? Color.white.opacity(0.9)
+                            : AppTheme.statusColor(for: source.status)
+                    )
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background {
+                if isSelected {
+                    Capsule().fill(AppTheme.brandGradient)
+                } else {
+                    Capsule().fill(.ultraThinMaterial)
+                }
+            }
+            .overlay(
+                Capsule().strokeBorder(
+                    isSelected ? .clear : Color.primary.opacity(0.08),
+                    lineWidth: 1
                 )
-                .overlay(
-                    Capsule().strokeBorder(isSelected ? AppTheme.accent : .clear, lineWidth: 1.5)
-                )
+            )
+            .foregroundStyle(isSelected ? .white : .primary)
+            .shadow(
+                color: isSelected ? AppTheme.accent.opacity(0.35) : .clear,
+                radius: 10,
+                y: 4
+            )
         }
         .buttonStyle(.plain)
-        .tint(AppTheme.accent)
-        .opacity(hasAdapter ? 1 : 0.6)
+        .opacity(hasAdapter ? 1 : 0.55)
         .frame(minHeight: 44)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
-        .accessibilityValue(Text(hasAdapter ? (isSelected ? "已选中，可浏览" : "可浏览") : "适配器未接入"))
+        .accessibilityValue(
+            Text(
+                hasAdapter
+                    ? (isSelected ? "已选中，\(source.status.title)" : source.status.title)
+                    : "适配器未接入"
+            )
+        )
     }
 }

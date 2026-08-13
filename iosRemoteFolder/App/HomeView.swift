@@ -15,7 +15,9 @@ struct HomeView: View {
                 }
                 .padding(.horizontal)
                 .padding(.top, 12)
+                .padding(.bottom, 24)
             }
+            .ambientScreenBackground()
             .navigationTitle("首页")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -284,12 +286,7 @@ private struct ResourceSearchResultRow: View {
     }
 
     private var icon: some View {
-        Image(systemName: resource.kind.systemImage)
-            .font(.title3)
-            .foregroundStyle(AppTheme.accent)
-            .frame(width: 36, height: 36)
-            .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-            .accessibilityHidden(true)
+        ResourceIconTile(kind: resource.kind, side: 40)
     }
 
     private var details: some View {
@@ -317,11 +314,19 @@ private struct HomeHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("你的资源台")
-                .font(.largeTitle.bold())
+                .font(.system(size: 34, weight: .bold, design: .rounded))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.primary, .primary.opacity(0.75)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
             Text("从上次停下的位置继续。")
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -331,7 +336,7 @@ private struct ContinueSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SectionTitle(title: "继续")
+            ModernSectionHeader(title: "继续")
             if dynamicTypeSize.isAccessibilitySize {
                 VStack(spacing: 14) {
                     ForEach(resources) { resource in
@@ -351,6 +356,7 @@ private struct ContinueSection: View {
                             .buttonStyle(.plain)
                         }
                     }
+                    .padding(.vertical, 4)
                 }
             }
         }
@@ -362,28 +368,40 @@ private struct ContinueCard: View {
     let fillsWidth: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: resource.kind.systemImage)
-                .font(.title)
-                .foregroundStyle(AppTheme.accent)
-                .frame(width: 58, height: 58)
-                .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
-            Text(resource.name)
-                .font(.headline)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(ResourceMetadataFormatter.modified(for: resource.metadata))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 0) {
+            // 类型渐变横幅：内容层的视觉锚点。
+            ZStack {
+                resource.kind.gradient
+                Image(systemName: resource.kind.systemImage)
+                    .font(.system(size: 40, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+            }
+            .frame(height: 96)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(resource.name)
+                    .font(.headline)
+                    .fontDesign(.rounded)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("\(resource.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(
-            minWidth: fillsWidth ? 0 : 180,
-            maxWidth: fillsWidth ? .infinity : 280,
+            minWidth: fillsWidth ? 0 : 200,
+            maxWidth: fillsWidth ? .infinity : 260,
             alignment: .leading
         )
         .fixedSize(horizontal: false, vertical: true)
-        .padding(18)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .modernCard(cornerRadius: 24)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(resource.name))
         .accessibilityValue(Text("\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))"))
@@ -395,20 +413,30 @@ private struct RecentSection: View {
     let resources: [ResourceItem]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionTitle(title: "最近打开")
-            ForEach(resources) { resource in
-                NavigationLink(value: resource) {
-                    ResourceRowView(
-                        resource: resource,
-                        interaction: .actionable(
-                            resultHint: resource.kind == .folder ? "进入文件夹" : "打开资源"
-                        ),
-                        disclosureOwnership: .resourceRow
-                    )
+        VStack(alignment: .leading, spacing: 14) {
+            ModernSectionHeader(title: "最近打开")
+            VStack(spacing: 0) {
+                ForEach(Array(resources.enumerated()), id: \.element.id) { index, resource in
+                    NavigationLink(value: resource) {
+                        ResourceRowView(
+                            resource: resource,
+                            interaction: .actionable(
+                                resultHint: resource.kind == .folder ? "进入文件夹" : "打开资源"
+                            ),
+                            disclosureOwnership: .resourceRow
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    if index < resources.count - 1 {
+                        Divider()
+                            .padding(.leading, 70)
+                    }
                 }
-                .buttonStyle(.plain)
             }
+            .padding(.vertical, 6)
+            .modernCard(cornerRadius: 22)
         }
     }
 }
@@ -417,20 +445,21 @@ private struct SourceAttentionSection: View {
     let sources: [ResourceSource]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionTitle(title: "来源状态")
-            ForEach(sources) { source in
-                SourceRowView(source: source)
+        VStack(alignment: .leading, spacing: 14) {
+            ModernSectionHeader(title: "来源状态")
+            VStack(spacing: 0) {
+                ForEach(Array(sources.enumerated()), id: \.element.id) { index, source in
+                    SourceRowView(source: source)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
+                    if index < sources.count - 1 {
+                        Divider()
+                            .padding(.leading, 74)
+                    }
+                }
             }
+            .padding(.vertical, 6)
+            .modernCard(cornerRadius: 22)
         }
-    }
-}
-
-private struct SectionTitle: View {
-    let title: String
-
-    var body: some View {
-        Text(title)
-            .font(.title3.bold())
     }
 }

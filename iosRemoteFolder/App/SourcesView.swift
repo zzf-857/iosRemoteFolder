@@ -62,24 +62,24 @@ struct SourcesView: View {
         NavigationStack {
             List {
                 Section {
-                    Button {
+                    AddSourceRow(
+                        title: "添加本地文件夹",
+                        subtitle: "从文件 App 选择一个文件夹",
+                        systemImage: "folder.badge.plus"
+                    ) {
                         appModel.dismissSourceError()
                         reauthorizationSourceID = nil
                         isShowingFolderImporter = true
-                    } label: {
-                        Label("添加本地文件夹", systemImage: "folder.badge.plus")
-                            .font(.headline)
                     }
-                    .tint(AppTheme.accent)
 
-                    Button {
+                    AddSourceRow(
+                        title: "添加 WebDAV / Alist",
+                        subtitle: "连接你的服务器或网盘挂载",
+                        systemImage: "server.rack"
+                    ) {
                         appModel.dismissSourceError()
                         remoteDraft = .adding()
-                    } label: {
-                        Label("添加 WebDAV / Alist", systemImage: "server.rack")
-                            .font(.headline)
                     }
-                    .tint(AppTheme.accent)
                 }
 
                 if let error = appModel.sourceActionError {
@@ -122,6 +122,8 @@ struct SourcesView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .ambientScreenBackground()
             .navigationTitle("来源")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -430,6 +432,52 @@ private struct LocalSourceFormView: View {
                 }
             }
         }
+    }
+}
+
+/// 添加来源入口行：品牌渐变 tile + 标题/副标题。
+private struct AddSourceRow: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        AppTheme.brandGradient,
+                        in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    )
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.headline)
+                        .fontDesign(.rounded)
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "plus.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(AppTheme.accent)
+                    .accessibilityHidden(true)
+            }
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text(title))
+        .accessibilityHint(Text(subtitle))
     }
 }
 

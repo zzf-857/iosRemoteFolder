@@ -43,6 +43,8 @@ struct OfflineView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .ambientScreenBackground()
             .navigationTitle("离线")
             .task {
                 await appModel.refreshOfflineCache()
@@ -117,13 +119,22 @@ private struct OfflineStorageSummary: View {
         }
     }
 
+    private var summaryIcon: some View {
+        Image(systemName: "internaldrive.fill")
+            .font(.system(size: 19, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 46, height: 46)
+            .background(
+                AppTheme.brandGradient,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .shadow(color: AppTheme.accent.opacity(0.3), radius: 7, y: 3)
+            .accessibilityHidden(true)
+    }
+
     private var compactLayout: some View {
         HStack(alignment: .center, spacing: 14) {
-            Image(systemName: "internaldrive")
-                .font(.title3)
-                .foregroundStyle(AppTheme.accent)
-                .frame(width: 44, height: 44)
-                .accessibilityHidden(true)
+            summaryIcon
             storageText
                 .layoutPriority(1)
         }
@@ -131,11 +142,7 @@ private struct OfflineStorageSummary: View {
 
     private var stackedLayout: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: "internaldrive")
-                .font(.title3)
-                .foregroundStyle(AppTheme.accent)
-                .frame(width: 44, height: 44)
-                .accessibilityHidden(true)
+            summaryIcon
             storageText
         }
     }

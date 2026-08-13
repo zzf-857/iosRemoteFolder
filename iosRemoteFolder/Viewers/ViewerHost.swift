@@ -700,7 +700,7 @@ struct MarkdownReaderView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            ViewerHeader(icon: "text.badge.checkmark", eyebrow: "MARKDOWN READER", title: resource.name)
+            ViewerHeader(kind: .markdown, title: resource.name)
             Picker("显示模式", selection: $renderedMode) {
                 Text("渲染").tag(true)
                 Text("源码").tag(false)
@@ -1010,25 +1010,45 @@ struct VideoPlayerView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-            ScrollView {
-                VStack(spacing: 18) {
-                    VideoPlayer(player: engine.player)
-                        .aspectRatio(16 / 9, contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        .disabled(engine.playbackState.disablesControls)
-                        .allowsHitTesting(!engine.playbackState.disablesControls)
-                        .accessibilityLabel(Text("\(resource.name)，视频播放器"))
+            ZStack {
+                MediaAmbientBackground(kind: .video)
+                ScrollView {
+                    VStack(spacing: 20) {
+                        VideoPlayer(player: engine.player)
+                            .aspectRatio(16 / 9, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                            )
+                            .shadow(color: .black.opacity(0.30), radius: 24, y: 10)
+                            .disabled(engine.playbackState.disablesControls)
+                            .allowsHitTesting(!engine.playbackState.disablesControls)
+                            .accessibilityLabel(Text("\(resource.name)，视频播放器"))
 
-                    MediaPlaybackControls(
-                        engine: engine,
-                        onSeekCommitted: { nowPlaying.refresh() }
-                    ) {
-                        savePosition(engine)
-                        onRetry()
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(resource.name)
+                                .font(.headline)
+                                .fontDesign(.rounded)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("\(resource.kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityElement(children: .combine)
+
+                        MediaPlaybackControls(
+                            engine: engine,
+                            onSeekCommitted: { nowPlaying.refresh() }
+                        ) {
+                            savePosition(engine)
+                            onRetry()
+                        }
                     }
+                    .frame(maxWidth: 900)
+                    .padding()
                 }
-                .frame(maxWidth: 900)
-                .padding()
             }
         }
         .onAppear {
@@ -1103,30 +1123,34 @@ struct MusicPlayerView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-            ScrollView {
-                VStack(spacing: 24) {
-                    ViewerHeader(icon: "music.note", eyebrow: "MUSIC PLAYER", title: resource.name)
-                    RoundedRectangle(cornerRadius: 26)
-                        .fill(AppTheme.accent.opacity(0.18))
-                        .aspectRatio(1, contentMode: .fit)
-                        .overlay {
-                            Image(systemName: "music.note.list")
-                                .font(.system(size: 72))
-                                .foregroundStyle(AppTheme.accent)
+            ZStack {
+                MediaAmbientBackground(kind: .audio)
+                ScrollView {
+                    VStack(spacing: 26) {
+                        artwork
+                        VStack(spacing: 6) {
+                            Text(resource.name)
+                                .font(.title2.bold())
+                                .fontDesign(.rounded)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("\(resource.kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-                    Text(resource.name)
-                        .font(.title2.bold())
-                        .multilineTextAlignment(.center)
-                    MediaPlaybackControls(
-                        engine: engine,
-                        onSeekCommitted: { nowPlaying.refresh() }
-                    ) {
-                        savePosition(engine)
-                        onRetry()
+                        .accessibilityElement(children: .combine)
+                        MediaPlaybackControls(
+                            engine: engine,
+                            onSeekCommitted: { nowPlaying.refresh() }
+                        ) {
+                            savePosition(engine)
+                            onRetry()
+                        }
                     }
+                    .frame(maxWidth: 560)
+                    .padding(20)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: 620)
-                .padding()
             }
         }
         .onAppear {
@@ -1141,6 +1165,26 @@ struct MusicPlayerView: View {
         .onChange(of: engine.playbackState) { _, _ in
             nowPlaying.refresh()
         }
+    }
+
+    /// 大幅渐变封面：音频类型光谱 + 音符符号，取代旧的浅色占位块。
+    private var artwork: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 44, style: .continuous)
+                .fill(ResourceKind.audio.gradient)
+            Image(systemName: "music.note")
+                .font(.system(size: 92, weight: .medium))
+                .foregroundStyle(.white.opacity(0.95))
+                .shadow(color: .black.opacity(0.25), radius: 14, y: 6)
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .frame(maxWidth: 330)
+        .shadow(
+            color: (ResourceKind.audio.gradientColors.first ?? .clear).opacity(0.42),
+            radius: 30,
+            y: 14
+        )
+        .accessibilityHidden(true)
     }
 
     private func restorePositionIfNeeded(_ engine: AVMediaPlayerEngine) {
@@ -1171,6 +1215,26 @@ struct MusicPlayerView: View {
         }
     }
 
+}
+
+/// 媒体页氛围背景：类型光谱渐变经超薄材质柔化，深浅色自适应。
+private struct MediaAmbientBackground: View {
+    let kind: ResourceKind
+
+    var body: some View {
+        ZStack {
+            Color(.systemBackground)
+            LinearGradient(
+                colors: kind.gradientColors.map { $0.opacity(0.32) },
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Rectangle()
+                .fill(.ultraThinMaterial)
+        }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
+    }
 }
 
 @MainActor
@@ -1216,6 +1280,7 @@ private struct MediaPlaybackControls: View {
                     onSeekCommitted?()
                 }
             )
+            .tint(AppTheme.accent)
             .disabled(engine.playbackState.disablesControls)
             .accessibilityLabel("播放进度")
             .accessibilityValue(
@@ -1230,33 +1295,55 @@ private struct MediaPlaybackControls: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
 
-            HStack(spacing: 32) {
-                Button("后退 10 秒", systemImage: "gobackward.10") {
+            HStack(spacing: 40) {
+                Button {
                     engine.seek(to: engine.currentTime - 10)
                     onSeekCommitted?()
+                } label: {
+                    Label("后退 10 秒", systemImage: "gobackward.10")
+                        .labelStyle(.iconOnly)
+                        .font(.title2.weight(.semibold))
+                        .frame(minWidth: 44, minHeight: 44)
                 }
-                Button(
-                    engine.playbackState.showsPauseControl ? "暂停" : "播放",
-                    systemImage: engine.playbackState.showsPauseControl
-                        ? "pause.circle.fill"
-                        : "play.circle.fill"
-                ) {
+                .foregroundStyle(.primary)
+
+                Button {
                     if engine.playbackState.showsPauseControl {
                         engine.pause()
                     } else {
                         _ = engine.play()
                     }
+                } label: {
+                    Label(
+                        engine.playbackState.showsPauseControl ? "暂停" : "播放",
+                        systemImage: engine.playbackState.showsPauseControl
+                            ? "pause.fill"
+                            : "play.fill"
+                    )
+                    .labelStyle(.iconOnly)
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 64, height: 64)
+                    .background(AppTheme.brandGradient, in: Circle())
+                    .shadow(color: AppTheme.accent.opacity(0.38), radius: 12, y: 5)
                 }
-                .font(.largeTitle)
-                Button("前进 10 秒", systemImage: "goforward.10") {
+
+                Button {
                     engine.seek(to: engine.currentTime + 10)
                     onSeekCommitted?()
+                } label: {
+                    Label("前进 10 秒", systemImage: "goforward.10")
+                        .labelStyle(.iconOnly)
+                        .font(.title2.weight(.semibold))
+                        .frame(minWidth: 44, minHeight: 44)
                 }
+                .foregroundStyle(.primary)
             }
             .disabled(engine.playbackState.disablesControls)
-            .labelStyle(.iconOnly)
             .accessibilityElement(children: .contain)
         }
+        .padding(18)
+        .modernCard(cornerRadius: 26)
         .onChange(of: engine.playbackState) { _, state in
             // 手势中控件被禁用时 SwiftUI 不保证回调 onEditingChanged(false)，
             // 显式清理拖动状态，避免时间显示永久停在悬挂的拖动值。
@@ -1447,23 +1534,23 @@ private struct PDFDocumentView: UIViewRepresentable {
 }
 
 private struct ViewerHeader: View {
-    let icon: String
-    let eyebrow: String
+    let kind: ResourceKind
     let title: String
 
     var body: some View {
         HStack(spacing: 14) {
-            Image(systemName: icon)
-                .font(.title2)
-                .foregroundStyle(AppTheme.accent)
+            ResourceIconTile(kind: kind, side: 46)
             VStack(alignment: .leading, spacing: 3) {
-                Text(eyebrow)
+                Text(kind.title)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(AppTheme.accent)
+                    .foregroundStyle(.secondary)
                 Text(title)
-                    .font(.title.bold())
+                    .font(.title2.bold())
+                    .fontDesign(.rounded)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
         }
+        .accessibilityElement(children: .combine)
     }
 }

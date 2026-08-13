@@ -14,7 +14,21 @@ enum AppTab: String, CaseIterable, Hashable, Identifiable {
 @MainActor
 @Observable
 final class AppModel {
+    #if DEBUG
+    /// 仅调试构建：`-initialTab browse|sources|offline` 启动参数用于
+    /// 自动化截图验证，不影响发布行为。
+    var currentTab: AppTab = {
+        let arguments = ProcessInfo.processInfo.arguments
+        if let flagIndex = arguments.firstIndex(of: "-initialTab"),
+           arguments.indices.contains(flagIndex + 1),
+           let tab = AppTab(rawValue: arguments[flagIndex + 1]) {
+            return tab
+        }
+        return .home
+    }()
+    #else
     var currentTab: AppTab = .home
+    #endif
     var searchText = ""
     var selectedKind: ResourceKind?
     /// Shared Browse selection so a folder search result can open its source.

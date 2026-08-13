@@ -114,12 +114,7 @@ struct ResourceRowView: View {
     }
 
     private var resourceIcon: some View {
-        Image(systemName: resource.kind.systemImage)
-            .font(.title3)
-            .foregroundStyle(AppTheme.accent)
-            .frame(width: 36, height: 36)
-            .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-            .accessibilityHidden(true)
+        ResourceIconTile(kind: resource.kind, side: 40)
     }
 
     private var disclosure: some View {
