@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import MediaPlayer
+import Network
 import PDFKit
 import Testing
 import UIKit
@@ -352,6 +353,183 @@ struct SourcesStoreTests {
         #expect(authStub.calls == authCallsBefore)
     }
 
+    @Test("当前目录瞬时失败按各自原路径恢复")
+    func recoverTransientDirectoryFailuresAtOriginalPaths() async throws {
+        let firstSource = makeSource(kind: .webdav)
+        let secondSource = makeSource(kind: .alist)
+        let firstStub = StubSourceAdapter(
+            source: firstSource,
+            items: [sampleItem(firstSource.id)]
+        )
+        let secondStub = StubSourceAdapter(
+            source: secondSource,
+            items: [sampleItem(secondSource.id)]
+        )
+        firstStub.release()
+        secondStub.release()
+        let store = try makeStore(
+            sources: [firstSource, secondSource],
+            adapters: [firstStub, secondStub],
+            transientRetryDelays: []
+        )
+
+        store.connect(firstSource.id)
+        store.connect(secondSource.id)
+        try await waitUntil {
+            entry(of: firstSource, in: store)?.state == .ready
+                && entry(of: secondSource, in: store)?.state == .ready
+        }
+
+        let firstPath = try #require(ResourcePath(rawValue: "/资料/项目"))
+        let secondPath = try #require(ResourcePath(rawValue: "/媒体/电影"))
+        firstStub.setListFailure(.networkUnavailable)
+        secondStub.setListFailure(.httpStatus(503))
+        store.loadDirectory(firstSource.id, at: firstPath)
+        store.loadDirectory(secondSource.id, at: secondPath)
+        try await waitUntil {
+            entry(of: firstSource, in: store)?.browse.error == .networkUnavailable
+                && entry(of: secondSource, in: store)?.browse.error == .httpStatus(503)
+        }
+
+        firstStub.setListFailure(nil)
+        secondStub.setListFailure(nil)
+        store.recoverTransientFailures()
+        try await waitUntil {
+            entry(of: firstSource, in: store)?.browse.error == nil
+                && entry(of: secondSource, in: store)?.browse.error == nil
+                && entry(of: firstSource, in: store)?.browse.isLoading == false
+                && entry(of: secondSource, in: store)?.browse.isLoading == false
+        }
+
+        #expect(firstStub.listPaths == [.root, firstPath, firstPath])
+        #expect(secondStub.listPaths == [.root, secondPath, secondPath])
+        #expect(entry(of: firstSource, in: store)?.browse.currentPath == firstPath)
+        #expect(entry(of: secondSource, in: store)?.browse.currentPath == secondPath)
+    }
+
+    @Test("确定性目录错误不会自动恢复")
+    func deterministicDirectoryFailureDoesNotRecover() async throws {
+        let source = makeSource(kind: .webdav)
+        let stub = StubSourceAdapter(source: source)
+        stub.release()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            transientRetryDelays: []
+        )
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+
+        let path = try #require(ResourcePath(rawValue: "/协议错误"))
+        stub.setListFailure(.invalidResponse)
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil { store.entries.first?.browse.error == .invalidResponse }
+        stub.setListFailure(nil)
+        let pathsBeforeRecovery = stub.listPaths
+
+        store.recoverTransientFailures()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(stub.listPaths == pathsBeforeRecovery)
+        #expect(store.entries.first?.browse.error == .invalidResponse)
+        #expect(store.entries.first?.browse.currentPath == path)
+    }
+
+    @Test("目录恢复加载中不会叠加重复请求")
+    func directoryRecoveryDoesNotStackWhileLoading() async throws {
+        let source = makeSource(kind: .webdav)
+        let stub = StubSourceAdapter(source: source)
+        stub.release()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            transientRetryDelays: []
+        )
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+
+        let path = try #require(ResourcePath(rawValue: "/弱网目录"))
+        stub.setListFailure(.timedOut)
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil { store.entries.first?.browse.error == .timedOut }
+
+        stub.setListFailure(nil)
+        stub.setListDelay(.milliseconds(150))
+        store.recoverTransientFailures()
+        try await waitUntil {
+            store.entries.first?.browse.isLoading == true
+                && stub.listPaths.count == 3
+        }
+        store.recoverTransientFailures()
+        store.recoverTransientFailures()
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(stub.listPaths == [.root, path, path])
+        try await waitUntil {
+            store.entries.first?.browse.isLoading == false
+                && store.entries.first?.browse.error == nil
+        }
+    }
+
+    @Test("自动恢复白名单只包含明确瞬时错误")
+    func automaticRecoveryWhitelistIsNarrow() {
+        for error in [
+            ResourceSourceError.timedOut,
+            .networkUnavailable,
+            .httpStatus(500),
+            .httpStatus(503),
+            .httpStatus(599),
+        ] {
+            #expect(error.isAutomaticallyRecoverable)
+        }
+
+        for error in [
+            ResourceSourceError.authenticationRequired,
+            .authorizationRequired,
+            .permissionDenied,
+            .notFound,
+            .cancelled,
+            .httpStatus(501),
+            .httpStatus(505),
+            .httpStatus(404),
+            .invalidReference,
+            .capabilityUnavailable,
+            .responseTooLarge,
+            .invalidResponse,
+            .unsafeRedirect,
+            .unavailable,
+        ] {
+            #expect(!error.isAutomaticallyRecoverable)
+        }
+    }
+
+    @Test("网络状态仅在断开后的首次恢复触发")
+    func networkRecoveryTransitionRequiresUnsatisfiedToSatisfied() {
+        var state = NetworkRecoveryTransitionState()
+
+        let initialSatisfied = state.consume(.satisfied)
+        let repeatedSatisfied = state.consume(.satisfied)
+        let requiresConnection = state.consume(.requiresConnection)
+        let satisfiedWithoutOutage = state.consume(.satisfied)
+        let firstUnsatisfied = state.consume(.unsatisfied)
+        let repeatedUnsatisfied = state.consume(.unsatisfied)
+        let recovered = state.consume(.satisfied)
+        let satisfiedAfterRecovery = state.consume(.satisfied)
+        let laterRequiresConnection = state.consume(.requiresConnection)
+        let laterSatisfied = state.consume(.satisfied)
+
+        #expect(!initialSatisfied)
+        #expect(!repeatedSatisfied)
+        #expect(!requiresConnection)
+        #expect(!satisfiedWithoutOutage)
+        #expect(!firstUnsatisfied)
+        #expect(!repeatedUnsatisfied)
+        #expect(recovered)
+        #expect(!satisfiedAfterRecovery)
+        #expect(!laterRequiresConnection)
+        #expect(!laterSatisfied)
+    }
+
     // MARK: - Helpers
 
     private func makeStore(
@@ -533,6 +711,35 @@ struct SourceConfigurationMigrationTests {
         let model = AppModel(configurationStore: localStore)
 
         #expect(model.sources.contains { $0.id == remote.id })
+    }
+
+    @Test("首页删除最后一条历史后不回退当前目录资源")
+    func homeHistoryDoesNotFallBackToCurrentDirectory() throws {
+        let model = AppModel(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer()
+        )
+        let resource = ResourceItem(
+            sourceID: UUID(),
+            logicalPath: try #require(ResourcePath(rawValue: "/notes/current.txt")),
+            name: "current.txt",
+            kind: .text,
+            metadata: ResourceMetadata(
+                byteSize: 7,
+                mimeType: "text/plain",
+                isDirectory: false
+            ),
+            capabilities: [.read],
+            accent: .teal
+        )
+        model.resources = [resource]
+
+        model.recordRecent(resource: resource, metadata: resource.metadata)
+        #expect(model.homeResources.map(\.id) == [resource.id])
+
+        model.removeRecent(identity: resource.id)
+        #expect(model.recentResources.isEmpty)
+        #expect(model.homeResources.isEmpty)
+        #expect(model.resources.map(\.id) == [resource.id])
     }
 
     @Test("文件型容器重建后恢复本地与远端迁移配置")
@@ -1820,6 +2027,48 @@ struct RecentResourceStoreTests {
         store.remove(sourceID: sourceID)
         #expect(store.items.isEmpty)
         #expect(RecentResourceStore(defaults: defaults).items.isEmpty)
+    }
+
+    @Test("单条删除按完整身份隔离并允许再次记录")
+    func removesOneIdentityAndAllowsRecordingAgain() {
+        let suiteName = "iosRemoteFolder.recent-resource-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let firstSourceID = UUID()
+        let secondSourceID = UUID()
+        let sharedPath = ResourcePath(rawValue: "/notes/guide.txt")!
+        let first = ResourceItem(
+            sourceID: firstSourceID,
+            logicalPath: sharedPath,
+            name: "first-guide.txt",
+            kind: .text,
+            metadata: ResourceMetadata(byteSize: 10, mimeType: "text/plain"),
+            capabilities: [.read],
+            accent: .blue
+        )
+        let second = ResourceItem(
+            sourceID: secondSourceID,
+            logicalPath: sharedPath,
+            name: "second-guide.txt",
+            kind: .text,
+            metadata: ResourceMetadata(byteSize: 20, mimeType: "text/plain"),
+            capabilities: [.read],
+            accent: .teal
+        )
+
+        let store = RecentResourceStore(defaults: defaults)
+        store.record(first)
+        store.record(second)
+        store.remove(identity: first.id)
+        store.remove(identity: first.id)
+
+        #expect(store.items.map(\.id) == [second.id])
+        #expect(RecentResourceStore(defaults: defaults).items.map(\.id) == [second.id])
+
+        store.record(first)
+        #expect(store.items.map(\.id) == [first.id, second.id])
+        #expect(RecentResourceStore(defaults: defaults).items.map(\.id) == [first.id, second.id])
     }
 }
 

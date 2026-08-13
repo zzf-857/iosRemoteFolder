@@ -499,6 +499,24 @@ struct ResourcePreviewPipelineTests {
             targetSize: .zero,
             displayScale: 2
         ) == nil)
+
+        let rowRequest = try #require(ResourcePreviewRequest(
+            item: item,
+            targetSize: CGSize(width: 40, height: 40),
+            displayScale: 3
+        ))
+        let continueCardRequest = try #require(ResourcePreviewRequest(
+            item: item,
+            targetSize: CGSize(width: 260, height: 96),
+            displayScale: 3
+        ))
+        #expect(rowRequest.targetSize == CGSize(width: 40, height: 40))
+        #expect(continueCardRequest.targetSize == CGSize(width: 260, height: 96))
+        #expect(rowRequest.pixelWidth == 120)
+        #expect(rowRequest.pixelHeight == 120)
+        #expect(continueCardRequest.pixelWidth == 780)
+        #expect(continueCardRequest.pixelHeight == 288)
+        #expect(rowRequest != continueCardRequest)
     }
 
     private func samplePreview(

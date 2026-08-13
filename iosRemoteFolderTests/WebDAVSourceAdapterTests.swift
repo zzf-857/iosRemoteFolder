@@ -11,7 +11,6 @@ struct WebDAVSourceAdapterTests {
     private static let fileURL = URL(string: "https://dav.test/dav/%E8%B5%84%E6%96%99%20%23%3F%25.txt")!
     private static let fileDirectoryURL = URL(string: "https://dav.test/dav/%E8%B5%84%E6%96%99%20%23%3F%25.txt/")!
     private static let imageURL = URL(string: "https://dav.test/dav/%E5%B0%81%E9%9D%A2.jpg")!
-    private static let imageDirectoryURL = URL(string: "https://dav.test/dav/%E5%B0%81%E9%9D%A2.jpg/")!
     private static let sourceID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
     private static let source = ResourceSource(
         id: sourceID,
@@ -21,6 +20,67 @@ struct WebDAVSourceAdapterTests {
         status: .disconnected,
         itemCountDescription: ""
     )
+
+    @Test("目录 PROPFIND 保留尾斜杠且文件元数据不追加尾斜杠")
+    func propfindDistinguishesCollectionAndFileURLs() async throws {
+        let rootWithoutSlash = URL(string: "https://dav.test/dav")!
+        WebDAVMockURLProtocol.reset()
+        let observedRequests = TestBox<[String]>([])
+        WebDAVMockURLProtocol.register(rootWithoutSlash) { request in
+            observedRequests.value.append("unexpected \(request.httpMethod ?? "") \(request.url?.absoluteString ?? "")")
+            return .respond(status: 404, headers: [:], body: Data())
+        }
+        WebDAVMockURLProtocol.register(Self.endpoint) { request in
+            observedRequests.value.append(
+                "\(request.httpMethod ?? "") \(request.url?.absoluteString ?? "") depth=\(request.value(forHTTPHeaderField: "Depth") ?? "")"
+            )
+            return .respond(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                body: Self.directoryResponse
+            )
+        }
+        WebDAVMockURLProtocol.register(Self.fileDirectoryURL) { request in
+            observedRequests.value.append("unexpected \(request.httpMethod ?? "") \(request.url?.absoluteString ?? "")")
+            return .respond(status: 404, headers: [:], body: Data())
+        }
+        WebDAVMockURLProtocol.register(Self.fileURL) { request in
+            observedRequests.value.append(
+                "\(request.httpMethod ?? "") \(request.url?.absoluteString ?? "") depth=\(request.value(forHTTPHeaderField: "Depth") ?? "")"
+            )
+            if request.httpMethod == "PROPFIND" {
+                return .respond(
+                    status: 207,
+                    headers: ["Content-Type": "application/xml"],
+                    body: Self.fileResponse
+                )
+            }
+            #expect(request.httpMethod == "HEAD")
+            return .respond(
+                status: 200,
+                headers: [
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": "5",
+                    "Content-Type": "text/plain",
+                ],
+                body: Data()
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        try await adapter.connect()
+        let item = try #require(try await adapter.listResources(at: .root).first)
+        _ = try await adapter.fetchMetadata(for: item)
+
+        #expect(observedRequests.value.contains("PROPFIND \(Self.endpoint.absoluteString) depth=0"))
+        #expect(observedRequests.value.contains("PROPFIND \(Self.endpoint.absoluteString) depth=1"))
+        #expect(observedRequests.value.contains("PROPFIND \(Self.fileURL.absoluteString) depth=0"))
+        #expect(!observedRequests.value.contains { $0.hasPrefix("unexpected") })
+    }
 
     @Test("PROPFIND 解析 namespace、保留字符路径与 Basic Auth，Range 读取使用文件响应证据")
     func listAndReadPreservePathAndAuthentication() async throws {
@@ -83,14 +143,14 @@ struct WebDAVSourceAdapterTests {
                 body: Self.directoryResponse
             )
         }
-        WebDAVMockURLProtocol.register(Self.fileDirectoryURL) { _ in
-            .respond(
-                status: 207,
-                headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
-                body: Self.fileResponse
-            )
-        }
         WebDAVMockURLProtocol.register(Self.fileURL) { request in
+            if request.httpMethod == "PROPFIND" {
+                return .respond(
+                    status: 207,
+                    headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
+                    body: Self.fileResponse
+                )
+            }
             #expect(request.httpMethod == "HEAD")
             return .respond(
                 status: 200,
@@ -126,14 +186,14 @@ struct WebDAVSourceAdapterTests {
                 body: Self.directoryResponse
             )
         }
-        WebDAVMockURLProtocol.register(Self.fileDirectoryURL) { _ in
-            .respond(
-                status: 207,
-                headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
-                body: Self.fileResponse
-            )
-        }
         WebDAVMockURLProtocol.register(Self.fileURL) { request in
+            if request.httpMethod == "PROPFIND" {
+                return .respond(
+                    status: 207,
+                    headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
+                    body: Self.fileResponse
+                )
+            }
             if request.httpMethod == "HEAD" {
                 return .respond(
                     status: 200,
@@ -175,14 +235,14 @@ struct WebDAVSourceAdapterTests {
                 body: depth == "0" ? Self.fileResponse : Self.directoryResponse
             )
         }
-        WebDAVMockURLProtocol.register(Self.fileDirectoryURL) { _ in
-            .respond(
-                status: 207,
-                headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
-                body: Self.fileResponse
-            )
-        }
         WebDAVMockURLProtocol.register(Self.fileURL) { request in
+            if request.httpMethod == "PROPFIND" {
+                return .respond(
+                    status: 207,
+                    headers: ["Accept-Ranges": "bytes", "Content-Type": "application/xml"],
+                    body: Self.fileResponse
+                )
+            }
             if request.httpMethod == "HEAD" {
                 return .respond(status: 405, headers: [:], body: Data())
             }
@@ -223,14 +283,14 @@ struct WebDAVSourceAdapterTests {
                     body: depth == "0" ? Self.imageFileResponse : Self.imageDirectoryResponse
                 )
             }
-            WebDAVMockURLProtocol.register(Self.imageDirectoryURL) { _ in
-                .respond(
-                    status: 207,
-                    headers: ["Content-Type": "application/xml"],
-                    body: Self.imageFileResponse
-                )
-            }
             WebDAVMockURLProtocol.register(Self.imageURL) { request in
+                if request.httpMethod == "PROPFIND" {
+                    return .respond(
+                        status: 207,
+                        headers: ["Content-Type": "application/xml"],
+                        body: Self.imageFileResponse
+                    )
+                }
                 #expect(request.httpMethod == "HEAD")
                 return .respond(
                     status: 200,
@@ -464,15 +524,15 @@ struct WebDAVSourceAdapterTests {
                 body: depth == "0" ? Self.fileResponse : Self.directoryResponse
             )
         }
-        WebDAVMockURLProtocol.register(Self.fileDirectoryURL) { _ in
-            .respond(
-                status: 207,
-                headers: ["Content-Type": "application/xml"],
-                body: Self.fileResponse
-            )
-        }
         WebDAVMockURLProtocol.register(Self.fileURL) { request in
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic dXNlcjpwYXNz")
+            if request.httpMethod == "PROPFIND" {
+                return .respond(
+                    status: 207,
+                    headers: ["Content-Type": "application/xml"],
+                    body: Self.fileResponse
+                )
+            }
             return .redirect(status: 307, location: firstTarget)
         }
         WebDAVMockURLProtocol.register(firstTarget) { request in
@@ -861,9 +921,8 @@ struct WebDAVSourceAdapterTests {
                     headers: ["Content-Type": "application/xml"],
                     body: Self.loopbackDirectoryXML(size: totalSize)
                 )
-            // 适配器的 PROPFIND 统一使用目录形式 URL（带尾斜杠）。
-            case ("PROPFIND", "/dav/loopback-large.wav"),
-                 ("PROPFIND", "/dav/loopback-large.wav/"):
+            // 文件元数据必须使用文件 URL；尾斜杠只属于集合路径。
+            case ("PROPFIND", "/dav/loopback-large.wav"):
                 return .init(
                     status: 207,
                     headers: ["Content-Type": "application/xml"],
