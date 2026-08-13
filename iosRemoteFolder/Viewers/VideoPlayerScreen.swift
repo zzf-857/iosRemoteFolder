@@ -39,6 +39,7 @@ struct VideoPlayerScreen: View {
     @State private var feedbackTask: Task<Void, Never>?
     @State private var pendingSeekTime: TimeInterval?
     @State private var seekGeneration = 0
+    @State private var playbackIntentRevision = 0
     @State private var isSliderScrubbing = false
     @State private var isPresented = false
     @State private var didBeginOrientationPolicy = false
@@ -351,13 +352,16 @@ struct VideoPlayerScreen: View {
         let clamped = min(max(target, 0), engine.duration)
         seekGeneration &+= 1
         let generation = seekGeneration
+        let intentRevision = playbackIntentRevision
         pendingSeekTime = clamped
         engine.seek(to: clamped) { finished in
-            guard isPresented,
-                  seekGeneration == generation,
-                  finished else { return }
+            guard seekGeneration == generation else { return }
             pendingSeekTime = nil
-            if resumeAfterSeek, engine.play() {
+            guard isPresented else { return }
+            if finished,
+               playbackIntentRevision == intentRevision,
+               resumeAfterSeek,
+               engine.play() {
                 scheduleControlsAutoHide()
             }
             nowPlaying.refresh()
@@ -365,6 +369,7 @@ struct VideoPlayerScreen: View {
     }
 
     private func togglePlayback() {
+        playbackIntentRevision &+= 1
         if engine.playbackState.showsPauseControl { engine.pause() } else { _ = engine.play() }
         nowPlaying.refresh()
         scheduleControlsAutoHide()
