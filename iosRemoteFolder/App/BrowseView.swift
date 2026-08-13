@@ -33,6 +33,9 @@ private struct BrowseContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             sourcePicker
+            if let entry = selectedEntry, case .ready = entry.state {
+                locationBar(entry: entry)
+            }
             listing
         }
         .ambientScreenBackground()
@@ -201,7 +204,6 @@ private struct BrowseContentView: View {
         } else {
             let visibleItems = filteredItems(browse.items)
             List {
-                breadcrumbSection(entry: entry, browse: browse)
                 if visibleItems.isEmpty {
                     ContentUnavailableView {
                         Label("没有符合筛选的项目", systemImage: "line.3.horizontal.decrease.circle")
@@ -263,13 +265,20 @@ private struct BrowseContentView: View {
         }
     }
 
-    // MARK: - 面包屑
+    // MARK: - 固定路径栏
 
-    private func breadcrumbSection(entry: SourcesStore.Entry, browse: SourcesStore.SourceBrowse) -> some View {
-        let path = browse.currentPath
-        return Section {
+    private func locationBar(entry: SourcesStore.Entry) -> some View {
+        let path = entry.browse.currentPath
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("当前位置")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .accessibilityAddTraits(.isHeader)
+
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
+                    let isRootSelected = path.isRoot
                     Button {
                         store.loadDirectory(entry.id, at: .root)
                     } label: {
@@ -277,14 +286,26 @@ private struct BrowseContentView: View {
                             .font(.footnote.weight(.medium))
                             .padding(.horizontal, 12)
                             .frame(minWidth: 44, minHeight: 36)
-                            .background(AppTheme.accent.opacity(0.12), in: Capsule())
-                            .foregroundStyle(AppTheme.accent)
+                            .background {
+                                if isRootSelected {
+                                    Capsule().fill(AppTheme.accent.opacity(0.12))
+                                } else {
+                                    Capsule().fill(.ultraThinMaterial)
+                                }
+                            }
+                            .foregroundStyle(isRootSelected ? AppTheme.accent : Color.primary)
+                            .overlay(
+                                Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                            )
                     }
                     .buttonStyle(.borderless)
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
+                    .accessibilityHint("切换到根目录")
+                    .accessibilityAddTraits(isRootSelected ? .isSelected : [])
                     ForEach(Array(path.components.enumerated()), id: \.offset) { index, component in
                         let prefix = "/" + path.components.prefix(index + 1).joined(separator: "/")
+                        let isCurrent = index == path.components.count - 1
                         Image(systemName: "chevron.right")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.tertiary)
@@ -299,7 +320,14 @@ private struct BrowseContentView: View {
                                 .fixedSize(horizontal: true, vertical: false)
                                 .padding(.horizontal, 12)
                                 .frame(minWidth: 44, minHeight: 36)
-                                .background(.ultraThinMaterial, in: Capsule())
+                                .background {
+                                    if isCurrent {
+                                        Capsule().fill(AppTheme.accent.opacity(0.12))
+                                    } else {
+                                        Capsule().fill(.ultraThinMaterial)
+                                    }
+                                }
+                                .foregroundStyle(isCurrent ? AppTheme.accent : Color.primary)
                                 .overlay(
                                     Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                                 )
@@ -307,12 +335,18 @@ private struct BrowseContentView: View {
                         .buttonStyle(.borderless)
                         .frame(minHeight: 44)
                         .contentShape(Rectangle())
+                        .accessibilityHint("切换到路径 \(prefix)")
+                        .accessibilityAddTraits(isCurrent ? .isSelected : [])
                     }
                 }
+                .padding(.horizontal)
                 .padding(.vertical, 4)
             }
-        } header: {
-            Text("当前位置")
+        }
+        .padding(.bottom, 4)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Divider()
         }
     }
 }

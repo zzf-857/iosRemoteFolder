@@ -21,15 +21,20 @@ struct ResourcePreviewView: View {
         )
     }
 
+    @ViewBuilder
     var body: some View {
-        PreviewTaskView(
-            resource: resource,
-            request: request,
-            pipeline: appModel.resourcePreviewPipeline
-        )
-        .frame(width: side, height: side)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .accessibilityHidden(true)
+        if resource.kind == .folder {
+            ResourceIconTile(kind: .folder, side: side)
+        } else {
+            PreviewTaskView(
+                resource: resource,
+                request: request,
+                pipeline: appModel.resourcePreviewPipeline
+            )
+            .frame(width: side, height: side)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .accessibilityHidden(true)
+        }
     }
 }
 
