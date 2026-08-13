@@ -179,6 +179,7 @@ private struct BrowseContentView: View {
         let browse = entry.browse
         if browse.isLoading && browse.items.isEmpty {
             ProgressView("加载中…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let error = browse.error {
             statusScroll {
                 ContentUnavailableView {

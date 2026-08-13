@@ -111,8 +111,8 @@ struct VideoPlayerScreen: View {
         .onAppear {
             isPresented = true
             activatePlayerSceneIfNeeded()
-            restorePositionIfNeeded()
             nowPlaying.activate(title: resource.name, engine: engine, isVideo: true)
+            restorePositionIfNeeded()
             scheduleControlsAutoHide()
         }
         .onDisappear {
@@ -348,11 +348,12 @@ struct VideoPlayerScreen: View {
         let generation = seekGeneration
         pendingSeekTime = clamped
         engine.seek(to: clamped) { finished in
-            guard isPresented, seekGeneration == generation else { return }
+            guard isPresented,
+                  seekGeneration == generation,
+                  finished,
+                  engine.play() else { return }
             pendingSeekTime = nil
-            if finished {
-                nowPlaying.refresh()
-            }
+            nowPlaying.refresh()
         }
     }
 
@@ -591,10 +592,13 @@ struct VideoPlayerScreen: View {
 
     private func restorePositionIfNeeded() {
         guard !restoredPosition else { return }
-        guard case .seconds(let seconds) = appModel.resumePosition(for: resource, metadata: metadata) else { restoredPosition = true; return }
         guard engine.duration > 0 else { return }
         restoredPosition = true
-        commitSeek(seconds)
+        if case .seconds(let seconds) = appModel.resumePosition(for: resource, metadata: metadata) {
+            commitSeek(seconds)
+        } else if engine.play() {
+            nowPlaying.refresh()
+        }
     }
 
     private func savePosition() {
