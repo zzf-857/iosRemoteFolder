@@ -52,7 +52,7 @@
 - [ ] CACHE-003 Publish viewer content before cache storage and offline-projection refresh.
 - [ ] CACHE-007 Restore 10,000 cache records in <=150 ms without startup-path per-file stat or per-open offline rescans.
 - [x] QUAL-001 Fix PDFKit actor isolation and make Debug/Release warning-free.
-- [ ] QUAL-007 Make missing real Alist configuration report skipped/not-run rather than passed.
+- [x] QUAL-007 Make missing real Alist configuration report skipped/not-run rather than passed.
 
 ### Phase 1 Exit Gate
 

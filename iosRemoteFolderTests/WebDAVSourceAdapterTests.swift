@@ -6,6 +6,61 @@ import UniformTypeIdentifiers
 
 @testable import iosRemoteFolder
 
+private struct RealAlistTestConfiguration: Sendable {
+    enum MediaKind: Sendable {
+        case audio
+        case video
+
+        var resourceKind: ResourceKind {
+            switch self {
+            case .audio: .audio
+            case .video: .video
+            }
+        }
+
+        var expectedMediaType: AVMediaType {
+            switch self {
+            case .audio: .audio
+            case .video: .video
+            }
+        }
+    }
+
+    let endpoint: URL
+    let username: String
+    let password: String
+    let logicalPath: ResourcePath
+    let mediaKind: MediaKind
+
+    static let current = parse(environment: ProcessInfo.processInfo.environment)
+
+    static func parse(environment: [String: String]) -> RealAlistTestConfiguration? {
+        guard let endpointText = environment["ALIST_ENDPOINT"],
+              let candidateEndpoint = URL(string: endpointText),
+              let endpoint = try? WebDAVSourceAdapter.normalizedEndpoint(candidateEndpoint),
+              endpoint.scheme?.lowercased() == "https",
+              let rawUsername = environment["ALIST_USERNAME"],
+              let password = environment["ALIST_PASSWORD"],
+              !password.isEmpty,
+              let mediaPath = environment["ALIST_MEDIA_PATH"],
+              !mediaPath.isEmpty,
+              let logicalPath = ResourcePath(rawValue: mediaPath),
+              !logicalPath.isRoot else {
+            return nil
+        }
+        let username = rawUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !username.isEmpty else { return nil }
+
+        return RealAlistTestConfiguration(
+            endpoint: endpoint,
+            username: username,
+            password: password,
+            logicalPath: logicalPath,
+            mediaKind: environment["ALIST_MEDIA_KIND"] == "video" ? .video : .audio
+        )
+    }
+}
+
 @Suite("WebDAV 来源适配器", .serialized)
 struct WebDAVSourceAdapterTests {
     private static let endpoint = URL(string: "https://dav.test/dav/")!
@@ -1363,40 +1418,78 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test("真实 Alist 配置拒绝缺字段、非法 URL 与非法路径")
+    func realAlistConfigurationValidationIsDeterministic() throws {
+        let validEnvironment = [
+            "ALIST_ENDPOINT": "https://alist.test/dav",
+            "ALIST_USERNAME": "fixture-user",
+            "ALIST_PASSWORD": "fixture-password",
+            "ALIST_MEDIA_PATH": "/media/fixture.mp3",
+        ]
+        func isRejected(_ environment: [String: String]) -> Bool {
+            RealAlistTestConfiguration.parse(environment: environment)
+                .map { _ in false } ?? true
+        }
+
+        let validConfiguration = try #require(
+            RealAlistTestConfiguration.parse(environment: validEnvironment)
+        )
+        #expect(validConfiguration.endpoint.absoluteString == "https://alist.test/dav/")
+        #expect(validConfiguration.logicalPath.normalized == "/media/fixture.mp3")
+
+        var missingFieldEnvironment = validEnvironment
+        missingFieldEnvironment.removeValue(forKey: "ALIST_PASSWORD")
+        #expect(isRejected(missingFieldEnvironment))
+
+        var invalidURLEnvironment = validEnvironment
+        invalidURLEnvironment["ALIST_ENDPOINT"] = "alist.test/dav/"
+        #expect(isRejected(invalidURLEnvironment))
+
+        var insecureEndpointEnvironment = validEnvironment
+        insecureEndpointEnvironment["ALIST_ENDPOINT"] = "http://alist.test/dav/"
+        #expect(isRejected(insecureEndpointEnvironment))
+
+        for invalidEndpoint in [
+            "https://fixture-user:fixture-password@alist.test/dav/",
+            "https://alist.test/dav/?token=fixture",
+            "https://alist.test/dav/#fixture",
+        ] {
+            var invalidEndpointEnvironment = validEnvironment
+            invalidEndpointEnvironment["ALIST_ENDPOINT"] = invalidEndpoint
+            #expect(isRejected(invalidEndpointEnvironment))
+        }
+
+        var invalidPathEnvironment = validEnvironment
+        invalidPathEnvironment["ALIST_MEDIA_PATH"] = "/media/../fixture.mp3"
+        #expect(isRejected(invalidPathEnvironment))
+    }
+
     @Test(
-        "真实 Alist：目录、元数据与大媒体流式播放（需环境变量，缺省跳过）",
+        "真实 Alist：目录、元数据与大媒体流式播放（需环境变量）",
+        .enabled(
+            if: RealAlistTestConfiguration.current != nil,
+            "未提供完整有效的 ALIST_* 环境配置；真实服务测试不会运行"
+        ),
         .timeLimit(.minutes(3))
     )
     @MainActor
     func realAlistLargeMediaStreamsEndToEnd() async throws {
-        // 凭证与 endpoint 只经环境变量注入（TEST_RUNNER_ 前缀），
-        // 不进入源码、fixture 或项目记录；未配置时本用例直接通过。
-        let environment = ProcessInfo.processInfo.environment
-        guard let endpointText = environment["ALIST_ENDPOINT"],
-              let endpoint = URL(string: endpointText),
-              let username = environment["ALIST_USERNAME"],
-              let password = environment["ALIST_PASSWORD"],
-              let mediaPath = environment["ALIST_MEDIA_PATH"],
-              let logicalPath = ResourcePath(rawValue: mediaPath) else {
-            return
-        }
-        let isVideo = environment["ALIST_MEDIA_KIND"] == "video"
-        let mediaKind: ResourceKind = isVideo ? .video : .audio
-        let expectedMediaType: AVMediaType = isVideo ? .video : .audio
+        // 凭证只经测试进程环境注入；trait 与正文共享同一不可变配置快照。
+        let configuration = try #require(RealAlistTestConfiguration.current)
 
         let source = ResourceSource(
             id: UUID(),
             name: "真实 Alist 验证",
             kind: .alist,
-            endpoint: endpoint.absoluteString,
+            endpoint: configuration.endpoint.absoluteString,
             status: .disconnected,
             itemCountDescription: ""
         )
         let adapter = try WebDAVSourceAdapter(
             source: source,
-            endpoint: endpoint,
-            username: username,
-            password: password
+            endpoint: configuration.endpoint,
+            username: configuration.username,
+            password: configuration.password
         )
         let registry = try SourceRegistry(sources: [source], adapters: [adapter])
 
@@ -1408,9 +1501,9 @@ struct WebDAVSourceAdapterTests {
         // 会话闭环：直接寻址目标媒体，元数据必须给出大小、Range 与已知版本。
         let item = ResourceItem(
             sourceID: source.id,
-            logicalPath: logicalPath,
-            name: logicalPath.components.last ?? "media",
-            kind: mediaKind,
+            logicalPath: configuration.logicalPath,
+            name: configuration.logicalPath.components.last ?? "media",
+            kind: configuration.mediaKind.resourceKind,
             metadata: ResourceMetadata(),
             capabilities: [.read],
             accent: .pink
@@ -1428,7 +1521,7 @@ struct WebDAVSourceAdapterTests {
             metadata: metadata,
             resourcePath: item.path
         )
-        try await engine.prepare(expectedMediaType: expectedMediaType)
+        try await engine.prepare(expectedMediaType: configuration.mediaKind.expectedMediaType)
         #expect(engine.duration > 0)
         #expect(engine.play())
         try await Task.sleep(for: .seconds(1))
