@@ -434,6 +434,151 @@ struct ResourcePreviewPipelineTests {
         #expect(unknownDiskEntries.isEmpty)
     }
 
+    @Test("磁盘命中不阻塞写 manifest 且一个视口只批量持久化一次")
+    func batchesDiskHitManifestPersistence() async throws {
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let fixture = makeFixture(
+            revision: .etag("batch-v1"),
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let items = try (0..<4).map { index in
+            try makeItem(
+                sourceID: fixture.source.id,
+                path: "/批量/预览-\(index).txt",
+                revision: .etag("batch-v1")
+            )
+        }
+        for item in items {
+            _ = try await fixture.pipeline.preview(for: makeRequest(item: item))
+        }
+
+        let persistenceSpy = ManifestDataWriterSpy()
+        let accessDate = Date(timeIntervalSince1970: 1_800_000_000)
+        let diskPipeline = ResourcePreviewPipeline(
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory,
+            accessFlushDelay: .seconds(60),
+            currentDate: { accessDate },
+            manifestDataWriter: { try persistenceSpy.write($0, to: $1) }
+        )
+        for item in items {
+            _ = try await diskPipeline.preview(for: makeRequest(item: item))
+        }
+
+        #expect(persistenceSpy.count == 0)
+        #expect(await fixture.adapter.snapshot().readCalls == items.count)
+
+        try await diskPipeline.flushPendingManifestAccesses()
+        #expect(persistenceSpy.count == 1)
+        try await diskPipeline.flushPendingManifestAccesses()
+        #expect(persistenceSpy.count == 1)
+
+        let entries = try decodeManifestEntries(in: cacheDirectory)
+        #expect(entries.count == items.count)
+        #expect(entries.values.allSatisfy { $0.lastAccess == accessDate })
+    }
+
+    @Test("管线析构会持久化最后一批磁盘访问")
+    func deinitFlushesLastDiskAccess() async throws {
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let fixture = makeFixture(
+            revision: .etag("deinit-v1"),
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let request = try makeRequest(item: fixture.item)
+        _ = try await fixture.pipeline.preview(for: request)
+
+        let persistenceSpy = ManifestDataWriterSpy()
+        let accessDate = Date(timeIntervalSince1970: 1_900_000_000)
+        try await accessDiskArtifactAndReleasePipeline(
+            request: request,
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory,
+            accessDate: accessDate,
+            persistenceSpy: persistenceSpy
+        )
+
+        #expect(persistenceSpy.count == 1)
+        let entries = try decodeManifestEntries(in: cacheDirectory)
+        #expect(entries.count == 1)
+        #expect(entries.values.first?.lastAccess == accessDate)
+        #expect(await fixture.adapter.snapshot().readCalls == 1)
+    }
+
+    @Test("自动 flush 失败会保留 dirty 访问并允许确定性重试")
+    func failedScheduledFlushRetainsDirtyAccesses() async throws {
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let fixture = makeFixture(
+            revision: .etag("retry-v1"),
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let request = try makeRequest(item: fixture.item)
+        _ = try await fixture.pipeline.preview(for: request)
+        let originalAccess = try #require(
+            decodeManifestEntries(in: cacheDirectory).values.first?.lastAccess
+        )
+
+        let writer = ManifestDataWriterSpy(failuresRemaining: 1)
+        let retriedAccess = Date(timeIntervalSince1970: 2_000_000_000)
+        let pipeline = ResourcePreviewPipeline(
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory,
+            accessFlushDelay: .milliseconds(10),
+            currentDate: { retriedAccess },
+            manifestDataWriter: { try writer.write($0, to: $1) }
+        )
+        _ = try await pipeline.preview(for: request)
+
+        #expect(try await waitUntil { writer.count == 1 })
+        #expect(
+            try decodeManifestEntries(in: cacheDirectory).values.first?.lastAccess
+                == originalAccess
+        )
+
+        try await pipeline.flushPendingManifestAccesses()
+        #expect(writer.count == 2)
+        #expect(
+            try decodeManifestEntries(in: cacheDirectory).values.first?.lastAccess
+                == retriedAccess
+        )
+        #expect(await fixture.adapter.snapshot().readCalls == 1)
+    }
+
+    @Test("removeAll 取消 pending flush 且析构不会写回 manifest")
+    func removeAllDiscardsPendingManifestAccesses() async throws {
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let fixture = makeFixture(
+            revision: .etag("remove-all-v1"),
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let request = try makeRequest(item: fixture.item)
+        _ = try await fixture.pipeline.preview(for: request)
+
+        let writer = ManifestDataWriterSpy()
+        try await accessThenRemoveAllAndReleasePipeline(
+            request: request,
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory,
+            writer: writer
+        )
+
+        #expect(writer.count == 0)
+        #expect(!FileManager.default.fileExists(atPath: cacheDirectory.path))
+        #expect(await fixture.adapter.snapshot().readCalls == 1)
+    }
+
     @Test("文件夹预览零探测零读取")
     func rejectsUnsupportedAndOversizedResourcesBeforeRead() async throws {
         for kind in [ResourceKind.folder] {
@@ -640,6 +785,48 @@ struct ResourcePreviewPipelineTests {
             cacheDirectory: cacheDirectory
         )
         return try await pipeline.preview(for: try makeRequest(item: item))
+    }
+
+    private func accessDiskArtifactAndReleasePipeline(
+        request: ResourcePreviewRequest,
+        accessService: ResourceAccessService,
+        cacheDirectory: URL,
+        accessDate: Date,
+        persistenceSpy: ManifestDataWriterSpy
+    ) async throws {
+        let pipeline = ResourcePreviewPipeline(
+            accessService: accessService,
+            cacheDirectory: cacheDirectory,
+            accessFlushDelay: .seconds(60),
+            currentDate: { accessDate },
+            manifestDataWriter: { try persistenceSpy.write($0, to: $1) }
+        )
+        _ = try await pipeline.preview(for: request)
+    }
+
+    private func accessThenRemoveAllAndReleasePipeline(
+        request: ResourcePreviewRequest,
+        accessService: ResourceAccessService,
+        cacheDirectory: URL,
+        writer: ManifestDataWriterSpy
+    ) async throws {
+        let pipeline = ResourcePreviewPipeline(
+            accessService: accessService,
+            cacheDirectory: cacheDirectory,
+            accessFlushDelay: .seconds(60),
+            manifestDataWriter: { try writer.write($0, to: $1) }
+        )
+        _ = try await pipeline.preview(for: request)
+        await pipeline.removeAll()
+    }
+
+    private func decodeManifestEntries(
+        in cacheDirectory: URL
+    ) throws -> [String: PreviewManifestEntry] {
+        let data = try Data(
+            contentsOf: cacheDirectory.appendingPathComponent("manifest.json")
+        )
+        return try JSONDecoder().decode([String: PreviewManifestEntry].self, from: data)
     }
 
     private func sampleContent(sourceID: UUID, path: String) async throws -> Data {
@@ -872,6 +1059,43 @@ struct ResourcePreviewPipelineTests {
             try await Task.sleep(for: .milliseconds(5))
         }
         return await condition()
+    }
+}
+
+private struct PreviewManifestEntry: Decodable {
+    let lastAccess: Date
+}
+
+private enum ManifestDataWriterError: Error {
+    case injectedFailure
+}
+
+private final class ManifestDataWriterSpy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var persistenceCount = 0
+    private var failuresRemaining: Int
+
+    init(failuresRemaining: Int = 0) {
+        self.failuresRemaining = failuresRemaining
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return persistenceCount
+    }
+
+    func write(_ data: Data, to url: URL) throws {
+        lock.lock()
+        persistenceCount += 1
+        let shouldFail = failuresRemaining > 0
+        failuresRemaining = max(0, failuresRemaining - 1)
+        lock.unlock()
+
+        if shouldFail {
+            throw ManifestDataWriterError.injectedFailure
+        }
+        try data.write(to: url, options: .atomic)
     }
 }
 

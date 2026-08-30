@@ -313,23 +313,51 @@ actor ResourcePreviewPipeline {
     private let manifestURL: URL
     private let concurrencyLimiter = PreviewConcurrencyLimiter(limit: 3)
     private let fileManager = FileManager.default
+    private let accessFlushDelay: Duration
+    private let currentDate: @Sendable () -> Date
+    private let manifestDataWriter: @Sendable (Data, URL) throws -> Void
 
     private var inFlight: [CacheKey: InFlight] = [:]
     private var memoryCache: [CacheKey: MemoryEntry] = [:]
     private var memoryCost = 0
     private var accessCounter: UInt64 = 0
     private var diskManifest: [String: DiskManifestEntry]
+    private var manifestAccessesAreDirty = false
+    private var manifestAccessFlushTask: Task<Void, Never>?
+    private var manifestAccessFlushGeneration: UInt64 = 0
     private var globalEpoch: UInt64 = 0
     private var sourceEpochs: [UUID: UInt64] = [:]
 
-    init(accessService: ResourceAccessService, cacheDirectory: URL? = nil) {
+    init(
+        accessService: ResourceAccessService,
+        cacheDirectory: URL? = nil,
+        accessFlushDelay: Duration = .milliseconds(250),
+        currentDate: @escaping @Sendable () -> Date = { Date() },
+        manifestDataWriter: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
+            try data.write(to: url, options: .atomic)
+        }
+    ) {
         self.accessService = accessService
         let root = cacheDirectory ?? Self.defaultCacheDirectory()
         self.cacheDirectory = root
         self.manifestURL = root.appendingPathComponent(Self.manifestFilename, isDirectory: false)
+        self.accessFlushDelay = accessFlushDelay
+        self.currentDate = currentDate
+        self.manifestDataWriter = manifestDataWriter
         self.diskManifest = Self.loadManifest(
             at: root.appendingPathComponent(Self.manifestFilename, isDirectory: false),
             cacheDirectory: root
+        )
+    }
+
+    deinit {
+        manifestAccessFlushTask?.cancel()
+        guard manifestAccessesAreDirty else { return }
+        try? Self.persistManifest(
+            diskManifest,
+            at: manifestURL,
+            cacheDirectory: cacheDirectory,
+            dataWriter: manifestDataWriter
         )
     }
 
@@ -374,6 +402,7 @@ actor ResourcePreviewPipeline {
 
     func removeAll() {
         globalEpoch &+= 1
+        cancelManifestAccessFlush(discardingChanges: true)
         let cancelledEntries = Array(inFlight.values)
         inFlight.removeAll()
         cancelledEntries.forEach(cancelInFlight)
@@ -382,6 +411,11 @@ actor ResourcePreviewPipeline {
         sourceEpochs.removeAll()
         diskManifest.removeAll()
         try? fileManager.removeItem(at: cacheDirectory)
+    }
+
+    func flushPendingManifestAccesses() throws {
+        cancelManifestAccessFlush(discardingChanges: false)
+        try persistDirtyManifestAccesses()
     }
 
     func remove(sourceID: UUID) {
@@ -524,7 +558,7 @@ actor ResourcePreviewPipeline {
             diskManifest.removeValue(forKey: digest)
         }
         if !diskDigests.isEmpty {
-            try? persistManifest()
+            try? persistManifestImmediately()
         }
     }
 
@@ -581,13 +615,13 @@ actor ResourcePreviewPipeline {
               record.keyDigest == digest else {
             removeDiskFile(digest: digest)
             diskManifest.removeValue(forKey: digest)
-            try? persistManifest()
+            try? persistManifestImmediately()
             return nil
         }
 
-        manifestEntry.lastAccess = Date()
+        manifestEntry.lastAccess = currentDate()
         diskManifest[digest] = manifestEntry
-        try? persistManifest()
+        scheduleManifestAccessFlush()
         return record.artifact
     }
 
@@ -609,9 +643,9 @@ actor ResourcePreviewPipeline {
             diskManifest[digest] = DiskManifestEntry(
                 sourceID: key.identity.sourceID,
                 byteCount: Int64(data.count),
-                lastAccess: Date()
+                lastAccess: currentDate()
             )
-            try persistManifest()
+            try persistManifestImmediately()
             pruneDiskIfNeeded()
         } catch {
             removeDiskFile(digest: digest)
@@ -631,17 +665,89 @@ actor ResourcePreviewPipeline {
             total = max(0, total - entry.byteCount)
             if total <= Self.diskByteBudget { break }
         }
-        try? persistManifest()
+        try? persistManifestImmediately()
     }
 
-    private func persistManifest() throws {
-        guard !diskManifest.isEmpty else {
-            try? fileManager.removeItem(at: manifestURL)
+    private func scheduleManifestAccessFlush() {
+        manifestAccessesAreDirty = true
+        manifestAccessFlushGeneration &+= 1
+        let generation = manifestAccessFlushGeneration
+        manifestAccessFlushTask?.cancel()
+
+        let delay = accessFlushDelay
+        manifestAccessFlushTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            await self?.flushScheduledManifestAccesses(generation: generation)
+        }
+    }
+
+    private func flushScheduledManifestAccesses(generation: UInt64) {
+        // A cancelled debounce may already be queued on the actor. It must not
+        // flush or clear the newer task that replaced it.
+        guard generation == manifestAccessFlushGeneration else { return }
+        manifestAccessFlushTask = nil
+        try? persistDirtyManifestAccesses()
+    }
+
+    private func persistDirtyManifestAccesses() throws {
+        guard manifestAccessesAreDirty else { return }
+        try Self.persistManifest(
+            diskManifest,
+            at: manifestURL,
+            cacheDirectory: cacheDirectory,
+            dataWriter: manifestDataWriter
+        )
+        manifestAccessesAreDirty = false
+    }
+
+    private func persistManifestImmediately() throws {
+        cancelManifestAccessFlush(discardingChanges: false)
+        do {
+            try Self.persistManifest(
+                diskManifest,
+                at: manifestURL,
+                cacheDirectory: cacheDirectory,
+                dataWriter: manifestDataWriter
+            )
+            manifestAccessesAreDirty = false
+        } catch {
+            if manifestAccessesAreDirty {
+                scheduleManifestAccessFlush()
+            }
+            throw error
+        }
+    }
+
+    private func cancelManifestAccessFlush(discardingChanges: Bool) {
+        manifestAccessFlushGeneration &+= 1
+        manifestAccessFlushTask?.cancel()
+        manifestAccessFlushTask = nil
+        if discardingChanges {
+            manifestAccessesAreDirty = false
+        }
+    }
+
+    private static func persistManifest(
+        _ manifest: [String: DiskManifestEntry],
+        at manifestURL: URL,
+        cacheDirectory: URL,
+        dataWriter: @Sendable (Data, URL) throws -> Void
+    ) throws {
+        guard !manifest.isEmpty else {
+            try? FileManager.default.removeItem(at: manifestURL)
             return
         }
-        try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(diskManifest)
-        try data.write(to: manifestURL, options: .atomic)
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(manifest)
+        try dataWriter(data, manifestURL)
     }
 
     private func diskFileURL(digest: String) -> URL {
