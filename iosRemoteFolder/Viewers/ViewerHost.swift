@@ -1500,6 +1500,7 @@ struct UnsupportedViewerView: View {
     }
 }
 
+@MainActor
 private struct PDFDocumentView: UIViewRepresentable {
     let document: PDFDocument
     let initialPageIndex: Int?
@@ -1538,32 +1539,39 @@ private struct PDFDocumentView: UIViewRepresentable {
         coordinator.detach()
     }
 
+    @MainActor
     final class Coordinator: NSObject {
         var onPageChange: (Int) -> Void
         var appliedPageIndex: Int?
-        private var observer: NSObjectProtocol?
+        private weak var observedView: PDFView?
 
         init(onPageChange: @escaping (Int) -> Void) {
             self.onPageChange = onPageChange
         }
 
         func attach(to view: PDFView) {
-            observer = NotificationCenter.default.addObserver(
-                forName: Notification.Name.PDFViewPageChanged,
-                object: view,
-                queue: .main
-            ) { [weak self, weak view] _ in
-                guard let self,
-                      let view,
-                      let page = view.currentPage,
-                      let document = view.document else {
-                    return
-                }
-                let index = document.index(for: page)
-                guard index >= 0 else { return }
-                self.appliedPageIndex = index
-                self.onPageChange(index)
+            detach()
+            observedView = view
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(pageDidChange(_:)),
+                name: Notification.Name.PDFViewPageChanged,
+                object: view
+            )
+        }
+
+        @objc
+        private func pageDidChange(_ notification: Notification) {
+            guard let view = notification.object as? PDFView,
+                  view === observedView,
+                  let page = view.currentPage,
+                  let document = view.document else {
+                return
             }
+            let index = document.index(for: page)
+            guard index >= 0 else { return }
+            appliedPageIndex = index
+            onPageChange(index)
         }
 
         func apply(pageIndex: Int?, to view: PDFView) {
@@ -1578,15 +1586,14 @@ private struct PDFDocumentView: UIViewRepresentable {
         }
 
         func detach() {
-            if let observer {
-                NotificationCenter.default.removeObserver(observer)
-                self.observer = nil
-            }
+            NotificationCenter.default.removeObserver(
+                self,
+                name: Notification.Name.PDFViewPageChanged,
+                object: observedView
+            )
+            observedView = nil
         }
 
-        deinit {
-            detach()
-        }
     }
 }
 
