@@ -101,7 +101,7 @@ actor ResourceIndexStore {
             FetchDescriptor<ResourceIndexRecord>(
                 predicate: Self.searchPredicate(
                     term: term,
-                    kindRawValue: kind?.rawValue,
+                    resolvedKindRawValue: kind?.rawValue,
                     sourceID: sourceID
                 )
             )
@@ -109,15 +109,23 @@ actor ResourceIndexStore {
         var matched: [ResourceItem] = []
         matched.reserveCapacity(records.count)
         var corrupted: [ResourceIndexRecord] = []
+        var repairedDerivedKinds = false
         for record in records {
             if let item = record.resourceItem {
                 matched.append(item)
+                let resolvedKindRawValue = item.resolvedContentType.kind.rawValue
+                if record.resolvedKindRawValue != resolvedKindRawValue {
+                    record.resolvedKindRawValue = resolvedKindRawValue
+                    repairedDerivedKinds = true
+                }
             } else {
                 corrupted.append(record)
             }
         }
-        if !corrupted.isEmpty {
-            // 读路径尽力自愈：删除失败回滚并保留结果，下次读取再试。
+        if repairedDerivedKinds || !corrupted.isEmpty {
+            // The first successful read backfills legacy derived kinds. Corrupt
+            // rows share the same best-effort save so later searches stay on the
+            // persistent predicate path instead of repeatedly decoding them.
             corrupted.forEach(modelContext.delete)
             do {
                 try modelContext.save()
@@ -126,7 +134,10 @@ actor ResourceIndexStore {
             }
         }
 
-        return matched
+        let typeFiltered = matched.filter { item in
+            kind == nil || item.resolvedContentType.kind == kind
+        }
+        return typeFiltered
             .sorted { lhs, rhs in
                 let lhsRank = Self.searchRank(lhs, term: term)
                 let rhsRank = Self.searchRank(rhs, term: term)
@@ -189,10 +200,10 @@ actor ResourceIndexStore {
 
     private static func searchPredicate(
         term: String,
-        kindRawValue: String?,
+        resolvedKindRawValue: String?,
         sourceID: UUID?
     ) -> Predicate<ResourceIndexRecord> {
-        switch (sourceID, kindRawValue) {
+        switch (sourceID, resolvedKindRawValue) {
         case (nil, nil):
             return #Predicate {
                 $0.name.localizedStandardContains(term)
@@ -208,14 +219,16 @@ actor ResourceIndexStore {
             return #Predicate {
                 ($0.name.localizedStandardContains(term)
                     || $0.logicalPath.localizedStandardContains(term))
-                    && $0.kindRawValue == kindRaw
+                    && ($0.resolvedKindRawValue == kindRaw
+                        || $0.resolvedKindRawValue == nil)
             }
         case (let source?, let kindRaw?):
             return #Predicate {
                 ($0.name.localizedStandardContains(term)
                     || $0.logicalPath.localizedStandardContains(term))
                     && $0.sourceID == source
-                    && $0.kindRawValue == kindRaw
+                    && ($0.resolvedKindRawValue == kindRaw
+                        || $0.resolvedKindRawValue == nil)
             }
         }
     }
@@ -243,7 +256,7 @@ actor ResourceIndexStore {
               !item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               item.metadata.byteSize.map({ $0 >= 0 }) ?? true,
               item.metadata.modifiedAt.map({ $0.timeIntervalSinceReferenceDate.isFinite }) ?? true,
-              (item.kind == .folder) == item.metadata.isDirectory,
+              (item.resolvedContentType.kind == .folder) == item.metadata.isDirectory,
               Self.isValid(item.metadata.revision) else {
             return false
         }
@@ -283,6 +296,9 @@ final class ResourceIndexRecord {
     var logicalPath: String
     var name: String
     var kindRawValue: String
+    /// Nil identifies records created before shared content-type resolution was
+    /// persisted. Searches include those legacy rows and verify them in memory.
+    var resolvedKindRawValue: String?
     var byteSize: Int64?
     var modifiedAt: Date?
     var mimeType: String?
@@ -304,6 +320,7 @@ final class ResourceIndexRecord {
         logicalPath = item.path
         name = item.name
         kindRawValue = item.kind.rawValue
+        resolvedKindRawValue = item.resolvedContentType.kind.rawValue
         byteSize = item.metadata.byteSize
         modifiedAt = item.metadata.modifiedAt
         mimeType = item.metadata.mimeType
@@ -327,6 +344,7 @@ final class ResourceIndexRecord {
         logicalPath = item.path
         name = item.name
         kindRawValue = item.kind.rawValue
+        resolvedKindRawValue = item.resolvedContentType.kind.rawValue
         byteSize = item.metadata.byteSize
         modifiedAt = item.metadata.modifiedAt
         mimeType = item.metadata.mimeType

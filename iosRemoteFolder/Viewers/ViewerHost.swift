@@ -4,6 +4,7 @@ import PDFKit
 import UIKit
 import AVFoundation
 import AVKit
+import ImageIO
 
 enum ResourceViewerMode: Hashable, Sendable {
     case online
@@ -93,6 +94,9 @@ struct ResourceViewerHost: View {
         .task(id: loadRequest) {
             await load(request: loadRequest, resource: resource)
         }
+        .onDisappear {
+            closeMaterializedFileIfNeeded()
+        }
     }
 
     @ViewBuilder
@@ -111,7 +115,7 @@ struct ResourceViewerHost: View {
             )
         } else {
             VStack(spacing: 0) {
-                metadataSummary(metadata)
+                metadataSummary(metadata, contentType: resolution.contentType)
                 viewerView(resolution: resolution, metadata: metadata, payload: payload)
             }
         }
@@ -143,8 +147,8 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "文本内容读取无效")
             }
         case .imageViewer:
-            if case .image(let data) = payload {
-                ImageViewerView(resource: resource, data: data)
+            if case .image(let image) = payload {
+                ImageViewerView(resource: resource, image: image)
             } else {
                 UnsupportedViewerView(resource: resource, reason: "图片内容读取无效")
             }
@@ -171,19 +175,26 @@ struct ResourceViewerHost: View {
                 UnsupportedViewerView(resource: resource, reason: "音乐内容读取无效")
             }
         case .systemPreview:
-            UnsupportedViewerView(resource: resource, reason: resolution.fallbackDescription)
+            if case .file(let lease) = payload {
+                SystemFileFallbackView(resource: resource, lease: lease)
+            } else {
+                UnsupportedViewerView(resource: resource, reason: resolution.fallbackDescription)
+            }
         }
     }
 
-    private func metadataSummary(_ metadata: ResourceMetadata) -> some View {
+    private func metadataSummary(
+        _ metadata: ResourceMetadata,
+        contentType: ResolvedContentType
+    ) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 12) {
-                Label(resource.kind.title, systemImage: resource.kind.systemImage)
+                Label(contentType.kind.title, systemImage: contentType.kind.systemImage)
                 Text(ResourceMetadataFormatter.size(for: metadata))
                 Text(ResourceMetadataFormatter.modified(for: metadata))
             }
             VStack(alignment: .leading, spacing: 4) {
-                Label(resource.kind.title, systemImage: resource.kind.systemImage)
+                Label(contentType.kind.title, systemImage: contentType.kind.systemImage)
                 HStack(spacing: 12) {
                     Text(ResourceMetadataFormatter.size(for: metadata))
                     Text(ResourceMetadataFormatter.modified(for: metadata))
@@ -199,7 +210,7 @@ struct ResourceViewerHost: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             Text(
-                "\(resource.name)，\(resource.kind.title)，"
+                "\(resource.name)，\(contentType.kind.title)，"
                     + "\(ResourceMetadataFormatter.size(for: metadata))，"
                     + "\(ResourceMetadataFormatter.modified(for: metadata))"
             )
@@ -255,8 +266,14 @@ struct ResourceViewerHost: View {
     }
 
     private func retry() {
+        closeMaterializedFileIfNeeded()
         loadState = .loading
         retryAttempt += 1
+    }
+
+    private func closeMaterializedFileIfNeeded() {
+        guard case .ready(_, _, _, .file(let lease)) = loadState else { return }
+        lease.close()
     }
 
     private func retryMedia(_ engine: AVMediaPlayerEngine) {
@@ -267,6 +284,7 @@ struct ResourceViewerHost: View {
     @MainActor
     private func load(request: LoadRequest, resource: ResourceItem) async {
         guard request == loadRequest else { return }
+        closeMaterializedFileIfNeeded()
         loadState = .loading
 
         var session: ResourceContentSession?
@@ -318,17 +336,45 @@ struct ResourceViewerHost: View {
                 }
                 payload = .pdf(data)
             case .image(let maximumBytes):
-                let data = try await readContent(
+                var preparedImage: ViewerPreparedImage?
+                _ = try await readContent(
                     from: createdSession,
                     metadata: metadata,
                     maximumBytes: maximumBytes,
                     usePersistentCache: mode == .online
                 ) { data in
-                    guard ViewerContentDecoder.isValidImageData(data) else {
-                        throw ResourceSourceError.invalidResponse
-                    }
+                    preparedImage = try await ViewerContentDecoder.prepareImageOffMainActor(data)
                 }
-                payload = .image(data)
+                guard let preparedImage else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .image(preparedImage)
+            case .file(let maximumBytes):
+                guard let byteCount = metadata.byteSize,
+                      byteCount >= 0,
+                      byteCount <= maximumBytes else {
+                    throw ResourceSourceError.responseTooLarge
+                }
+                let materializer = ResourceFileMaterializer()
+                var materializedFile: MaterializedResourceFileLease?
+                _ = try await readContent(
+                    from: createdSession,
+                    metadata: metadata,
+                    maximumBytes: maximumBytes,
+                    usePersistentCache: mode == .online
+                ) { data in
+                    materializedFile = try await materializer.materialize(
+                        data: data,
+                        knownByteCount: byteCount,
+                        suggestedFilename: resource.name,
+                        suggestedTypeIdentifier: resolution.contentType.preferredSystemTypeIdentifier,
+                        maximumBytes: maximumBytes
+                    )
+                }
+                guard let materializedFile else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .file(materializedFile)
             case .audio(let maximumBytes):
                 phase = .enginePreparation
                 let prepared = try await prepareMedia(
@@ -353,7 +399,7 @@ struct ResourceViewerHost: View {
                 payload = .video(prepared.engine)
             }
             try Task.checkCancellation()
-            if mode == .online, resolution.kind != .systemPreview {
+            if mode == .online, resolution.contentType.kind != .folder {
                 appModel.recordRecent(resource: resource, metadata: metadata)
                 await appModel.refreshOfflineCache()
             }
@@ -570,14 +616,139 @@ struct ResourceViewerHost: View {
 enum ViewerContentPayload {
     case text(String)
     case pdf(Data)
-    case image(Data)
+    case image(ViewerPreparedImage)
+    case file(MaterializedResourceFileLease)
     case audio(AVMediaPlayerEngine)
     case video(AVMediaPlayerEngine)
 }
 
+struct ViewerImagePreparationPolicy: Equatable, Sendable {
+    /// Keeps a decoded full-screen image near a 64 MiB RGBA budget while still
+    /// retaining useful detail beyond the device's native display resolution.
+    static let fullScreen = ViewerImagePreparationPolicy(
+        maximumPixelDimension: 4_096,
+        maximumDecodedPixelCount: 16_777_216,
+        // Supports current 48 MP photos while rejecting dimensions whose
+        // worst-case RGBA source would exceed roughly 256 MiB.
+        maximumSourcePixelCount: 67_108_864
+    )
+
+    let maximumPixelDimension: Int
+    let maximumDecodedPixelCount: Int64
+    let maximumSourcePixelCount: Int64
+
+    init(
+        maximumPixelDimension: Int,
+        maximumDecodedPixelCount: Int64,
+        maximumSourcePixelCount: Int64
+    ) {
+        precondition(maximumPixelDimension > 0)
+        precondition(maximumDecodedPixelCount > 0)
+        precondition(maximumSourcePixelCount > 0)
+        self.maximumPixelDimension = maximumPixelDimension
+        self.maximumDecodedPixelCount = maximumDecodedPixelCount
+        self.maximumSourcePixelCount = maximumSourcePixelCount
+    }
+}
+
+/// ImageIO owns the immutable bitmap backing this value. The source bytes are
+/// deliberately not retained, so SwiftUI cannot trigger a second lazy decode.
+struct ViewerPreparedImage: @unchecked Sendable {
+    let cgImage: CGImage
+    let sourcePixelWidth: Int
+    let sourcePixelHeight: Int
+    let wasDownsampled: Bool
+
+    var pixelWidth: Int { cgImage.width }
+    var pixelHeight: Int { cgImage.height }
+}
+
 enum ViewerContentDecoder {
-    static func isValidImageData(_ data: Data) -> Bool {
-        UIImage(data: data) != nil
+    /// Full image validation and bitmap allocation run on the concurrent
+    /// executor. ImageIO inspects dimensions without caching first, then creates
+    /// exactly one display-bounded bitmap with orientation already applied.
+    @concurrent
+    static func prepareImageOffMainActor(
+        _ data: Data,
+        policy: ViewerImagePreparationPolicy = .fullScreen,
+        executionObserver: (@Sendable (_ isMainThread: Bool) -> Void)? = nil
+    ) async throws -> ViewerPreparedImage {
+        try Task.checkCancellation()
+        executionObserver?(isCurrentThreadMain())
+
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData,
+            sourceOptions as CFDictionary
+        ),
+        CGImageSourceGetCount(source) > 0,
+        CGImageSourceGetStatus(source) == .statusComplete,
+        CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any],
+        let sourceWidth = positivePixelDimension(properties[kCGImagePropertyPixelWidth]),
+        let sourceHeight = positivePixelDimension(properties[kCGImagePropertyPixelHeight]),
+        let sourcePixelCount = pixelCount(width: sourceWidth, height: sourceHeight),
+        sourcePixelCount <= policy.maximumSourcePixelCount else {
+            throw ResourceSourceError.invalidResponse
+        }
+
+        let dimensionScale = min(
+            1,
+            Double(policy.maximumPixelDimension) / Double(max(sourceWidth, sourceHeight))
+        )
+        let pixelScale = min(
+            1,
+            sqrt(Double(policy.maximumDecodedPixelCount) / Double(sourcePixelCount))
+        )
+        let decodeScale = min(dimensionScale, pixelScale)
+        let thumbnailDimension = max(
+            1,
+            Int(floor(Double(max(sourceWidth, sourceHeight)) * decodeScale))
+        )
+
+        try Task.checkCancellation()
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: thumbnailDimension,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ),
+        let decodedPixelCount = pixelCount(width: image.width, height: image.height),
+        decodedPixelCount <= policy.maximumDecodedPixelCount,
+        max(image.width, image.height) <= policy.maximumPixelDimension else {
+            throw ResourceSourceError.invalidResponse
+        }
+        try Task.checkCancellation()
+
+        return ViewerPreparedImage(
+            cgImage: image,
+            sourcePixelWidth: sourceWidth,
+            sourcePixelHeight: sourceHeight,
+            wasDownsampled: decodeScale < 1
+        )
+    }
+
+    private static func positivePixelDimension(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        let dimension = number.int64Value
+        guard dimension > 0, dimension <= Int64(Int.max) else { return nil }
+        return Int(dimension)
+    }
+
+    private static func isCurrentThreadMain() -> Bool {
+        Thread.isMainThread
+    }
+
+    private static func pixelCount(width: Int, height: Int) -> Int64? {
+        let (count, overflow) = Int64(width).multipliedReportingOverflow(by: Int64(height))
+        guard !overflow, count > 0 else { return nil }
+        return count
     }
 
     static func isValidAudioData(_ data: Data) -> Bool {
@@ -1066,7 +1237,7 @@ private final class PositionAwareTextView: UITextView {
 
 struct ImageViewerView: View {
     let resource: ResourceItem
-    let data: Data
+    let image: ViewerPreparedImage
 
     @State private var committedScale: CGFloat = 1
     @State private var gestureScale: CGFloat = 1
@@ -1076,57 +1247,49 @@ struct ImageViewerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let image = UIImage(data: data) {
-                GeometryReader { proxy in
-                    Image(uiImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: proxy.size.width, height: proxy.size.height)
-                        .scaleEffect(committedScale * gestureScale)
-                        .offset(
-                            x: committedOffset.width + gestureOffset.width,
-                            y: committedOffset.height + gestureOffset.height
-                        )
-                        .contentShape(Rectangle())
-                        .gesture(
-                            MagnificationGesture()
-                                .onChanged { value in
-                                    gestureScale = value
+            GeometryReader { proxy in
+                Image(decorative: image.cgImage, scale: 1, orientation: .up)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .scaleEffect(committedScale * gestureScale)
+                    .offset(
+                        x: committedOffset.width + gestureOffset.width,
+                        y: committedOffset.height + gestureOffset.height
+                    )
+                    .contentShape(Rectangle())
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { value in
+                                gestureScale = value
+                            }
+                            .onEnded { value in
+                                committedScale = min(max(committedScale * value, 1), 4)
+                                gestureScale = 1
+                                if committedScale == 1 {
+                                    committedOffset = .zero
                                 }
-                                .onEnded { value in
-                                    committedScale = min(max(committedScale * value, 1), 4)
-                                    gestureScale = 1
-                                    if committedScale == 1 {
-                                        committedOffset = .zero
-                                    }
-                                }
-                        )
-                        .simultaneousGesture(
-                            DragGesture()
-                                .onChanged { value in
-                                    guard committedScale > 1 || gestureScale > 1 else { return }
-                                    gestureOffset = value.translation
-                                }
-                                .onEnded { value in
-                                    guard committedScale > 1 else {
-                                        gestureOffset = .zero
-                                        return
-                                    }
-                                    committedOffset.width += value.translation.width
-                                    committedOffset.height += value.translation.height
+                            }
+                    )
+                    .simultaneousGesture(
+                        DragGesture()
+                            .onChanged { value in
+                                guard committedScale > 1 || gestureScale > 1 else { return }
+                                gestureOffset = value.translation
+                            }
+                            .onEnded { value in
+                                guard committedScale > 1 else {
                                     gestureOffset = .zero
+                                    return
                                 }
-                        )
-                        .accessibilityElement()
-                        .accessibilityLabel(Text("\(resource.name)，图片"))
-                        .accessibilityValue(Text("可缩放和平移"))
-                }
-            } else {
-                ContentUnavailableView(
-                    "无法显示图片",
-                    systemImage: "photo",
-                    description: Text("文件内容不是有效的图片。")
-                )
+                                committedOffset.width += value.translation.width
+                                committedOffset.height += value.translation.height
+                                gestureOffset = .zero
+                            }
+                    )
+                    .accessibilityElement()
+                    .accessibilityLabel(Text("\(resource.name)，图片"))
+                    .accessibilityValue(Text("可缩放和平移"))
             }
         }
         .toolbar {
@@ -1188,7 +1351,7 @@ struct VideoPlayerView: View {
                                 .font(.headline)
                                 .fontDesign(.rounded)
                                 .fixedSize(horizontal: false, vertical: true)
-                            Text("\(resource.kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
+                            Text("\(resource.resolvedContentType(using: metadata).kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -1291,7 +1454,7 @@ struct MusicPlayerView: View {
                                 .fontDesign(.rounded)
                                 .multilineTextAlignment(.center)
                                 .fixedSize(horizontal: false, vertical: true)
-                            Text("\(resource.kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
+                            Text("\(resource.resolvedContentType(using: metadata).kind.title) · \(ResourceMetadataFormatter.size(for: metadata))")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -1589,14 +1752,9 @@ struct UnsupportedViewerView: View {
     var body: some View {
         ContentUnavailableView(
             "暂不支持此格式",
-            systemImage: resource.kind.systemImage,
+            systemImage: resource.resolvedContentType.kind.systemImage,
             description: Text(reason ?? "可以下载文件后使用系统分享或其他 App 打开。")
         )
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("分享", systemImage: "square.and.arrow.up") {}
-            }
-        }
     }
 }
 

@@ -593,7 +593,7 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         guard item.id.sourceID == source.id, item.id.logicalPath == item.path else {
             throw ResourceSourceError.invalidReference
         }
-        guard item.kind != .folder, !item.metadata.isDirectory else {
+        guard item.resolvedContentType.kind != .folder else {
             throw ResourceSourceError.invalidReference
         }
         guard !hasInvalidDescriptor, !hasPathConflict else { throw ResourceSourceError.invalidReference }

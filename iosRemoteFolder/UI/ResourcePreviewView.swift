@@ -1,5 +1,61 @@
 import SwiftUI
-import UIKit
+
+enum ResourcePreviewDisplayArtifact: Sendable {
+    case image(ViewerPreparedImage)
+    case textExcerpt(String)
+}
+
+enum ResourcePreviewDisplayPreparer {
+    // ResourcePreviewRequest clamps each side to 512 points at a 4x display scale.
+    private static let maximumPixelDimension = 2_048
+    private static let maximumPixelCount: Int64 = 2_048 * 2_048
+
+    static func prepare(
+        _ artifact: ResourcePreviewArtifact,
+        imageExecutionObserver: (@Sendable (_ isMainThread: Bool) -> Void)? = nil
+    ) async throws -> ResourcePreviewDisplayArtifact {
+        try Task.checkCancellation()
+        switch artifact {
+        case .encodedImage(let data, .png, let pixelWidth, let pixelHeight):
+            guard pixelWidth > 0,
+                  pixelHeight > 0,
+                  pixelWidth <= maximumPixelDimension,
+                  pixelHeight <= maximumPixelDimension,
+                  let pixelCount = checkedPixelCount(
+                      width: pixelWidth,
+                      height: pixelHeight
+                  ),
+                  pixelCount <= maximumPixelCount else {
+                throw ResourceSourceError.invalidResponse
+            }
+
+            let image = try await ViewerContentDecoder.prepareImageOffMainActor(
+                data,
+                policy: ViewerImagePreparationPolicy(
+                    maximumPixelDimension: max(pixelWidth, pixelHeight),
+                    maximumDecodedPixelCount: pixelCount,
+                    maximumSourcePixelCount: pixelCount
+                ),
+                executionObserver: imageExecutionObserver
+            )
+            guard image.pixelWidth == pixelWidth,
+                  image.pixelHeight == pixelHeight else {
+                throw ResourceSourceError.invalidResponse
+            }
+            try Task.checkCancellation()
+            return .image(image)
+
+        case .textExcerpt(let excerpt):
+            return .textExcerpt(excerpt)
+        }
+    }
+
+    private static func checkedPixelCount(width: Int, height: Int) -> Int64? {
+        let (count, overflow) = Int64(width).multipliedReportingOverflow(by: Int64(height))
+        guard !overflow, count > 0 else { return nil }
+        return count
+    }
+}
 
 enum ResourcePreviewFallbackPresentation: Equatable {
     case label
@@ -34,7 +90,7 @@ struct ResourcePreviewView: View {
     }
 
     private var request: ResourcePreviewRequest? {
-        guard resource.kind != .folder else { return nil }
+        guard resource.resolvedContentType.kind != .folder else { return nil }
         return ResourcePreviewRequest(
             item: resource,
             targetSize: targetSize,
@@ -44,7 +100,7 @@ struct ResourcePreviewView: View {
 
     @ViewBuilder
     var body: some View {
-        if resource.kind == .folder {
+        if resource.resolvedContentType.kind == .folder {
             if fallbackPresentation == .symbol {
                 ResourcePreviewSymbolFallback(resource: resource)
                     .previewFrame(
@@ -92,7 +148,7 @@ private struct PreviewTaskView: View {
     private enum PreviewState {
         case placeholder
         case loading
-        case artifact(ResourcePreviewArtifact)
+        case artifact(ResourcePreviewDisplayArtifact)
         case fallback
     }
 
@@ -104,7 +160,9 @@ private struct PreviewTaskView: View {
             pixelHeight: request?.pixelHeight,
             scaleHundredths: request?.scaleHundredths,
             rendererVersion: request?.rendererVersion,
-            kind: resource.kind
+            contentTypeFingerprint: (
+                request?.contentType ?? resource.resolvedContentType
+            ).stableFingerprint
         )
     }
 
@@ -144,17 +202,13 @@ private struct PreviewTaskView: View {
     }
 
     @ViewBuilder
-    private func artifactView(_ artifact: ResourcePreviewArtifact) -> some View {
+    private func artifactView(_ artifact: ResourcePreviewDisplayArtifact) -> some View {
         switch artifact {
-        case .encodedImage(let data, _, _, _):
-            if let image = UIImage(data: data) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .clipped()
-            } else {
-                fallback
-            }
+        case .image(let image):
+            Image(decorative: image.cgImage, scale: 1, orientation: .up)
+                .resizable()
+                .scaledToFill()
+                .clipped()
         case .textExcerpt(let excerpt):
             Text(excerpt)
                 .font(
@@ -169,7 +223,7 @@ private struct PreviewTaskView: View {
                 .lineLimit(fallbackPresentation == .symbol ? 5 : 4)
                 .padding(fallbackPresentation == .symbol ? 10 : 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(resource.kind.gradient.opacity(0.12))
+                .background(resource.resolvedContentType.kind.gradient.opacity(0.12))
         }
     }
 
@@ -178,7 +232,7 @@ private struct PreviewTaskView: View {
         switch fallbackPresentation {
         case .label:
             ZStack {
-                resource.kind.gradient.opacity(0.18)
+                resource.resolvedContentType.kind.gradient.opacity(0.18)
                 Text(fallbackLabel)
                     .font(
                         .system(
@@ -211,13 +265,13 @@ private struct PreviewTaskView: View {
         if (2...5).contains(normalized.count) {
             return normalized
         }
-        return resource.kind.title
+        return resource.resolvedContentType.kind.title
     }
 
     private func load(expectedTaskID: PreviewTaskID) async {
         activeTaskID = expectedTaskID
         guard let request,
-              resource.kind != .folder else {
+              resource.resolvedContentType.kind != .folder else {
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
             state = .fallback
             return
@@ -225,8 +279,9 @@ private struct PreviewTaskView: View {
         state = .loading
         do {
             let artifact = try await pipeline.preview(for: request)
+            let displayArtifact = try await ResourcePreviewDisplayPreparer.prepare(artifact)
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
-            state = .artifact(artifact)
+            state = .artifact(displayArtifact)
         } catch {
             guard !Task.isCancelled, activeTaskID == expectedTaskID else { return }
             state = .fallback
@@ -239,8 +294,8 @@ private struct ResourcePreviewSymbolFallback: View {
 
     var body: some View {
         ZStack {
-            resource.kind.gradient
-            Image(systemName: resource.kind.systemImage)
+            resource.resolvedContentType.kind.gradient
+            Image(systemName: resource.resolvedContentType.kind.systemImage)
                 .font(.system(size: 36, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.95))
                 .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
@@ -270,5 +325,5 @@ private struct PreviewTaskID: Hashable {
     let pixelHeight: Int?
     let scaleHundredths: Int?
     let rendererVersion: Int?
-    let kind: ResourceKind
+    let contentTypeFingerprint: String
 }

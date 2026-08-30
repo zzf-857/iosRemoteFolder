@@ -22,6 +22,20 @@ enum BrowseSourceActivation {
     }
 }
 
+enum BrowseResourceFilter {
+    static func filter(
+        _ items: [ResourceItem],
+        selectedKind: ResourceKind?
+    ) -> [ResourceItem] {
+        guard let selectedKind else { return items }
+        // Directories stay reachable while a file-type filter is active.
+        return items.filter {
+            let resolvedKind = $0.resolvedContentType.kind
+            return resolvedKind == .folder || resolvedKind == selectedKind
+        }
+    }
+}
+
 struct BrowseView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -264,14 +278,12 @@ private struct BrowseContentView: View {
     }
 
     private func filteredItems(_ items: [ResourceItem]) -> [ResourceItem] {
-        guard let selectedKind else { return items }
-        // 文件夹始终可见，保证筛选状态下仍能下钻目录。
-        return items.filter { $0.kind == .folder || $0.kind == selectedKind }
+        BrowseResourceFilter.filter(items, selectedKind: selectedKind)
     }
 
     @ViewBuilder
     private func row(for item: ResourceItem, entry: SourcesStore.Entry) -> some View {
-        if item.kind == .folder {
+        if item.resolvedContentType.kind == .folder {
             // 文件夹下钻：改变当前目录状态，不进入查看器。
             Button {
                 store.enter(entry.id, folder: item)

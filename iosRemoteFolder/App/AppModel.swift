@@ -300,7 +300,8 @@ final class AppModel {
 
     var filteredResources: [ResourceItem] {
         resources.filter { resource in
-            let matchesKind = selectedKind == nil || resource.kind == selectedKind
+            let matchesKind = selectedKind == nil
+                || resource.resolvedContentType.kind == selectedKind
             let matchesSearch = searchText.isEmpty || resource.name.localizedCaseInsensitiveContains(searchText)
             return matchesKind && matchesSearch
         }
@@ -315,8 +316,7 @@ final class AppModel {
     /// 只有查看器已经完成 metadata/内容准备后才写入最近记录。
     /// 传入的 metadata 是本次会话最新事实，不复用列举时的旧值。
     func recordRecent(resource: ResourceItem, metadata: ResourceMetadata) {
-        guard resource.kind != .folder,
-              !metadata.isDirectory,
+        guard resource.resolvedContentType(using: metadata).kind != .folder,
               let path = ResourcePath(rawValue: resource.path),
               path.normalized == resource.path else {
             return
@@ -427,7 +427,7 @@ final class AppModel {
     /// Opens an indexed folder through the same SourcesStore browse state used
     /// by the Browse tab. Persisted search results never bypass the registry.
     func openIndexedFolder(_ resource: ResourceItem) {
-        guard resource.kind == .folder,
+        guard resource.resolvedContentType.kind == .folder,
               sources.contains(where: { $0.id == resource.sourceID }),
               let path = ResourcePath(rawValue: resource.path),
               path.normalized == resource.path else {
@@ -1149,8 +1149,7 @@ final class RecentResourceStore {
     }
 
     func record(_ resource: ResourceItem) {
-        guard resource.kind != .folder,
-              !resource.metadata.isDirectory,
+        guard resource.resolvedContentType.kind != .folder,
               ResourcePath(rawValue: resource.path)?.normalized == resource.path else {
             return
         }
@@ -1302,7 +1301,8 @@ final class ResourceProgressStore {
         for resource: ResourceItem,
         metadata: ResourceMetadata
     ) -> ResourceResumePosition? {
-        guard Self.isSupportedMedia(resource), Self.hasCanonicalIdentity(resource) else {
+        guard Self.isSupportedMedia(resource, metadata: metadata),
+              Self.hasCanonicalIdentity(resource) else {
             return nil
         }
 
@@ -1330,7 +1330,7 @@ final class ResourceProgressStore {
         for resource: ResourceItem,
         metadata: ResourceMetadata
     ) {
-        guard Self.isSupportedMedia(resource),
+        guard Self.isSupportedMedia(resource, metadata: metadata),
               Self.hasCanonicalIdentity(resource),
               metadata.revision.isKnown,
               let seconds = position.secondsValue else {
@@ -1381,8 +1381,12 @@ final class ResourceProgressStore {
         defaults.set(data, forKey: Self.storageKey)
     }
 
-    private static func isSupportedMedia(_ resource: ResourceItem) -> Bool {
-        resource.kind == .audio || resource.kind == .video
+    private static func isSupportedMedia(
+        _ resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> Bool {
+        let kind = resource.resolvedContentType(using: metadata).kind
+        return kind == .audio || kind == .video
     }
 
     private static func hasCanonicalIdentity(_ resource: ResourceItem) -> Bool {
@@ -1528,7 +1532,8 @@ final class ResourceReadingStore {
         for resource: ResourceItem,
         metadata: ResourceMetadata
     ) -> ResourceReadingPosition? {
-        guard Self.supportsReading(resource), Self.hasCanonicalIdentity(resource) else {
+        let resolvedKind = resource.resolvedContentType(using: metadata).kind
+        guard Self.supportsReading(resolvedKind), Self.hasCanonicalIdentity(resource) else {
             return nil
         }
         guard let index = items.firstIndex(where: { $0.identityKey == resource.id.identityKey }) else {
@@ -1541,7 +1546,7 @@ final class ResourceReadingStore {
         let item = items[index]
         guard item.revision == metadata.revision,
               let position = item.position,
-              Self.isCompatible(position, with: resource.kind) else {
+              Self.isCompatible(position, with: resolvedKind) else {
             remove(at: index)
             return nil
         }
@@ -1553,10 +1558,11 @@ final class ResourceReadingStore {
         for resource: ResourceItem,
         metadata: ResourceMetadata
     ) {
-        guard Self.supportsReading(resource),
+        let resolvedKind = resource.resolvedContentType(using: metadata).kind
+        guard Self.supportsReading(resolvedKind),
               Self.hasCanonicalIdentity(resource),
               metadata.revision.isKnown,
-              Self.isCompatible(position, with: resource.kind) else {
+              Self.isCompatible(position, with: resolvedKind) else {
             return
         }
         let stored = StoredItem(position: position, resource: resource, metadata: metadata)
@@ -1603,8 +1609,8 @@ final class ResourceReadingStore {
         defaults.set(data, forKey: Self.storageKey)
     }
 
-    private static func supportsReading(_ resource: ResourceItem) -> Bool {
-        resource.kind == .pdf || resource.kind == .text || resource.kind == .markdown
+    private static func supportsReading(_ kind: ResourceKind) -> Bool {
+        kind == .pdf || kind == .text || kind == .markdown
     }
 
     private static func isCompatible(

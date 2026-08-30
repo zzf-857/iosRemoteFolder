@@ -23,8 +23,7 @@ final class ResourceAccessService: Sendable {
         guard await registry.hasAdapter(for: item.sourceID) else {
             throw ResourceSourceError.capabilityUnavailable
         }
-        guard item.kind != .folder,
-              !item.metadata.isDirectory,
+        guard item.resolvedContentType.kind != .folder,
               item.capabilities.contains(.read) else {
             throw ResourceSourceError.capabilityUnavailable
         }
@@ -32,7 +31,7 @@ final class ResourceAccessService: Sendable {
         let session = ResourceContentSession(registry: registry, item: item)
         do {
             let latestMetadata = try await session.fetchMetadata()
-            guard !latestMetadata.isDirectory else {
+            guard item.resolvedContentType(using: latestMetadata).kind != .folder else {
                 throw ResourceSourceError.capabilityUnavailable
             }
             return session
@@ -51,8 +50,7 @@ final class ResourceAccessService: Sendable {
         guard Self.isCanonicalResource(item) else {
             throw ResourceSourceError.invalidReference
         }
-        guard item.kind != .folder,
-              !item.metadata.isDirectory,
+        guard item.resolvedContentType.kind != .folder,
               item.metadata.revision.isKnown,
               let cacheCoordinator,
               let key = ResourceCacheKey(

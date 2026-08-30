@@ -440,7 +440,7 @@ final class SourcesStore {
     /// 进入一个文件夹：文件夹的 `path` 即其完整规范化逻辑路径。
     /// 拒绝来源不匹配或身份/路径矛盾的文件夹，避免越界下钻。
     func enter(_ sourceID: UUID, folder: ResourceItem) {
-        guard folder.kind == .folder,
+        guard folder.resolvedContentType.kind == .folder,
               folder.sourceID == sourceID,
               folder.id.sourceID == sourceID,
               folder.id.logicalPath == folder.path,

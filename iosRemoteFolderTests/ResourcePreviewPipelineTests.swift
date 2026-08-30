@@ -5,8 +5,428 @@ import Testing
 
 @testable import iosRemoteFolder
 
+private final class PreviewImageExecutionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private var mainThreadObservation: Bool?
+
+    func record(isMainThread: Bool) {
+        lock.lock()
+        callCount += 1
+        mainThreadObservation = isMainThread
+        lock.unlock()
+    }
+
+    var snapshot: (callCount: Int, observedMainThread: Bool?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (callCount, mainThreadObservation)
+    }
+}
+
 @Suite("统一资源预览管线", .serialized)
 struct ResourcePreviewPipelineTests {
+    @Test("编码缩略图仅在后台准备一次并持有解码结果")
+    @MainActor
+    func preparesEncodedThumbnailOnceOffMainActor() async throws {
+        let data = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        let probe = PreviewImageExecutionProbe()
+
+        let displayArtifact = try await ResourcePreviewDisplayPreparer.prepare(
+            .encodedImage(
+                data: data,
+                format: .png,
+                pixelWidth: 1,
+                pixelHeight: 1
+            ),
+            imageExecutionObserver: probe.record(isMainThread:)
+        )
+
+        guard case .image(let image) = displayArtifact else {
+            Issue.record("编码图片应准备为可直接展示的 CGImage")
+            return
+        }
+        #expect(image.pixelWidth == 1)
+        #expect(image.pixelHeight == 1)
+        let snapshot = probe.snapshot
+        #expect(snapshot.callCount == 1)
+        #expect(snapshot.observedMainThread == false)
+    }
+
+    @Test("共享类型解析统一证据、Viewer 与浏览筛选")
+    func resolvesGenericMIMEAndSharedConsumers() throws {
+        let genericPDF = try makeResolvedItem(
+            path: "/文档/手册.pdf",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                mimeType: "application/octet-stream",
+                typeIdentifier: "public.data"
+            )
+        )
+
+        let contentType = genericPDF.resolvedContentType
+        #expect(contentType.kind == .pdf)
+        #expect(contentType.confidence == .medium)
+        #expect(contentType.diagnostics.isEmpty)
+        #expect(contentType.evidence.contains { evidence in
+            evidence.source == .mimeType
+                && evidence.kind == .unknown
+                && evidence.strength == .generic
+        })
+        #expect(contentType.evidence.contains { evidence in
+            evidence.source == .filenameExtension
+                && evidence.kind == .pdf
+                && evidence.strength == .inferred
+        })
+
+        let viewer = ViewerRegistry.resolve(
+            resource: genericPDF,
+            metadata: genericPDF.metadata
+        )
+        #expect(viewer.contentType == contentType)
+        #expect(viewer.kind == .pdfReader)
+
+        let systemFile = try makeResolvedItem(
+            path: "/文档/report.docx",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                byteSize: 4_096,
+                mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        )
+        let systemResolution = ViewerRegistry.resolve(
+            resource: systemFile,
+            metadata: systemFile.metadata
+        )
+        #expect(systemResolution.kind == .systemPreview)
+        #expect(
+            systemResolution.preparation
+                == .file(maximumBytes: ViewerRegistry.systemFallbackMaximumBytes)
+        )
+
+        let directory = try makeResolvedItem(
+            path: "/文档/子目录.pdf",
+            kind: .unknown,
+            metadata: ResourceMetadata(isDirectory: true)
+        )
+        let folderResolution = ViewerRegistry.resolve(
+            resource: directory,
+            metadata: directory.metadata
+        )
+        #expect(folderResolution.kind == .systemPreview)
+        #expect(folderResolution.preparation == .none)
+
+        let declaredPDFButTypedText = try makeResolvedItem(
+            path: "/文档/说明.txt",
+            kind: .pdf,
+            metadata: ResourceMetadata(
+                mimeType: "text/plain",
+                typeIdentifier: "public.plain-text"
+            )
+        )
+        #expect(
+            BrowseResourceFilter.filter(
+                [genericPDF, declaredPDFButTypedText, directory],
+                selectedKind: .pdf
+            ) == [genericPDF, directory]
+        )
+    }
+
+    @Test("Markdown 兼容、无扩展与 declared 低置信回退确定性解析")
+    func resolvesCompatibleAndFallbackEvidence() throws {
+        let markdown = try makeResolvedItem(
+            path: "/笔记/readme.md",
+            kind: .text,
+            metadata: ResourceMetadata(
+                mimeType: "text/markdown; charset=utf-8",
+                typeIdentifier: "public.plain-text"
+            )
+        ).resolvedContentType
+        #expect(markdown.kind == .markdown)
+        #expect(markdown.confidence == .high)
+        #expect(markdown.diagnostics.isEmpty)
+
+        for path in ["/数据/payload.json", "/网页/index.html", "/数据/feed.xml"] {
+            let typedText = try makeResolvedItem(
+                path: path,
+                kind: .unknown,
+                metadata: ResourceMetadata(
+                    mimeType: "text/plain",
+                    typeIdentifier: "public.plain-text"
+                )
+            ).resolvedContentType
+            #expect(typedText.kind == .text)
+            #expect(typedText.confidence == .high)
+            #expect(!typedText.hasBlockingConflict)
+        }
+
+        let genericPDF = try makeResolvedItem(
+            path: "/文档/manual.pdf",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/x-binary")
+        ).resolvedContentType
+        #expect(genericPDF.kind == .pdf)
+        #expect(genericPDF.confidence == .medium)
+
+        for (mimeType, expectedKind) in [
+            ("audio/opus", ResourceKind.audio),
+            ("image/x-icon", ResourceKind.image),
+            ("video/x-matroska", ResourceKind.video)
+        ] {
+            let vendorMedia = try makeResolvedItem(
+                path: "/媒体/extensionless",
+                kind: .unknown,
+                metadata: ResourceMetadata(mimeType: mimeType)
+            ).resolvedContentType
+            #expect(vendorMedia.kind == expectedKind)
+            #expect(vendorMedia.confidence == .high)
+            #expect(!vendorMedia.hasBlockingConflict)
+        }
+
+        let extensionlessAudio = try makeResolvedItem(
+            path: "/媒体/track",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                mimeType: "audio/mpeg",
+                typeIdentifier: "public.mp3"
+            )
+        ).resolvedContentType
+        #expect(extensionlessAudio.kind == .audio)
+        #expect(extensionlessAudio.confidence == .high)
+
+        let declaredOnly = try makeResolvedItem(
+            path: "/资源/cover",
+            kind: .image,
+            metadata: ResourceMetadata()
+        ).resolvedContentType
+        #expect(declaredOnly.kind == .image)
+        #expect(declaredOnly.confidence == .low)
+        #expect(declaredOnly.evidence.contains { $0.source == .declaredKind })
+
+        let officeDocument = try makeResolvedItem(
+            path: "/文档/report.docx",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        ).resolvedContentType
+        #expect(officeDocument.kind == .unknown)
+        #expect(!officeDocument.hasBlockingConflict)
+        #expect(!officeDocument.diagnostics.contains { diagnostic in
+            if case .metadataExtensionMismatch = diagnostic { return true }
+            return false
+        })
+
+        let typedArchiveWithoutExtension = try makeResolvedItem(
+            path: "/资源/download",
+            kind: .pdf,
+            metadata: ResourceMetadata(mimeType: "application/zip")
+        ).resolvedContentType
+        #expect(typedArchiveWithoutExtension.kind == .unknown)
+        #expect(typedArchiveWithoutExtension.confidence == .high)
+        #expect(!typedArchiveWithoutExtension.hasBlockingConflict)
+
+        for path in ["/文档/report.docx", "/归档/package.zip"] {
+            let extensionOnlySystemFile = try makeResolvedItem(
+                path: path,
+                kind: .pdf,
+                metadata: ResourceMetadata(byteSize: 4_096)
+            )
+            let contentType = extensionOnlySystemFile.resolvedContentType
+            #expect(contentType.kind == .unknown)
+            #expect(contentType.confidence == .medium)
+            #expect(!contentType.hasBlockingConflict)
+            #expect(
+                ViewerRegistry.resolve(
+                    resource: extensionOnlySystemFile,
+                    metadata: extensionOnlySystemFile.metadata
+                ).preparation == .file(
+                    maximumBytes: ViewerRegistry.systemFallbackMaximumBytes
+                )
+            )
+        }
+
+        let declaredFolderWithTypedFile = try makeResolvedItem(
+            path: "/文档/manual.pdf",
+            kind: .folder,
+            metadata: ResourceMetadata(
+                mimeType: "application/pdf",
+                typeIdentifier: "com.adobe.pdf"
+            )
+        ).resolvedContentType
+        #expect(declaredFolderWithTypedFile.kind == .pdf)
+        #expect(declaredFolderWithTypedFile.confidence == .high)
+
+        let dottedDeclaredFolder = try makeResolvedItem(
+            path: "/文档/archive.zip",
+            kind: .folder,
+            metadata: ResourceMetadata()
+        ).resolvedContentType
+        #expect(dottedDeclaredFolder.kind == .folder)
+        #expect(dottedDeclaredFolder.confidence == .low)
+    }
+
+    @Test("强 typed 冲突安全降级且目录事实优先")
+    func rejectsStrongConflictAndPrioritizesDirectoryFact() async throws {
+        let conflictItem = try makeResolvedItem(
+            path: "/资源/no-extension",
+            kind: .image,
+            metadata: ResourceMetadata(
+                mimeType: "image/jpeg",
+                typeIdentifier: "public.plain-text"
+            )
+        )
+        let conflict = conflictItem.resolvedContentType
+        #expect(conflict.kind == .unknown)
+        #expect(conflict.confidence == .none)
+        #expect(conflict.hasBlockingConflict)
+        #expect(conflict.diagnostics.contains { diagnostic in
+            if case .conflictingTypedMetadata(
+                typeIdentifier: .text,
+                mimeType: .image
+            ) = diagnostic {
+                return true
+            }
+            return false
+        })
+        #expect(
+            ViewerRegistry.resolve(
+                resource: conflictItem,
+                metadata: conflictItem.metadata
+            ).kind == .systemPreview
+        )
+
+        let folder = try makeResolvedItem(
+            path: "/资源/folder.pdf",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                mimeType: "application/pdf",
+                typeIdentifier: "com.adobe.pdf",
+                isDirectory: true
+            )
+        ).resolvedContentType
+        #expect(folder.kind == .folder)
+        #expect(folder.confidence == .authoritative)
+        #expect(folder.diagnostics.isEmpty)
+        #expect(folder.evidence.contains { $0.source == .directory })
+
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/资源/no-extension",
+            revision: .etag("typed-conflict-v1"),
+            mimeType: "image/jpeg",
+            typeIdentifier: "public.plain-text",
+            readsReleased: true
+        )
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            try await fixture.pipeline.preview(for: makeRequest(item: fixture.item))
+        }
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 0)
+        #expect(snapshot.readCalls == 0)
+
+        let zipDisguisedAsPDF = try makeResolvedItem(
+            path: "/资源/archive.pdf",
+            kind: .pdf,
+            metadata: ResourceMetadata(mimeType: "application/zip")
+        ).resolvedContentType
+        #expect(zipDisguisedAsPDF.kind == .unknown)
+        #expect(zipDisguisedAsPDF.hasBlockingConflict)
+        #expect(zipDisguisedAsPDF.diagnostics.contains { diagnostic in
+            if case .metadataExtensionMismatch(
+                metadata: .unknown,
+                filenameExtension: .pdf
+            ) = diagnostic {
+                return true
+            }
+            return false
+        })
+        let blockedViewer = ViewerRegistry.resolve(
+            resource: try makeResolvedItem(
+                path: "/资源/archive.pdf",
+                kind: .pdf,
+                metadata: ResourceMetadata(
+                    byteSize: 4_096,
+                    mimeType: "application/zip"
+                )
+            ),
+            metadata: ResourceMetadata(
+                byteSize: 4_096,
+                mimeType: "application/zip"
+            )
+        )
+        #expect(blockedViewer.kind == .systemPreview)
+        #expect(blockedViewer.preparation == .none)
+    }
+
+    @Test("预览管线按 generic MIME 下的强扩展选择 renderer")
+    func previewUsesSharedResolutionForGenericMIME() async throws {
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/预览/说明.md",
+            revision: .etag("generic-markdown-v1"),
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            content: Data("# 标题\n正文".utf8),
+            readsReleased: true
+        )
+
+        let artifact = try await fixture.pipeline.preview(
+            for: makeRequest(item: fixture.item)
+        )
+        guard case .textExcerpt(let excerpt) = artifact else {
+            Issue.record("Markdown 扩展应选择文本预览 renderer")
+            return
+        }
+        #expect(excerpt.contains("标题 正文"))
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+    }
+
+    @Test("初始强类型冲突在缓存查找前零探测拒绝")
+    func rejectsInitialBlockingConflictBeforeCacheLookup() async throws {
+        let revision = ResourceRevision.etag("initial-conflict-v1")
+        let path = "/预览/conflict.txt"
+        let fixture = makeFixture(
+            kind: .text,
+            path: path,
+            revision: revision,
+            readsReleased: true
+        )
+
+        let healthyRequest = try makeRequest(item: fixture.item)
+        #expect(
+            try await fixture.pipeline.preview(for: healthyRequest)
+                == .textExcerpt("预览正文")
+        )
+        let primedSnapshot = await fixture.adapter.snapshot()
+        #expect(primedSnapshot.metadataCalls == 1)
+        #expect(primedSnapshot.readCalls == 1)
+
+        let conflictingItem = try makeItem(
+            sourceID: fixture.source.id,
+            path: path,
+            kind: .text,
+            byteSize: fixture.item.metadata.byteSize,
+            mimeType: "image/jpeg",
+            typeIdentifier: "public.plain-text",
+            revision: revision
+        )
+        let conflictingRequest = try makeRequest(item: conflictingItem)
+        #expect(conflictingItem.id == fixture.item.id)
+        #expect(conflictingRequest.contentType.hasBlockingConflict)
+
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            try await fixture.pipeline.preview(for: conflictingRequest)
+        }
+        let rejectedSnapshot = await fixture.adapter.snapshot()
+        #expect(rejectedSnapshot.metadataCalls == primedSnapshot.metadataCalls)
+        #expect(rejectedSnapshot.readCalls == primedSnapshot.readCalls)
+    }
+
     @Test("演示图片 PDF 与 Markdown 生成有界真实预览")
     func rendersSampleArtifacts() async throws {
         let cacheDirectory = try makeCacheDirectory()
@@ -432,6 +852,233 @@ struct ResourcePreviewPipelineTests {
             includingPropertiesForKeys: nil
         )
         #expect(unknownDiskEntries.isEmpty)
+    }
+
+    @Test("新鲜类型解析决定落盘键且不发布到陈旧类型键")
+    func freshResolutionOwnsPersistedCacheKey() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let revision = ResourceRevision.etag("fresh-image-v1")
+        let path = "/预览/asset"
+        let fixture = makeFixture(
+            kind: .image,
+            path: path,
+            revision: revision,
+            mimeType: "image/png",
+            typeIdentifier: "public.png",
+            content: pngData,
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let staleItem = try makeItem(
+            sourceID: fixture.source.id,
+            path: path,
+            kind: .text,
+            byteSize: Int64(pngData.count),
+            mimeType: "text/plain",
+            typeIdentifier: "public.plain-text",
+            revision: revision
+        )
+        let freshItem = try makeItem(
+            sourceID: fixture.source.id,
+            path: path,
+            kind: .image,
+            byteSize: Int64(pngData.count),
+            mimeType: "image/png",
+            typeIdentifier: "public.png",
+            revision: revision
+        )
+        #expect(staleItem.id == freshItem.id)
+        #expect(staleItem.resolvedContentType.kind == .text)
+        #expect(freshItem.resolvedContentType.kind == .image)
+        #expect(
+            staleItem.resolvedContentType.stableFingerprint
+                != freshItem.resolvedContentType.stableFingerprint
+        )
+
+        let staleRequest = try makeRequest(item: staleItem)
+        let freshRequest = try makeRequest(item: freshItem)
+        let generated = try await fixture.pipeline.preview(for: staleRequest)
+        guard case .encodedImage = generated else {
+            Issue.record("新鲜图片元数据必须覆盖陈旧文本列表类型")
+            return
+        }
+        var snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+
+        let repeatedStaleHit = try await fixture.pipeline.preview(for: staleRequest)
+        guard case .encodedImage = repeatedStaleHit else {
+            Issue.record("同一管线的陈旧类型别名应返回已验证图片")
+            return
+        }
+        snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+
+        let freshPipeline = ResourcePreviewPipeline(
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory
+        )
+        let diskHit = try await freshPipeline.preview(for: freshRequest)
+        guard case .encodedImage = diskHit else {
+            Issue.record("新鲜类型请求应命中已生成的图片磁盘缓存")
+            return
+        }
+        snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+
+        let stalePipeline = ResourcePreviewPipeline(
+            accessService: fixture.accessService,
+            cacheDirectory: cacheDirectory
+        )
+        let persistedAliasHit = try await stalePipeline.preview(for: staleRequest)
+        guard case .encodedImage = persistedAliasHit else {
+            Issue.record("陈旧类型请求应通过已验证的持久别名命中图片")
+            return
+        }
+        snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+    }
+
+    @Test("类型别名仅在请求 revision 与新鲜 revision 相同时建立")
+    func resolvedTypeAliasRequiresMatchingRevision() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let path = "/预览/revision-changed"
+        let fixture = makeFixture(
+            kind: .image,
+            path: path,
+            revision: .etag("stale-v1"),
+            resolvedRevision: .etag("fresh-v2"),
+            mimeType: "image/png",
+            typeIdentifier: "public.png",
+            content: pngData,
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let staleItem = try makeItem(
+            sourceID: fixture.source.id,
+            path: path,
+            kind: .text,
+            byteSize: Int64(pngData.count),
+            mimeType: "text/plain",
+            typeIdentifier: "public.plain-text",
+            revision: .etag("stale-v1")
+        )
+        let staleRequest = try makeRequest(item: staleItem)
+
+        _ = try await fixture.pipeline.preview(for: staleRequest)
+        _ = try await fixture.pipeline.preview(for: staleRequest)
+
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 2)
+        #expect(snapshot.readCalls == 2)
+    }
+
+    @Test("磁盘类型别名不能跨身份 revision 与尺寸作用域命中")
+    func rejectsTamperedResolvedTypeAliasOutsideScope() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let revision = ResourceRevision.etag("alias-scope-a")
+        let path = "/预览/alias-scope-a"
+        let first = makeFixture(
+            kind: .image,
+            path: path,
+            revision: revision,
+            mimeType: "image/png",
+            typeIdentifier: "public.png",
+            content: pngData,
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let staleItem = try makeItem(
+            sourceID: first.source.id,
+            path: path,
+            kind: .text,
+            byteSize: Int64(pngData.count),
+            mimeType: "text/plain",
+            typeIdentifier: "public.plain-text",
+            revision: revision
+        )
+        let staleRequest = try makeRequest(item: staleItem)
+        _ = try await first.pipeline.preview(for: staleRequest)
+
+        let second = makeFixture(
+            kind: .image,
+            path: "/预览/alias-scope-b.png",
+            revision: .etag("alias-scope-b"),
+            mimeType: "image/png",
+            typeIdentifier: "public.png",
+            content: pngData,
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        _ = try await second.pipeline.preview(for: makeRequest(item: second.item))
+
+        let entries = try decodeManifestEntries(in: cacheDirectory)
+        let alias = try #require(entries.first { $0.value.aliasTargetDigest != nil })
+        let originalTarget = try #require(alias.value.aliasTargetDigest)
+        let unrelatedTarget = try #require(entries.first { digest, entry in
+            digest != alias.key
+                && digest != originalTarget
+                && entry.aliasTargetDigest == nil
+        }?.key)
+
+        let aliasRecordURL = cacheDirectory
+            .appendingPathComponent(alias.key + ".preview")
+        let aliasRecordData = try Data(contentsOf: aliasRecordURL)
+        var propertyListFormat = PropertyListSerialization.PropertyListFormat.binary
+        let aliasPropertyList = try PropertyListSerialization.propertyList(
+            from: aliasRecordData,
+            options: [],
+            format: &propertyListFormat
+        )
+        var aliasRecord = try #require(
+            aliasPropertyList as? [String: Any]
+        )
+        aliasRecord["aliasTargetDigest"] = unrelatedTarget
+        let tamperedAliasData = try PropertyListSerialization.data(
+            fromPropertyList: aliasRecord,
+            format: .binary,
+            options: 0
+        )
+        try tamperedAliasData.write(to: aliasRecordURL, options: .atomic)
+
+        let manifestURL = cacheDirectory.appendingPathComponent("manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        var manifest = try #require(
+            JSONSerialization.jsonObject(with: manifestData) as? [String: Any]
+        )
+        var aliasManifestEntry = try #require(manifest[alias.key] as? [String: Any])
+        aliasManifestEntry["aliasTargetDigest"] = unrelatedTarget
+        manifest[alias.key] = aliasManifestEntry
+        let tamperedManifestData = try JSONSerialization.data(withJSONObject: manifest)
+        try tamperedManifestData.write(to: manifestURL, options: .atomic)
+
+        let reloaded = ResourcePreviewPipeline(
+            accessService: first.accessService,
+            cacheDirectory: cacheDirectory
+        )
+        _ = try await reloaded.preview(for: staleRequest)
+
+        let snapshot = await first.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 2)
+        #expect(snapshot.readCalls == 2)
     }
 
     @Test("磁盘命中不阻塞写 manifest 且一个视口只批量持久化一次")
@@ -921,6 +1568,8 @@ struct ResourcePreviewPipelineTests {
             path: path ?? defaultFixturePath(for: kind),
             kind: kind,
             byteSize: revision.isKnown ? metadata.byteSize : nil,
+            mimeType: resolvedMimeType,
+            typeIdentifier: resolvedTypeIdentifier,
             revision: revision
         )
         let adapter = PreviewFixtureAdapter(
@@ -969,7 +1618,8 @@ struct ResourcePreviewPipelineTests {
         case .image: "image/png"
         case .pdf: "application/pdf"
         case .markdown: "text/markdown"
-        case .folder, .text, .unknown: "text/plain"
+        case .folder, .text: "text/plain"
+        case .unknown: "application/octet-stream"
         }
     }
 
@@ -981,7 +1631,8 @@ struct ResourcePreviewPipelineTests {
         case .pdf: "com.adobe.pdf"
         case .markdown: "net.daringfireball.markdown"
         case .folder: "public.folder"
-        case .text, .unknown: "public.plain-text"
+        case .text: "public.plain-text"
+        case .unknown: "public.data"
         }
     }
 
@@ -998,6 +1649,8 @@ struct ResourcePreviewPipelineTests {
         path: String,
         kind: ResourceKind = .text,
         byteSize: Int64? = nil,
+        mimeType: String? = "text/plain",
+        typeIdentifier: String? = "public.plain-text",
         revision: ResourceRevision
     ) throws -> ResourceItem {
         let logicalPath = try #require(ResourcePath(rawValue: path))
@@ -1008,11 +1661,28 @@ struct ResourcePreviewPipelineTests {
             kind: kind,
             metadata: ResourceMetadata(
                 byteSize: byteSize,
-                mimeType: kind == .video ? "video/mp4" : "text/plain",
-                typeIdentifier: kind == .video ? "public.mpeg-4" : "public.plain-text",
+                mimeType: mimeType,
+                typeIdentifier: typeIdentifier,
                 revision: revision
             ),
             capabilities: [.read],
+            accent: .recommended(for: kind)
+        )
+    }
+
+    private func makeResolvedItem(
+        path: String,
+        kind: ResourceKind,
+        metadata: ResourceMetadata
+    ) throws -> ResourceItem {
+        let logicalPath = try #require(ResourcePath(rawValue: path))
+        return ResourceItem(
+            sourceID: UUID(),
+            logicalPath: logicalPath,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            kind: kind,
+            metadata: metadata,
+            capabilities: kind == .folder ? [.list] : [.read],
             accent: .recommended(for: kind)
         )
     }
@@ -1064,6 +1734,7 @@ struct ResourcePreviewPipelineTests {
 
 private struct PreviewManifestEntry: Decodable {
     let lastAccess: Date
+    let aliasTargetDigest: String?
 }
 
 private enum ManifestDataWriterError: Error {

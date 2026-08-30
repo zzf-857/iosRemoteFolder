@@ -406,6 +406,42 @@ struct WebDAVSourceAdapterTests {
         #expect(folder.metadata.mimeType == nil)
     }
 
+    @Test("已列举的 collection 事实拒绝伪造 typed-file 引用")
+    func cachedCollectionFactRejectsForgedTypedFileReference() async throws {
+        WebDAVMockURLProtocol.reset()
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .respond(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                body: Self.mixedPropstatDirectoryResponse
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        let folder = try #require(try await adapter.listResources(at: .root).first)
+        let forgedFile = ResourceItem(
+            sourceID: folder.sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: folder.path)),
+            name: "伪造.pdf",
+            kind: .folder,
+            metadata: ResourceMetadata(
+                mimeType: "application/pdf",
+                typeIdentifier: "com.adobe.pdf"
+            ),
+            capabilities: [.read],
+            accent: .orange
+        )
+        #expect(forgedFile.resolvedContentType.kind == .pdf)
+
+        await #expect(throws: ResourceSourceError.invalidReference) {
+            _ = try await adapter.reference(for: forgedFile)
+        }
+    }
+
     @Test("多个成功 propstat 的冲突属性拒绝歧义覆盖")
     func conflictingSuccessfulPropstatsAreRejected() async throws {
         WebDAVMockURLProtocol.reset()

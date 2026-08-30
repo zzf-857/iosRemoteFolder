@@ -68,11 +68,13 @@
 - [ ] LOAD-008A Move text decoding off the main actor with deterministic encoding/binary tests.
   - Implementation and deterministic encoding/binary coverage complete; keep open until the reference-device 100 ms stall gate is measured under OBS-004.
 - [ ] LOAD-008B Move image validation/downsampling off the main actor with one decode and a pixel budget.
+  - ImageIO preparation, one-decode display payloads, source/output pixel budgets, cancellation, and deterministic tests are complete; keep open for the reference-device 100 ms stall and 48 MP RSS gates under OBS-004.
 - [ ] LOAD-008C Move PDF preparation off the main actor with one file-backed parse.
 - [ ] LOAD-008D Move Markdown attributed parsing off the main actor and cache it per revision.
-- [ ] FMT-001 Introduce a shared `ResolvedContentType` with evidence and confidence.
+- [x] FMT-001 Introduce a shared `ResolvedContentType` with evidence and confidence.
 - [ ] FMT-002 Add bounded magic-byte sniffing and safe conflict resolution.
 - [ ] FMT-003 Implement real Quick Look, Share, and Open In fallbacks.
+  - The known-length <=64 MiB path now has real Quick Look, Share, Open In, canonical UTI propagation, and lease-safe cleanup; keep open until the physical-device Office/iWork/archive matrix passes.
 - [ ] FMT-004 Materialize unknown-length whole-file consumers through bounded temporary files.
 - [ ] FMT-005 Support MIME charset, GB18030/GBK, Big5, Shift-JIS, and binary-text rejection.
 - [ ] FMT-006 Validate AV container/codec capability and offer fallback before showing unusable controls.
@@ -139,3 +141,4 @@ Dependencies: `OBS-001A/001B/002/003 -> baseline -> performance changes -> OBS-0
 | 2026-08-30 | `fcc58c3`, `4a25d2f`, `ca3edb9` | SEC-001A, OBS-001A, LOAD-007, REL-002 | 184/184 tests; Release Analyze succeeded; `git diff --check` passed; `origin/main` verified | Existing PDFKit warnings and a SwiftData context-isolation runtime warning remain; real Alist still reports passed when unconfigured. |
 | 2026-08-30 | `3f80f75`, `0585645`, `eb98076`, `a5afa02`, `7be79ba` | QUAL-001, LOAD-001, LOAD-006, LOAD-009, SEC-003; LOAD-008A implementation | Focused source/viewer/WebDAV/HTTP suites passed; Debug/Release warnings-as-errors passed; `origin/main` verified at `7be79ba` | LOAD-008A remains open for the reference-device 100 ms stall measurement. |
 | 2026-08-30 | `02f60e5`, `215de86`, `4a0e60d` | CACHE-002, QUAL-007, LOAD-003 | 215 tests passed, 1 real-service test explicitly skipped; Debug/Release warnings-as-errors and Release Analyze succeeded; `git diff --check` passed | SwiftData context-isolation runtime warning remains tracked by QUAL-008. |
+| 2026-08-30 | `pending` | FMT-001; LOAD-008B and known-length FMT-003 implementation | 249 tests passed, 1 real-service test explicitly skipped; 96 focused tests passed with 1 skip; Debug/Release warnings-as-errors and Release Analyze succeeded; `git diff --check` passed | Preview aliases are revision/scope bounded; LOAD-008B awaits device metrics, FMT-003 awaits the device format matrix, and unknown-length materialization remains FMT-004. |

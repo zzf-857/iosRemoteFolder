@@ -172,7 +172,7 @@ struct ResourceSearchView: View {
             sourceName: appModel.sourceName(for: resource.sourceID)
         )
 
-        if resource.kind == .folder {
+        if resource.resolvedContentType.kind == .folder {
             Button {
                 dismiss()
                 appModel.openIndexedFolder(resource)
@@ -294,8 +294,8 @@ private struct ResourceSearchResultRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(resource.name)
-        .accessibilityValue("\(resource.kind.title)，\(sourceName)，\(resource.path)")
-        .accessibilityHint(resource.kind == .folder ? "打开文件夹" : "打开资源")
+        .accessibilityValue("\(resource.resolvedContentType.kind.title)，\(sourceName)，\(resource.path)")
+        .accessibilityHint(resource.resolvedContentType.kind == .folder ? "打开文件夹" : "打开资源")
     }
 
     private var compactLayout: some View {
@@ -337,7 +337,7 @@ private struct ResourceSearchResultRow: View {
 
     private var contextText: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("\(sourceName) · \(resource.kind.title)")
+            Text("\(sourceName) · \(resource.resolvedContentType.kind.title)")
             Text(resource.path)
                 .lineLimit(2)
         }
@@ -429,7 +429,7 @@ private struct ContinueCard: View {
                     .fontDesign(.rounded)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("\(resource.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))")
+                Text("\(resource.resolvedContentType.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -447,7 +447,7 @@ private struct ContinueCard: View {
         .modernCard(cornerRadius: 24)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(resource.name))
-        .accessibilityValue(Text("\(resource.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))"))
+        .accessibilityValue(Text("\(resource.resolvedContentType.kind.title)，\(ResourceMetadataFormatter.modified(for: resource.metadata))"))
         .accessibilityHint(Text("继续查看"))
     }
 }

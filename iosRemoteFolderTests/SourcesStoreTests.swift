@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import ImageIO
 import MediaPlayer
 import Network
 import PDFKit
@@ -26,6 +27,23 @@ private actor StubListGate {
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+private final class ImagePreparationExecutionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var mainThreadObservation: Bool?
+
+    func record(isMainThread: Bool) {
+        lock.lock()
+        mainThreadObservation = isMainThread
+        lock.unlock()
+    }
+
+    var observedMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return mainThreadObservation
     }
 }
 
@@ -481,6 +499,37 @@ struct SourcesStoreTests {
         store.loadDirectory(source.id, at: failedPath)
         try await waitUntil { store.entries.first?.browse.error == .timedOut }
         #expect(!snapshotPaths.contains(failedPath))
+    }
+
+    @Test("统一类型识别的目录可以实际下钻")
+    func resolvedDirectoryCanBeEntered() async throws {
+        let source = makeSource()
+        let folderPath = try #require(ResourcePath(rawValue: "/typed-folder"))
+        let folder = ResourceItem(
+            sourceID: source.id,
+            logicalPath: folderPath,
+            name: "typed-folder",
+            kind: .unknown,
+            metadata: ResourceMetadata(isDirectory: true),
+            capabilities: [.list],
+            accent: .blue
+        )
+        let child = sampleItem(source.id, path: "/typed-folder/child.txt")
+        let stub = StubSourceAdapter(source: source, items: [folder])
+        stub.setListItemSequence([[child]], at: folderPath)
+        let store = try makeStore(sources: [source], adapters: [stub])
+
+        store.connect(source.id)
+        stub.release()
+        try await waitUntil { store.entries.first?.state == .ready }
+
+        store.enter(source.id, folder: folder)
+        try await waitUntil {
+            store.entries.first?.browse.currentPath == folderPath
+                && store.entries.first?.browse.items == [child]
+                && store.entries.first?.browse.isLoading == false
+        }
+        #expect(stub.listPaths.contains(folderPath))
     }
 
     @Test("30 秒内 fresh 目录快照同步命中且零请求")
@@ -1356,6 +1405,14 @@ struct SourceConfigurationMigrationTests {
             isDirectory: false,
             revision: .etag("\"namespace-v1\"")
         )
+        let audioMetadata = ResourceMetadata(
+            byteSize: metadata.byteSize,
+            modifiedAt: metadata.modifiedAt,
+            mimeType: "audio/mp4",
+            typeIdentifier: "public.mpeg-4-audio",
+            isDirectory: false,
+            revision: metadata.revision
+        )
         let resource = ResourceItem(
             sourceID: sourceID,
             logicalPath: try #require(ResourcePath(rawValue: "/notes/readme.txt")),
@@ -1370,7 +1427,7 @@ struct SourceConfigurationMigrationTests {
             logicalPath: try #require(ResourcePath(rawValue: "/music/theme.m4a")),
             name: "theme.m4a",
             kind: .audio,
-            metadata: metadata,
+            metadata: audioMetadata,
             capabilities: [.read, .download],
             accent: .pink
         )
@@ -1382,7 +1439,7 @@ struct SourceConfigurationMigrationTests {
             )
         )
         model.recordRecent(resource: resource, metadata: metadata)
-        model.recordResumePosition(.seconds(12), for: audio, metadata: metadata)
+        model.recordResumePosition(.seconds(12), for: audio, metadata: audioMetadata)
         model.recordReadingPosition(.text(fraction: 0.4), for: resource, metadata: metadata)
         try await model.cacheCoordinator.store(
             Data("content".utf8),
@@ -1407,7 +1464,7 @@ struct SourceConfigurationMigrationTests {
             model.sources.first(where: { $0.id == sourceID })?.name == "新名称"
         }
         #expect(model.recentResources.contains { $0.id == resource.id })
-        #expect(model.resumePosition(for: audio, metadata: metadata) == .seconds(12))
+        #expect(model.resumePosition(for: audio, metadata: audioMetadata) == .seconds(12))
         #expect(model.readingPosition(for: resource, metadata: metadata) == .text(fraction: 0.4))
         #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) != nil)
         let indexCountAfterRename = try await model.resourceIndexStore.indexedResourceCount(
@@ -1438,7 +1495,7 @@ struct SourceConfigurationMigrationTests {
             try await Task.sleep(for: .milliseconds(25))
         }
         #expect(!model.recentResources.contains { $0.id == resource.id })
-        #expect(model.resumePosition(for: audio, metadata: metadata) == nil)
+        #expect(model.resumePosition(for: audio, metadata: audioMetadata) == nil)
         #expect(model.readingPosition(for: resource, metadata: metadata) == nil)
         #expect(try await model.cacheCoordinator.data(for: cacheKey, maximumBytes: 1_024) == nil)
         let indexCountAfterEndpointChange = try await model.resourceIndexStore.indexedResourceCount(
@@ -2011,6 +2068,25 @@ struct ResourceAccessServiceTests {
         }
     }
 
+    @Test("创建会话时以最新 metadata 保留目录事实")
+    func sessionCreationRejectsFreshDirectoryMetadata() async throws {
+        let source = makeSource()
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(isDirectory: true),
+            content: Data()
+        )
+        let service = try makeService(source: source, adapter: adapter)
+
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            _ = try await service.makeSession(
+                for: makeItem(sourceID: source.id, capabilities: [.read])
+            )
+        }
+        #expect(adapter.metadataCalls == 1)
+        #expect(adapter.readCalls == 0)
+    }
+
     @Test("调用方取消会取消对应在途操作")
     func callerCancellationCancelsOperation() async throws {
         let source = makeSource()
@@ -2374,7 +2450,7 @@ struct SessionMediaPlayerTests {
     }
 }
 
-@Suite("查看器解析与文本载荷")
+@Suite("查看器解析与载荷")
 struct ViewerResolutionTests {
     @Test("TXT 解析使用 typed 文本证据和显式预算")
     func resolvesTextContent() {
@@ -2405,8 +2481,8 @@ struct ViewerResolutionTests {
         #expect(resolution.preparation == .pdf(maximumBytes: 50 * 1024 * 1024))
     }
 
-    @Test("图片解析使用显式预算并拒绝非图片字节")
-    func resolvesImageContent() {
+    @Test("图片解析使用显式传输预算并准备单次解码结果")
+    func resolvesImageContent() async throws {
         let item = makeItem(path: "/photo.jpg", kind: .unknown)
         let metadata = ResourceMetadata(
             mimeType: "image/jpeg",
@@ -2417,9 +2493,93 @@ struct ViewerResolutionTests {
 
         #expect(resolution.kind == .imageViewer)
         #expect(resolution.preparation == .image(maximumBytes: 50 * 1024 * 1024))
-        let imageData = UIImage(systemName: "photo")!.pngData()!
-        #expect(ViewerContentDecoder.isValidImageData(imageData))
-        #expect(!ViewerContentDecoder.isValidImageData(Data("not an image".utf8)))
+        let imageData = try makePNG(width: 16, height: 8)
+        let prepared = try await ViewerContentDecoder.prepareImageOffMainActor(imageData)
+        #expect(prepared.pixelWidth == 16)
+        #expect(prepared.pixelHeight == 8)
+        #expect(!prepared.wasDownsampled)
+        #expect(ViewerImagePreparationPolicy.fullScreen.maximumSourcePixelCount == 67_108_864)
+    }
+
+    @Test("图片准备拒绝损坏和截断字节")
+    func rejectsDamagedImages() async throws {
+        let valid = try makePNG(width: 32, height: 16)
+        let invalidPayloads = [
+            Data("not an image".utf8),
+            Data(valid.prefix(valid.count / 2))
+        ]
+
+        for payload in invalidPayloads {
+            await #expect(throws: ResourceSourceError.invalidResponse) {
+                try await ViewerContentDecoder.prepareImageOffMainActor(payload)
+            }
+        }
+    }
+
+    @Test("超大图片按边长和解码像素预算下采样一次")
+    func downsamplesLargeImagesWithinPixelBudget() async throws {
+        let data = try makePNG(width: 256, height: 128)
+        let policy = ViewerImagePreparationPolicy(
+            maximumPixelDimension: 64,
+            maximumDecodedPixelCount: 4_096,
+            maximumSourcePixelCount: 100_000
+        )
+
+        let prepared = try await ViewerContentDecoder.prepareImageOffMainActor(
+            data,
+            policy: policy
+        )
+
+        #expect(prepared.sourcePixelWidth == 256)
+        #expect(prepared.sourcePixelHeight == 128)
+        #expect(prepared.pixelWidth == 64)
+        #expect(prepared.pixelHeight == 32)
+        #expect(prepared.pixelWidth * prepared.pixelHeight <= 4_096)
+        #expect(prepared.wasDownsampled)
+    }
+
+    @Test("源像素元数据超限时在位图分配前拒绝")
+    func rejectsSourcePixelBombMetadata() async throws {
+        let data = try makePNG(width: 64, height: 64)
+        let policy = ViewerImagePreparationPolicy(
+            maximumPixelDimension: 64,
+            maximumDecodedPixelCount: 4_096,
+            maximumSourcePixelCount: 4_095
+        )
+
+        await #expect(throws: ResourceSourceError.invalidResponse) {
+            try await ViewerContentDecoder.prepareImageOffMainActor(data, policy: policy)
+        }
+    }
+
+    @Test("图片准备响应调用方取消")
+    func imagePreparationHonorsCancellation() async throws {
+        let data = try makePNG(width: 32, height: 16)
+        let task = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return try await ViewerContentDecoder.prepareImageOffMainActor(data)
+        }
+
+        task.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+    }
+
+    @Test("图片准备从 MainActor 切换到并发执行器")
+    @MainActor
+    func imagePreparationLeavesMainActor() async throws {
+        let data = try makePNG(width: 16, height: 8)
+        let probe = ImagePreparationExecutionProbe()
+
+        _ = try await ViewerContentDecoder.prepareImageOffMainActor(
+            data,
+            executionObserver: probe.record(isMainThread:)
+        )
+
+        #expect(probe.observedMainThread == false)
     }
 
     @Test("音乐解析使用显式预算")
@@ -2472,6 +2632,7 @@ struct ViewerResolutionTests {
             )
         )
         #expect(conflictResolution.kind == .systemPreview)
+        #expect(conflictResolution.preparation == .none)
         #expect(conflictResolution.fallbackDescription?.contains("扩展名") == true)
     }
 
@@ -2604,6 +2765,40 @@ struct ViewerResolutionTests {
             accent: .blue
         )
     }
+
+    private func makePNG(width: Int, height: Int) throws -> Data {
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw ResourceSourceError.unavailable
+        }
+        context.setFillColor(red: 0.1, green: 0.4, blue: 0.8, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw ResourceSourceError.unavailable
+        }
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw ResourceSourceError.unavailable
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ResourceSourceError.invalidResponse
+        }
+        return output as Data
+    }
 }
 
 @Suite("最近资源记录")
@@ -2734,6 +2929,28 @@ struct RecentResourceStoreTests {
 @Suite("媒体播放位置")
 @MainActor
 struct ResourceProgressStoreTests {
+    @Test("播放位置使用共享解析类型而非来源 declared kind")
+    func usesResolvedMediaKind() {
+        let suiteName = "iosRemoteFolder.resource-progress-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let resource = makeResource(
+            sourceID: UUID(),
+            path: "/media/stream",
+            kind: .unknown
+        )
+        let metadata = ResourceMetadata(
+            mimeType: "audio/mpeg",
+            typeIdentifier: "public.mp3",
+            revision: .etag("resolved-audio-v1")
+        )
+        let store = ResourceProgressStore(defaults: defaults)
+
+        store.record(.seconds(8), for: resource, metadata: metadata)
+        #expect(store.position(for: resource, metadata: metadata) == .seconds(8))
+    }
+
     @Test("已知 revision 的位置可持久化并恢复")
     func persistsAndRestoresKnownRevision() {
         let suiteName = "iosRemoteFolder.resource-progress-tests.\(UUID().uuidString)"
@@ -2848,6 +3065,28 @@ struct ResourceProgressStoreTests {
 @Suite("文档阅读位置")
 @MainActor
 struct ResourceReadingStoreTests {
+    @Test("阅读位置使用共享解析类型而非来源 declared kind")
+    func usesResolvedDocumentKind() {
+        let suiteName = "iosRemoteFolder.resource-reading-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let resource = makeResource(
+            sourceID: UUID(),
+            path: "/docs/download",
+            kind: .unknown
+        )
+        let metadata = ResourceMetadata(
+            mimeType: "application/pdf",
+            typeIdentifier: "com.adobe.pdf",
+            revision: .etag("resolved-pdf-v1")
+        )
+        let store = ResourceReadingStore(defaults: defaults)
+
+        store.record(.pdf(pageIndex: 4), for: resource, metadata: metadata)
+        #expect(store.position(for: resource, metadata: metadata) == .pdf(pageIndex: 4))
+    }
+
     @Test("PDF 页码与文本比例按身份和 revision 持久化恢复")
     func persistsAndRestoresDocumentPositions() {
         let suiteName = "iosRemoteFolder.resource-reading-tests.\(UUID().uuidString)"
@@ -3173,6 +3412,37 @@ struct SampleSourceContentTests {
         let pdfData = try await pdfSession.readData(maximumBytes: 50 * 1024 * 1024)
         #expect(pdfData.starts(with: Data("%PDF-1.4".utf8)))
         #expect(PDFDocument(data: pdfData) != nil)
+    }
+
+    @Test("typed PDF metadata 可覆盖来源误报的 folder kind")
+    func readsTypedPDFDeclaredAsFolder() async throws {
+        let source = try #require(
+            SampleData.sources.first { $0.id == SampleData.personalSourceID }
+        )
+        let canonicalPDF = try #require(
+            SampleData.resources.first { $0.path.hasSuffix("设计系统与组件规范.pdf") }
+        )
+        let declaredFolder = ResourceItem(
+            sourceID: canonicalPDF.sourceID,
+            logicalPath: try #require(ResourcePath(rawValue: canonicalPDF.path)),
+            name: canonicalPDF.name,
+            kind: .folder,
+            metadata: canonicalPDF.metadata,
+            capabilities: [.read],
+            accent: canonicalPDF.accent
+        )
+        #expect(declaredFolder.resolvedContentType.kind == .pdf)
+
+        let registry = try SourceRegistry(
+            sources: [source],
+            adapters: [SampleSourceAdapter(source: source)]
+        )
+        let session = try await ResourceAccessService(registry: registry)
+            .makeSession(for: declaredFolder)
+        let data = try await session.readData(maximumBytes: 50 * 1024 * 1024)
+
+        #expect(data.starts(with: Data("%PDF-1.4".utf8)))
+        #expect(PDFDocument(data: data) != nil)
     }
 
     @Test("演示来源经内容会话返回可解码图片字节")

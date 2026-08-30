@@ -6,6 +6,230 @@ import Testing
 
 @Suite("已浏览资源索引")
 struct ResourceIndexStoreTests {
+    @Test("类型搜索按共享解析结果而非来源 declared kind 过滤")
+    func typeSearchUsesResolvedContentType() async throws {
+        let store = ResourceIndexStore(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer()
+        )
+        let sourceID = UUID()
+        let resolvedPDF = try makeItem(
+            sourceID: sourceID,
+            path: "/manual.pdf",
+            kind: .text,
+            metadata: ResourceMetadata(
+                mimeType: "application/octet-stream",
+                typeIdentifier: "public.data"
+            )
+        )
+        let declaredPDFButResolvedText = try makeItem(
+            sourceID: sourceID,
+            path: "/manual-notes.txt",
+            kind: .pdf,
+            metadata: ResourceMetadata(
+                mimeType: "text/plain",
+                typeIdentifier: "public.plain-text"
+            )
+        )
+        try await store.replaceDirectory(
+            sourceID: sourceID,
+            parentPath: .root,
+            items: [resolvedPDF, declaredPDFButResolvedText]
+        )
+
+        #expect(try await store.search("manual", kind: .pdf) == [resolvedPDF])
+        #expect(
+            try await store.search("manual", kind: .text)
+                == [declaredPDFButResolvedText]
+        )
+
+        let pdfRecord = ResourceIndexRecord(
+            item: resolvedPDF,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        let textRecord = ResourceIndexRecord(
+            item: declaredPDFButResolvedText,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        #expect(pdfRecord.resolvedKindRawValue == ResourceKind.pdf.rawValue)
+        #expect(textRecord.resolvedKindRawValue == ResourceKind.text.rawValue)
+    }
+
+    @Test("索引接受 unknown 目录与 typed metadata 覆盖的文件")
+    func indexesResolvedDirectoriesAndTypedFiles() async throws {
+        let store = ResourceIndexStore(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer()
+        )
+        let sourceID = UUID()
+        let directory = try makeItem(
+            sourceID: sourceID,
+            path: "/未分类",
+            kind: .unknown,
+            metadata: ResourceMetadata(isDirectory: true),
+            capabilities: [.list]
+        )
+        let typedPDF = try makeItem(
+            sourceID: sourceID,
+            path: "/manual.pdf",
+            kind: .folder,
+            metadata: ResourceMetadata(
+                mimeType: "application/pdf",
+                typeIdentifier: "com.adobe.pdf"
+            ),
+            capabilities: [.read]
+        )
+
+        #expect(directory.resolvedContentType.kind == .folder)
+        #expect(typedPDF.resolvedContentType.kind == .pdf)
+
+        try await store.replaceDirectory(
+            sourceID: sourceID,
+            parentPath: .root,
+            items: [directory, typedPDF]
+        )
+
+        #expect(try await store.search("未分类", kind: .folder) == [directory])
+        #expect(try await store.search("manual", kind: .pdf) == [typedPDF])
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 2)
+    }
+
+    @Test("resolved kind 谓词下推且 legacy nil 记录不会漏查")
+    func resolvedKindPredicateIncludesLegacyRows() async throws {
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let sourceID = UUID()
+        let newPDF = try makeItem(
+            sourceID: sourceID,
+            path: "/filter-new.pdf",
+            kind: .text,
+            metadata: ResourceMetadata(
+                mimeType: "application/octet-stream",
+                typeIdentifier: "public.data"
+            )
+        )
+        let legacyPDF = try makeItem(
+            sourceID: sourceID,
+            path: "/filter-legacy.pdf",
+            kind: .text,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        let legacyText = try makeItem(
+            sourceID: sourceID,
+            path: "/filter-legacy.txt",
+            kind: .pdf,
+            metadata: ResourceMetadata(
+                mimeType: "text/plain",
+                typeIdentifier: "public.plain-text"
+            )
+        )
+        let excludedCorruptText = try makeItem(
+            sourceID: sourceID,
+            path: "/filter-corrupt.txt",
+            kind: .text,
+            metadata: ResourceMetadata(mimeType: "text/plain")
+        )
+
+        let context = ModelContext(container)
+        let newPDFRecord = ResourceIndexRecord(
+            item: newPDF,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        let legacyPDFRecord = ResourceIndexRecord(
+            item: legacyPDF,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        legacyPDFRecord.resolvedKindRawValue = nil
+        let legacyTextRecord = ResourceIndexRecord(
+            item: legacyText,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        legacyTextRecord.resolvedKindRawValue = nil
+        let excludedCorruptRecord = ResourceIndexRecord(
+            item: excludedCorruptText,
+            parentPath: .root,
+            indexedAt: Date()
+        )
+        excludedCorruptRecord.kindRawValue = "invalid-kind"
+        for record in [
+            newPDFRecord,
+            legacyPDFRecord,
+            legacyTextRecord,
+            excludedCorruptRecord,
+        ] {
+            context.insert(record)
+        }
+        try context.save()
+
+        let store = ResourceIndexStore(modelContainer: container)
+        let pdfMatches = try await store.search(
+            "filter",
+            kind: .pdf,
+            sourceID: sourceID
+        )
+        #expect(Set(pdfMatches.map(\.id)) == Set([newPDF.id, legacyPDF.id]))
+
+        let reloadedContext = ModelContext(container)
+        let reloadedRecords = try reloadedContext.fetch(FetchDescriptor<ResourceIndexRecord>())
+        let reloadedLegacyPDF = try #require(
+            reloadedRecords.first { $0.logicalPath == legacyPDF.path }
+        )
+        let reloadedLegacyText = try #require(
+            reloadedRecords.first { $0.logicalPath == legacyText.path }
+        )
+        #expect(reloadedLegacyPDF.resolvedKindRawValue == ResourceKind.pdf.rawValue)
+        #expect(reloadedLegacyText.resolvedKindRawValue == ResourceKind.text.rawValue)
+
+        // The invalid text row remains because the resolved-kind predicate
+        // excluded it before decoding. Both legacy nil rows were fetched,
+        // resolved, and backfilled; only the legacy PDF is returned.
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 4)
+
+        let corruptMatches = try await store.search("filter-corrupt")
+        #expect(corruptMatches.isEmpty)
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 3)
+    }
+
+    @Test("一万条混合索引的类型搜索保持返回上限")
+    func largeResolvedKindSearchRemainsBounded() async throws {
+        let store = ResourceIndexStore(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer()
+        )
+        let sourceID = UUID()
+        var items: [ResourceItem] = []
+        items.reserveCapacity(10_000)
+        for index in 0..<10_000 {
+            let isPDF = index.isMultiple(of: 2)
+            items.append(try makeItem(
+                sourceID: sourceID,
+                path: "/bulk-\(index).\(isPDF ? "pdf" : "txt")",
+                kind: isPDF ? .text : .pdf,
+                metadata: isPDF
+                    ? ResourceMetadata(
+                        mimeType: "application/octet-stream",
+                        typeIdentifier: "public.data"
+                    )
+                    : ResourceMetadata(
+                        mimeType: "text/plain",
+                        typeIdentifier: "public.plain-text"
+                    )
+            ))
+        }
+
+        try await store.replaceDirectory(
+            sourceID: sourceID,
+            parentPath: .root,
+            items: items
+        )
+
+        let matches = try await store.search("bulk", kind: .pdf, limit: 37)
+        #expect(try await store.indexedResourceCount(sourceID: sourceID) == 10_000)
+        #expect(matches.count == 37)
+        #expect(matches.allSatisfy { $0.resolvedContentType.kind == .pdf })
+    }
+
     @Test("跨来源和目录搜索保留 typed metadata 并支持筛选")
     func searchesAcrossSourcesAndDirectories() async throws {
         let store = ResourceIndexStore(

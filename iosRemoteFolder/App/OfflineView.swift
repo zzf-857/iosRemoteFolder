@@ -166,7 +166,7 @@ private struct OfflineResourceRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
             Text(
-                "\(resource.name)，\(resource.kind.title)，"
+                "\(resource.name)，\(resource.resolvedContentType.kind.title)，"
                     + "\(ResourceMetadataFormatter.size(for: resource.metadata))，"
                     + "\(ResourceMetadataFormatter.modified(for: resource.metadata))，已离线"
             )

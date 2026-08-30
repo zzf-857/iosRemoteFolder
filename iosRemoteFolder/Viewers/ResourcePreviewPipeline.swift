@@ -60,7 +60,7 @@ private enum ResourcePreviewSignposts {
 }
 
 struct ResourcePreviewRequest: Hashable, Sendable {
-    static let currentRendererVersion = 2
+    static let currentRendererVersion = 3
     private static let pointPrecision: CGFloat = 100
     private static let minimumPointDimension: CGFloat = 1
     private static let maximumPointDimension: CGFloat = 512
@@ -68,6 +68,7 @@ struct ResourcePreviewRequest: Hashable, Sendable {
     private static let maximumDisplayScale: CGFloat = 4
 
     let item: ResourceItem
+    let contentType: ResolvedContentType
     let pointWidthHundredths: Int
     let pointHeightHundredths: Int
     let scaleHundredths: Int
@@ -106,6 +107,7 @@ struct ResourcePreviewRequest: Hashable, Sendable {
         let normalizedScale = CGFloat(scaleHundredths) / Self.pointPrecision
 
         self.item = item
+        self.contentType = item.resolvedContentType
         self.pointWidthHundredths = pointWidthHundredths
         self.pointHeightHundredths = pointHeightHundredths
         self.scaleHundredths = scaleHundredths
@@ -220,34 +222,37 @@ actor ResourcePreviewPipeline {
         let pixelHeight: Int
         let scaleHundredths: Int
         let rendererVersion: Int
-        let artifactKind: String
+        let contentTypeFingerprint: String
 
-        init(request: ResourcePreviewRequest, revision: ResourceRevision? = nil) {
+        init(
+            request: ResourcePreviewRequest,
+            revision: ResourceRevision? = nil,
+            contentType: ResolvedContentType? = nil
+        ) {
             identity = request.item.id
             self.revision = revision ?? request.item.metadata.revision
             pixelWidth = request.pixelWidth
             pixelHeight = request.pixelHeight
             scaleHundredths = request.scaleHundredths
             rendererVersion = request.rendererVersion
-            artifactKind = switch request.item.kind {
-            case .image, .pdf: "image"
-            case .text, .markdown: "text"
-            case .folder: "folder"
-            case .video: "video"
-            case .audio: "audio"
-            case .unknown: "unknown"
-            }
+            contentTypeFingerprint = (contentType ?? request.contentType).stableFingerprint
         }
 
         var persistenceToken: String? {
+            guard revision.isKnown else { return nil }
+            return aliasScopeToken.map {
+                $0 + "\u{1F}type:\(contentTypeFingerprint)"
+            }
+        }
+
+        var aliasScopeToken: String? {
             guard revision.isKnown else { return nil }
             return [
                 identity.identityKey,
                 revision.previewPersistenceToken,
                 "px:\(pixelWidth)x\(pixelHeight)",
                 "scale:\(scaleHundredths)",
-                "renderer:\(rendererVersion)",
-                "kind:\(artifactKind)"
+                "renderer:\(rendererVersion)"
             ].joined(separator: "\u{1F}")
         }
     }
@@ -258,20 +263,55 @@ actor ResourcePreviewPipeline {
         var accessOrder: UInt64
     }
 
+    private struct MemoryAliasEntry: Sendable {
+        let target: CacheKey
+        var accessOrder: UInt64
+    }
+
     private struct DiskManifestEntry: Codable, Sendable {
         let sourceID: UUID
         let byteCount: Int64
         var lastAccess: Date
+        let aliasTargetDigest: String?
     }
 
     private struct DiskRecord: Codable, Sendable {
         let keyDigest: String
-        let artifact: ResourcePreviewArtifact
+        let artifact: ResourcePreviewArtifact?
+        let aliasTargetDigest: String?
+        let scopeDigest: String?
+
+        static func artifact(
+            keyDigest: String,
+            scopeDigest: String,
+            artifact: ResourcePreviewArtifact
+        ) -> DiskRecord {
+            DiskRecord(
+                keyDigest: keyDigest,
+                artifact: artifact,
+                aliasTargetDigest: nil,
+                scopeDigest: scopeDigest
+            )
+        }
+
+        static func alias(
+            keyDigest: String,
+            targetDigest: String,
+            scopeDigest: String
+        ) -> DiskRecord {
+            DiskRecord(
+                keyDigest: keyDigest,
+                artifact: nil,
+                aliasTargetDigest: targetDigest,
+                scopeDigest: scopeDigest
+            )
+        }
     }
 
     private struct GeneratedPreview: Sendable {
         let artifact: ResourcePreviewArtifact
         let revision: ResourceRevision
+        let contentType: ResolvedContentType
     }
 
     private struct TextPreviewInput: Sendable {
@@ -300,7 +340,9 @@ actor ResourcePreviewPipeline {
     private static let quickLookByteBudget: Int64 = 4 * 1024 * 1024
     private static let requestDeadline: Duration = .seconds(8)
     private static let memoryCostBudget = 16 * 1024 * 1024
+    private static let maximumMemoryAliasCount = 512
     private static let diskByteBudget: Int64 = 64 * 1024 * 1024
+    private static let maximumDiskAliasCount = 512
     private static let maximumDiskRecordBytes: Int64 = 20 * 1024 * 1024
     private static let maximumManifestBytes: Int64 = 2 * 1024 * 1024
     private static let manifestFilename = "manifest.json"
@@ -319,6 +361,7 @@ actor ResourcePreviewPipeline {
 
     private var inFlight: [CacheKey: InFlight] = [:]
     private var memoryCache: [CacheKey: MemoryEntry] = [:]
+    private var memoryAliases: [CacheKey: MemoryAliasEntry] = [:]
     private var memoryCost = 0
     private var accessCounter: UInt64 = 0
     private var diskManifest: [String: DiskManifestEntry]
@@ -363,9 +406,12 @@ actor ResourcePreviewPipeline {
 
     func preview(for request: ResourcePreviewRequest) async throws -> ResourcePreviewArtifact {
         guard !Task.isCancelled else { throw ResourceSourceError.cancelled }
+        guard !request.contentType.hasBlockingConflict else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
         let requestedKey = CacheKey(request: request)
 
-        if let cached = memoryArtifact(for: requestedKey) {
+        if let cached = memoryArtifactResolvingAlias(for: requestedKey) {
             guard !Task.isCancelled else { throw ResourceSourceError.cancelled }
             return cached
         }
@@ -407,6 +453,7 @@ actor ResourcePreviewPipeline {
         inFlight.removeAll()
         cancelledEntries.forEach(cancelInFlight)
         memoryCache.removeAll()
+        memoryAliases.removeAll()
         memoryCost = 0
         sourceEpochs.removeAll()
         diskManifest.removeAll()
@@ -505,14 +552,35 @@ actor ResourcePreviewPipeline {
 
         switch result {
         case .success(let generated):
-            let resolvedKey = CacheKey(request: request, revision: generated.revision)
+            let resolvedKey = CacheKey(
+                request: request,
+                revision: generated.revision,
+                contentType: generated.contentType
+            )
             insertMemory(generated.artifact, for: resolvedKey)
-            if request.item.metadata.revision.isUnknown, resolvedKey != requestedKey {
-                // Only an unknown list snapshot may alias the probed revision in memory.
-                insertMemory(generated.artifact, for: requestedKey)
+            let canAliasResolvedType = request.item.metadata.revision.isKnown
+                && request.item.metadata.revision == generated.revision
+                && requestedKey != resolvedKey
+            if canAliasResolvedType {
+                insertMemoryAlias(from: requestedKey, to: resolvedKey)
+            }
+            if request.item.metadata.revision.isUnknown {
+                // Preserve the unknown-revision memory alias, but never attach a
+                // fresh renderer result to the stale request's type resolution.
+                let unknownRevisionKey = CacheKey(
+                    request: request,
+                    revision: request.item.metadata.revision,
+                    contentType: generated.contentType
+                )
+                if unknownRevisionKey != resolvedKey {
+                    insertMemory(generated.artifact, for: unknownRevisionKey)
+                }
             }
             if request.item.metadata.revision.isKnown {
                 storeDisk(generated.artifact, for: resolvedKey)
+                if canAliasResolvedType {
+                    storeDiskAlias(from: requestedKey, to: resolvedKey)
+                }
             }
             current.waiters.values.forEach { $0.continuation.resume(returning: generated.artifact) }
         case .failure(let error):
@@ -549,13 +617,16 @@ actor ResourcePreviewPipeline {
                 memoryCost = max(0, memoryCost - removed.cost)
             }
         }
+        memoryAliases = memoryAliases.filter { key, entry in
+            key.identity.sourceID != sourceID
+                && entry.target.identity.sourceID != sourceID
+        }
 
         let diskDigests = diskManifest.compactMap { digest, entry in
             entry.sourceID == sourceID ? digest : nil
         }
         for digest in diskDigests {
-            removeDiskFile(digest: digest)
-            diskManifest.removeValue(forKey: digest)
+            removeDiskEntry(digest: digest)
         }
         if !diskDigests.isEmpty {
             try? persistManifestImmediately()
@@ -567,6 +638,21 @@ actor ResourcePreviewPipeline {
         entry.waiters.values.forEach {
             $0.continuation.resume(throwing: ResourceSourceError.cancelled)
         }
+    }
+
+    private func memoryArtifactResolvingAlias(
+        for key: CacheKey
+    ) -> ResourcePreviewArtifact? {
+        if var alias = memoryAliases[key] {
+            if let artifact = memoryArtifact(for: alias.target) {
+                accessCounter &+= 1
+                alias.accessOrder = accessCounter
+                memoryAliases[key] = alias
+                return artifact
+            }
+            memoryAliases.removeValue(forKey: key)
+        }
+        return memoryArtifact(for: key)
     }
 
     private func memoryArtifact(for key: CacheKey) -> ResourcePreviewArtifact? {
@@ -593,17 +679,73 @@ actor ResourcePreviewPipeline {
         while memoryCost > Self.memoryCostBudget,
               let oldest = memoryCache.min(by: { $0.value.accessOrder < $1.value.accessOrder }) {
             memoryCache.removeValue(forKey: oldest.key)
+            memoryAliases = memoryAliases.filter { $0.value.target != oldest.key }
             memoryCost = max(0, memoryCost - oldest.value.cost)
         }
     }
 
+    private func insertMemoryAlias(from alias: CacheKey, to target: CacheKey) {
+        accessCounter &+= 1
+        memoryAliases[alias] = MemoryAliasEntry(
+            target: target,
+            accessOrder: accessCounter
+        )
+        while memoryAliases.count > Self.maximumMemoryAliasCount,
+              let oldest = memoryAliases.min(
+                  by: { $0.value.accessOrder < $1.value.accessOrder }
+              ) {
+            memoryAliases.removeValue(forKey: oldest.key)
+        }
+    }
+
     private func diskArtifact(for key: CacheKey) -> ResourcePreviewArtifact? {
-        guard let token = key.persistenceToken else { return nil }
+        guard let token = key.persistenceToken,
+              let scopeToken = key.aliasScopeToken else {
+            return nil
+        }
         pruneDiskIfNeeded()
         let digest = Self.digest(token)
+        let scopeDigest = Self.digest(scopeToken)
         guard var manifestEntry = diskManifest[digest] else {
             return nil
         }
+        guard let record = diskRecord(
+            digest: digest,
+            manifestEntry: &manifestEntry
+        ) else {
+            return nil
+        }
+        if let artifact = record.artifact,
+           record.aliasTargetDigest == nil,
+           record.scopeDigest.map({ $0 == scopeDigest }) ?? true {
+            return artifact
+        }
+        guard record.artifact == nil,
+              let targetDigest = record.aliasTargetDigest,
+              manifestEntry.aliasTargetDigest == targetDigest,
+              record.scopeDigest == scopeDigest,
+              targetDigest != digest,
+              Self.isValidDigest(targetDigest),
+              var targetEntry = diskManifest[targetDigest],
+              targetEntry.aliasTargetDigest == nil,
+              let targetRecord = diskRecord(
+                  digest: targetDigest,
+                  manifestEntry: &targetEntry
+              ),
+              targetRecord.aliasTargetDigest == nil,
+              targetRecord.scopeDigest == scopeDigest,
+              let artifact = targetRecord.artifact else {
+            removeDiskEntry(digest: digest)
+            try? persistManifestImmediately()
+            return nil
+        }
+        return artifact
+    }
+
+    private func diskRecord(
+        digest: String,
+        manifestEntry: inout DiskManifestEntry
+    ) -> DiskRecord? {
         let url = diskFileURL(digest: digest)
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
               let fileSize = attributes[.size] as? NSNumber,
@@ -612,9 +754,10 @@ actor ResourcePreviewPipeline {
               manifestEntry.byteCount == fileSize.int64Value,
               let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let record = try? PropertyListDecoder().decode(DiskRecord.self, from: data),
-              record.keyDigest == digest else {
-            removeDiskFile(digest: digest)
-            diskManifest.removeValue(forKey: digest)
+              record.keyDigest == digest,
+              record.aliasTargetDigest == manifestEntry.aliasTargetDigest,
+              (record.artifact != nil) != (record.aliasTargetDigest != nil) else {
+            removeDiskEntry(digest: digest)
             try? persistManifestImmediately()
             return nil
         }
@@ -622,13 +765,20 @@ actor ResourcePreviewPipeline {
         manifestEntry.lastAccess = currentDate()
         diskManifest[digest] = manifestEntry
         scheduleManifestAccessFlush()
-        return record.artifact
+        return record
     }
 
     private func storeDisk(_ artifact: ResourcePreviewArtifact, for key: CacheKey) {
-        guard let token = key.persistenceToken else { return }
+        guard let token = key.persistenceToken,
+              let scopeToken = key.aliasScopeToken else {
+            return
+        }
         let digest = Self.digest(token)
-        let record = DiskRecord(keyDigest: digest, artifact: artifact)
+        let record = DiskRecord.artifact(
+            keyDigest: digest,
+            scopeDigest: Self.digest(scopeToken),
+            artifact: artifact
+        )
         guard let data = try? PropertyListEncoder.previewEncoder.encode(record),
               Int64(data.count) <= Self.maximumDiskRecordBytes else {
             return
@@ -643,13 +793,67 @@ actor ResourcePreviewPipeline {
             diskManifest[digest] = DiskManifestEntry(
                 sourceID: key.identity.sourceID,
                 byteCount: Int64(data.count),
-                lastAccess: currentDate()
+                lastAccess: currentDate(),
+                aliasTargetDigest: nil
             )
             try persistManifestImmediately()
             pruneDiskIfNeeded()
         } catch {
-            removeDiskFile(digest: digest)
-            diskManifest.removeValue(forKey: digest)
+            removeDiskEntry(digest: digest)
+        }
+    }
+
+    private func storeDiskAlias(from aliasKey: CacheKey, to targetKey: CacheKey) {
+        guard aliasKey.identity == targetKey.identity,
+              aliasKey.revision == targetKey.revision,
+              aliasKey.revision.isKnown,
+              aliasKey.pixelWidth == targetKey.pixelWidth,
+              aliasKey.pixelHeight == targetKey.pixelHeight,
+              aliasKey.scaleHundredths == targetKey.scaleHundredths,
+              aliasKey.rendererVersion == targetKey.rendererVersion,
+              let aliasToken = aliasKey.persistenceToken,
+              let targetToken = targetKey.persistenceToken,
+              let aliasScopeToken = aliasKey.aliasScopeToken,
+              aliasScopeToken == targetKey.aliasScopeToken else {
+            return
+        }
+        let aliasDigest = Self.digest(aliasToken)
+        let targetDigest = Self.digest(targetToken)
+        guard aliasDigest != targetDigest, diskManifest[targetDigest] != nil else { return }
+
+        let record = DiskRecord.alias(
+            keyDigest: aliasDigest,
+            targetDigest: targetDigest,
+            scopeDigest: Self.digest(aliasScopeToken)
+        )
+        guard let data = try? PropertyListEncoder.previewEncoder.encode(record),
+              Int64(data.count) <= Self.maximumDiskRecordBytes else {
+            return
+        }
+
+        do {
+            try data.write(to: diskFileURL(digest: aliasDigest), options: .atomic)
+            diskManifest[aliasDigest] = DiskManifestEntry(
+                sourceID: aliasKey.identity.sourceID,
+                byteCount: Int64(data.count),
+                lastAccess: currentDate(),
+                aliasTargetDigest: targetDigest
+            )
+            pruneDiskAliasesIfNeeded()
+            try persistManifestImmediately()
+            pruneDiskIfNeeded()
+        } catch {
+            removeDiskEntry(digest: aliasDigest)
+        }
+    }
+
+    private func pruneDiskAliasesIfNeeded() {
+        let aliases = diskManifest
+            .filter { $0.value.aliasTargetDigest != nil }
+            .sorted { $0.value.lastAccess < $1.value.lastAccess }
+        guard aliases.count > Self.maximumDiskAliasCount else { return }
+        for (digest, _) in aliases.prefix(aliases.count - Self.maximumDiskAliasCount) {
+            removeDiskEntry(digest: digest)
         }
     }
 
@@ -659,11 +863,11 @@ actor ResourcePreviewPipeline {
         }
         guard total > Self.diskByteBudget else { return }
 
-        for (digest, entry) in diskManifest.sorted(by: { $0.value.lastAccess < $1.value.lastAccess }) {
-            removeDiskFile(digest: digest)
-            diskManifest.removeValue(forKey: digest)
-            total = max(0, total - entry.byteCount)
-            if total <= Self.diskByteBudget { break }
+        for (digest, _) in diskManifest.sorted(by: { $0.value.lastAccess < $1.value.lastAccess }) {
+            guard total > Self.diskByteBudget else { break }
+            guard diskManifest[digest] != nil else { continue }
+            let removedBytes = removeDiskEntry(digest: digest)
+            total = max(0, total - removedBytes)
         }
         try? persistManifestImmediately()
     }
@@ -758,12 +962,31 @@ actor ResourcePreviewPipeline {
         try? fileManager.removeItem(at: diskFileURL(digest: digest))
     }
 
+    @discardableResult
+    private func removeDiskEntry(digest: String) -> Int64 {
+        let dependentAliases = diskManifest.compactMap { candidate, entry in
+            entry.aliasTargetDigest == digest ? candidate : nil
+        }
+        var removedBytes: Int64 = 0
+        for aliasDigest in dependentAliases where aliasDigest != digest {
+            if let aliasEntry = diskManifest.removeValue(forKey: aliasDigest) {
+                removedBytes = removedBytes.addingClamped(aliasEntry.byteCount)
+            }
+            removeDiskFile(digest: aliasDigest)
+        }
+        if let entry = diskManifest.removeValue(forKey: digest) {
+            removedBytes = removedBytes.addingClamped(entry.byteCount)
+        }
+        removeDiskFile(digest: digest)
+        return removedBytes
+    }
+
     private static func generate(
         request: ResourcePreviewRequest,
         accessService: ResourceAccessService,
         limiter: PreviewConcurrencyLimiter
     ) async throws -> GeneratedPreview {
-        switch request.item.kind {
+        switch request.contentType.kind {
         case .folder:
             throw ResourceSourceError.capabilityUnavailable
         case .video, .audio, .image, .pdf, .text, .markdown, .unknown:
@@ -790,9 +1013,13 @@ actor ResourcePreviewPipeline {
     ) async throws -> GeneratedPreview {
         try Task.checkCancellation()
         let metadata = try await session.fetchMetadata()
+        let contentType = request.item.resolvedContentType(using: metadata)
+        guard !contentType.hasBlockingConflict else {
+            throw ResourceSourceError.capabilityUnavailable
+        }
         let artifact: ResourcePreviewArtifact
 
-        switch request.item.kind {
+        switch contentType.kind {
         case .image:
             let data = try await boundedData(
                 from: session,
@@ -832,7 +1059,7 @@ actor ResourcePreviewPipeline {
                 await lease.close()
                 throw ResourceSourceError.cancelled
             }
-            switch request.item.kind {
+            switch contentType.kind {
             case .video:
                 let image = try await lease.videoFrame(
                     maximumSize: CGSize(
@@ -853,7 +1080,11 @@ actor ResourcePreviewPipeline {
             throw ResourceSourceError.capabilityUnavailable
         }
         try Task.checkCancellation()
-        return GeneratedPreview(artifact: artifact, revision: metadata.revision)
+        return GeneratedPreview(
+            artifact: artifact,
+            revision: metadata.revision,
+            contentType: contentType
+        )
     }
 
     private static func boundedData(
@@ -1329,11 +1560,58 @@ actor ResourcePreviewPipeline {
             manifest[digest] = entry
         }
 
+        let invalidAliases = manifest.compactMap { digest, entry -> String? in
+            guard let targetDigest = entry.aliasTargetDigest else { return nil }
+            guard targetDigest != digest,
+                  isValidDigest(targetDigest),
+                  let targetEntry = manifest[targetDigest],
+                  targetEntry.aliasTargetDigest == nil else {
+                return digest
+            }
+            return nil
+        }
+        for digest in invalidAliases {
+            try? fileManager.removeItem(
+                at: cacheDirectory.appendingPathComponent(digest + ".preview", isDirectory: false)
+            )
+            manifest.removeValue(forKey: digest)
+        }
+
+        let aliases = manifest
+            .filter { $0.value.aliasTargetDigest != nil }
+            .sorted { $0.value.lastAccess < $1.value.lastAccess }
+        if aliases.count > maximumDiskAliasCount {
+            for (digest, _) in aliases.prefix(aliases.count - maximumDiskAliasCount) {
+                try? fileManager.removeItem(
+                    at: cacheDirectory.appendingPathComponent(
+                        digest + ".preview",
+                        isDirectory: false
+                    )
+                )
+                manifest.removeValue(forKey: digest)
+            }
+        }
+
         var total = manifest.values.reduce(into: Int64(0)) { partial, entry in
             partial = partial.addingClamped(entry.byteCount)
         }
-        for (digest, entry) in manifest.sorted(by: { $0.value.lastAccess < $1.value.lastAccess })
-        where total > diskByteBudget {
+        for (digest, _) in manifest.sorted(by: { $0.value.lastAccess < $1.value.lastAccess }) {
+            guard total > diskByteBudget else { break }
+            guard let entry = manifest[digest] else { continue }
+            let dependentAliases = manifest.compactMap { candidate, candidateEntry in
+                candidateEntry.aliasTargetDigest == digest ? candidate : nil
+            }
+            for aliasDigest in dependentAliases where aliasDigest != digest {
+                if let aliasEntry = manifest.removeValue(forKey: aliasDigest) {
+                    total = max(0, total - aliasEntry.byteCount)
+                }
+                try? fileManager.removeItem(
+                    at: cacheDirectory.appendingPathComponent(
+                        aliasDigest + ".preview",
+                        isDirectory: false
+                    )
+                )
+            }
             try? fileManager.removeItem(
                 at: cacheDirectory.appendingPathComponent(digest + ".preview", isDirectory: false)
             )
@@ -1357,6 +1635,11 @@ actor ResourcePreviewPipeline {
         SHA256.hash(data: Data(token.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private static func isValidDigest(_ digest: String) -> Bool {
+        digest.count == 64
+            && digest.allSatisfy { $0.isHexDigit && !$0.isUppercase }
     }
 }
 

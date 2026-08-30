@@ -156,7 +156,7 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         let descriptor = HTTPResourceDescriptor(
             path: path.normalized,
             name: item.name,
-            kind: item.kind,
+            kind: item.resolvedContentType(using: davMetadata).kind,
             url: resourceURL(for: path, isDirectory: false),
             headers: requestHeaders
         )
@@ -198,10 +198,11 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
     func readData(for item: ResourceItem, range: ResourceByteRange?) async throws -> Data {
         let path = try validatedFilePath(for: item)
+        let requestMetadata = metadataByPath[path.normalized] ?? item.metadata
         let descriptor = HTTPResourceDescriptor(
             path: path.normalized,
             name: item.name,
-            kind: item.kind,
+            kind: item.resolvedContentType(using: requestMetadata).kind,
             url: resourceURL(for: path, isDirectory: false),
             headers: requestHeaders
         )
@@ -324,10 +325,12 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         guard item.sourceID == source.id,
               item.id.sourceID == source.id,
               item.id.logicalPath == item.path,
-              item.kind != .folder,
-              !item.metadata.isDirectory,
+              item.resolvedContentType.kind != .folder,
               let path = ResourcePath(rawValue: item.path),
               path.normalized == item.path else {
+            throw ResourceSourceError.invalidReference
+        }
+        guard metadataByPath[path.normalized]?.isDirectory != true else {
             throw ResourceSourceError.invalidReference
         }
         return path

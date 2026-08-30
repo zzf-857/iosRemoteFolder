@@ -110,7 +110,7 @@ struct ResourceRowView: View {
     }
 
     private var metadataText: String {
-        "\(resource.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))"
+        "\(resource.resolvedContentType.kind.title) · \(ResourceMetadataFormatter.modified(for: resource.metadata))"
     }
 
     private var resourceIcon: some View {

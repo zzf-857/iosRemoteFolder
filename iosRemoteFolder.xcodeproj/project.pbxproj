@@ -56,6 +56,9 @@
 		B00000000000000000000047 /* ResourcePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000047 /* ResourcePreviewView.swift */; };
 		B00000000000000000000048 /* MediaResourceLoaderBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000048 /* MediaResourceLoaderBridge.swift */; };
 		B00000000000000000000049 /* PreviewMediaAssetLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000049 /* PreviewMediaAssetLease.swift */; };
+		B00000000000000000000050 /* ResourceFileMaterializer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000050 /* ResourceFileMaterializer.swift */; };
+		B00000000000000000000051 /* SystemFileFallbackViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000051 /* SystemFileFallbackViews.swift */; };
+		B00000000000000000000052 /* ResourceFileMaterializerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000052 /* ResourceFileMaterializerTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -118,6 +121,9 @@
 		C00000000000000000000047 /* ResourcePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourcePreviewView.swift; sourceTree = "<group>"; };
 		C00000000000000000000048 /* MediaResourceLoaderBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaResourceLoaderBridge.swift; sourceTree = "<group>"; };
 		C00000000000000000000049 /* PreviewMediaAssetLease.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewMediaAssetLease.swift; sourceTree = "<group>"; };
+		C00000000000000000000050 /* ResourceFileMaterializer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceFileMaterializer.swift; sourceTree = "<group>"; };
+		C00000000000000000000051 /* SystemFileFallbackViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemFileFallbackViews.swift; sourceTree = "<group>"; };
+		C00000000000000000000052 /* ResourceFileMaterializerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResourceFileMaterializerTests.swift; sourceTree = "<group>"; };
 		D00000000000000000000001 /* iosRemoteFolder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosRemoteFolder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D00000000000000000000002 /* iosRemoteFolderTests.xctest */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.wrapper.cfbundle"; includeInIndex = 0; path = iosRemoteFolderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -180,7 +186,7 @@
 		A00000000000000000000013 /* Indexing */ = {isa = PBXGroup; children = (C00000000000000000000011, ); path = Indexing; sourceTree = "<group>"; };
 		A00000000000000000000014 /* Cache */ = {isa = PBXGroup; children = (C00000000000000000000012, ); path = Cache; sourceTree = "<group>"; };
 		A00000000000000000000015 /* Playback */ = {isa = PBXGroup; children = (C00000000000000000000013, C00000000000000000000048, C00000000000000000000049, ); path = Playback; sourceTree = "<group>"; };
-		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, C00000000000000000000043, C00000000000000000000045, ); path = Viewers; sourceTree = "<group>"; };
+		A00000000000000000000016 /* Viewers */ = {isa = PBXGroup; children = (C00000000000000000000014, C00000000000000000000015, C00000000000000000000043, C00000000000000000000045, C00000000000000000000050, C00000000000000000000051, ); path = Viewers; sourceTree = "<group>"; };
 		A00000000000000000000017 /* UI */ = {isa = PBXGroup; children = (C00000000000000000000016, C00000000000000000000017, C00000000000000000000018, C00000000000000000000019, C00000000000000000000026, C00000000000000000000047, ); path = UI; sourceTree = "<group>"; };
 		A00000000000000000000018 /* iosRemoteFolderTests */ = {
 			isa = PBXGroup;
@@ -193,6 +199,7 @@
 				C00000000000000000000038 /* WebDAVSourceAdapterTests.swift */,
 				C00000000000000000000042 /* ResourceIndexStoreTests.swift */,
 				C00000000000000000000046 /* ResourcePreviewPipelineTests.swift */,
+				C00000000000000000000052 /* ResourceFileMaterializerTests.swift */,
 			);
 			path = iosRemoteFolderTests;
 			sourceTree = "<group>";
@@ -313,6 +320,8 @@
 				B00000000000000000000015 /* ViewerHost.swift in Sources */,
 				B00000000000000000000043 /* VideoPlayerScreen.swift in Sources */,
 				B00000000000000000000045 /* ResourcePreviewPipeline.swift in Sources */,
+				B00000000000000000000050 /* ResourceFileMaterializer.swift in Sources */,
+				B00000000000000000000051 /* SystemFileFallbackViews.swift in Sources */,
 				B00000000000000000000044 /* OrientationPolicy.swift in Sources */,
 				B00000000000000000000016 /* AppTheme.swift in Sources */,
 				B00000000000000000000017 /* ResourceCardView.swift in Sources */,
@@ -349,6 +358,7 @@
 					B00000000000000000000038 /* WebDAVSourceAdapterTests.swift in Sources */,
 					B00000000000000000000042 /* ResourceIndexStoreTests.swift in Sources */,
 					B00000000000000000000046 /* ResourcePreviewPipelineTests.swift in Sources */,
+					B00000000000000000000052 /* ResourceFileMaterializerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

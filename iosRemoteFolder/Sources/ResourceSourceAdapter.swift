@@ -261,7 +261,7 @@ struct SampleSourceAdapter: ResourceSourceAdapter {
               }) else {
             throw ResourceSourceError.invalidReference
         }
-        guard sample.kind != .folder, !sample.metadata.isDirectory else {
+        guard sample.resolvedContentType.kind != .folder else {
             throw ResourceSourceError.invalidReference
         }
         return sample
