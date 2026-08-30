@@ -45,6 +45,7 @@
 - [x] LOAD-009 Enforce the interim 2 MiB PROPFIND cap during transfer, bounded to limit plus one chunk.
 - [ ] LOAD-011 Reuse HTTP connect discovery and propagate trustworthy revisions into list/cache state.
 - [ ] LOAD-012 Share same-revision preview/viewer bodies and make cached online open use <=1 validation and zero body GETs.
+  - Online signature probing now reuses a size-validated, same-revision complete cache with zero body network requests; keep open for preview-to-viewer body publication and cached range-media opens.
 
 ### Cache And Quality
 
@@ -72,7 +73,8 @@
 - [ ] LOAD-008C Move PDF preparation off the main actor with one file-backed parse.
 - [ ] LOAD-008D Move Markdown attributed parsing off the main actor and cache it per revision.
 - [x] FMT-001 Introduce a shared `ResolvedContentType` with evidence and confidence.
-- [ ] FMT-002 Add bounded magic-byte sniffing and safe conflict resolution.
+- [x] FMT-002 Add bounded magic-byte sniffing and safe conflict resolution.
+  - Viewer and preview share a 4 KiB probe with exact-format conflicts, conservative container compatibility, revision-scoped aliases, cache-first online probes, and retryable unavailable results.
 - [ ] FMT-003 Implement real Quick Look, Share, and Open In fallbacks.
   - The known-length <=64 MiB path now has real Quick Look, Share, Open In, canonical UTI propagation, and lease-safe cleanup; keep open until the physical-device Office/iWork/archive matrix passes.
 - [ ] FMT-004 Materialize unknown-length whole-file consumers through bounded temporary files.
@@ -142,3 +144,4 @@ Dependencies: `OBS-001A/001B/002/003 -> baseline -> performance changes -> OBS-0
 | 2026-08-30 | `3f80f75`, `0585645`, `eb98076`, `a5afa02`, `7be79ba` | QUAL-001, LOAD-001, LOAD-006, LOAD-009, SEC-003; LOAD-008A implementation | Focused source/viewer/WebDAV/HTTP suites passed; Debug/Release warnings-as-errors passed; `origin/main` verified at `7be79ba` | LOAD-008A remains open for the reference-device 100 ms stall measurement. |
 | 2026-08-30 | `02f60e5`, `215de86`, `4a0e60d` | CACHE-002, QUAL-007, LOAD-003 | 215 tests passed, 1 real-service test explicitly skipped; Debug/Release warnings-as-errors and Release Analyze succeeded; `git diff --check` passed | SwiftData context-isolation runtime warning remains tracked by QUAL-008. |
 | 2026-08-30 | `52adec3` | FMT-001; LOAD-008B and known-length FMT-003 implementation | 249 tests passed, 1 real-service test explicitly skipped; 96 focused tests passed with 1 skip; Debug/Release warnings-as-errors and Release Analyze succeeded; `git diff --check` passed | Preview aliases are revision/scope bounded; LOAD-008B awaits device metrics, FMT-003 awaits the device format matrix, and unknown-length materialization remains FMT-004. |
+| 2026-08-30 | `6f0e405` | FMT-002; partial LOAD-012 cached signature reuse | 270 tests passed, 1 real-service test explicitly skipped; 65 focused tests passed; Debug/Release warnings-as-errors and Release Analyze succeeded; project/XML lint and `git diff --check` passed | Signatures read at most 4 KiB; exact UTI/container conflicts stop before full-body reads; same-revision complete caches avoid online signature body requests; the unrelated scheme edit remains excluded. |
