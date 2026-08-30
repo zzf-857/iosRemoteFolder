@@ -21,7 +21,7 @@
 - [x] SEC-001A Reject HTTP WebDAV/Alist username, password, and credential references in UI, persistence, and adapter layers while preserving anonymous loopback tests.
 - [ ] SEC-001B Limit anonymous HTTP to explicit local-network authorization and migrate/reject unsafe public HTTP entries.
 - [ ] SEC-002 Remove global ATS arbitrary loads and validate the narrow local-network policy in Archive.
-- [ ] SEC-003 Move remote traffic to controlled ephemeral sessions without shared cookies/cache/credential storage.
+- [x] SEC-003 Move remote traffic to controlled ephemeral sessions without shared cookies/cache/credential storage.
 - [ ] SEC-004 Implement and test HTTPS downgrade rejection plus cross-origin sensitive-header stripping for PROPFIND/HEAD/GET/Range.
 
 ### Measurements

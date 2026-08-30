@@ -286,6 +286,18 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
     /// 200 全量回退时允许消费的最大字节数；超过即返回 `responseTooLarge`。
     static let defaultMaxRangeFallbackBytes: Int64 = 50 * 1024 * 1024
 
+    /// 生产远端请求不复用应用共享的缓存、Cookie 或凭证状态。
+    static func makeDefaultSessionConfiguration(timeout: TimeInterval) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        return configuration
+    }
+
     let source: ResourceSource
     let descriptors: [HTTPResourceDescriptor]
 
@@ -367,9 +379,9 @@ struct HTTPSourceAdapter: ResourceSourceAdapter {
         if let session {
             self.session = session
         } else {
-            let configuration = URLSessionConfiguration.default
-            configuration.timeoutIntervalForRequest = timeout
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(
+                configuration: Self.makeDefaultSessionConfiguration(timeout: timeout)
+            )
         }
     }
 

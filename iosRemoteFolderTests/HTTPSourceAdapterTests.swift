@@ -7,6 +7,19 @@ import Testing
 struct HTTPSourceAdapterTests {
     private static let fileURL = URL(string: "http://resources.test/files/manual.pdf")!
 
+    @Test("默认远端会话隔离缓存、Cookie 与共享凭证")
+    func defaultSessionConfigurationIsEphemeralAndIsolated() {
+        let timeout: TimeInterval = 7.25
+        let configuration = HTTPSourceAdapter.makeDefaultSessionConfiguration(timeout: timeout)
+
+        #expect(configuration.timeoutIntervalForRequest == timeout)
+        #expect(configuration.requestCachePolicy == .reloadIgnoringLocalCacheData)
+        #expect(configuration.urlCache == nil)
+        #expect(!configuration.httpShouldSetCookies)
+        #expect(configuration.httpCookieStorage == nil)
+        #expect(configuration.urlCredentialStorage == nil)
+    }
+
     @Test("列举返回已配置的直链且不预先声称 Range 能力")
     func listingReturnsConfiguredLinks() async throws {
         MockURLProtocol.reset()
