@@ -395,6 +395,216 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test("PROPFIND 分块正文完成后保持正常解析")
+    func propfindParsesChunkedResponse() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        let body = Self.directoryResponse
+        let firstBoundary = body.count / 3
+        let secondBoundary = firstBoundary * 2
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                chunks: [
+                    .init(body: body.subdata(in: 0..<firstBoundary)),
+                    .init(body: body.subdata(in: firstBoundary..<secondBoundary)),
+                    .init(body: body.subdata(in: secondBoundary..<body.count)),
+                ],
+                completion: .finish,
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        try await adapter.connect()
+
+        #expect(observation.emittedChunkCount == 3)
+        #expect(observation.emittedByteCount == body.count)
+        #expect(observation.didFinish)
+        #expect(!observation.wasStopped)
+    }
+
+    @Test("PROPFIND 未声明长度时越过 2 MiB 立即停止传输")
+    func propfindStopsChunkedOverflowEarly() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        let limit = 2 * 1024 * 1024
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                chunks: [
+                    .init(body: Data(repeating: 0x61, count: limit)),
+                    .init(body: Data([0x62]), delay: 0.05),
+                    .init(body: Data(repeating: 0x63, count: 64 * 1024), delay: 30),
+                ],
+                completion: .finish,
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            try await adapter.connect()
+        }
+
+        #expect(await Self.eventually { observation.wasStopped })
+        #expect(observation.emittedChunkCount == 2)
+        #expect(observation.emittedByteCount == limit + 1)
+        #expect(!observation.didFinish)
+    }
+
+    @Test("PROPFIND 恰好 2 MiB 的有效 XML 可完整解析")
+    func propfindAcceptsExactResponseLimit() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        let limit = 2 * 1024 * 1024
+        let closingTag = Data("</d:multistatus>".utf8)
+        var body = Self.directoryResponse
+        #expect(body.suffix(closingTag.count) == closingTag)
+        body.removeLast(closingTag.count)
+        body.append(Data(repeating: 0x20, count: limit - body.count - closingTag.count))
+        body.append(closingTag)
+        #expect(body.count == limit)
+        let responseBody = body
+
+        let chunkSize = limit / 4
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                chunks: (0..<4).map { index in
+                    let lowerBound = index * chunkSize
+                    let upperBound = index == 3 ? responseBody.count : lowerBound + chunkSize
+                    return .init(body: responseBody.subdata(in: lowerBound..<upperBound))
+                },
+                completion: .finish,
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        try await adapter.connect()
+
+        #expect(observation.emittedChunkCount == 4)
+        #expect(observation.emittedByteCount == limit)
+        #expect(observation.didFinish)
+        #expect(!observation.wasStopped)
+    }
+
+    @Test("PROPFIND 声明长度超限时不消费正文")
+    func propfindRejectsDeclaredOverflowBeforeBody() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        let limit = 2 * 1024 * 1024
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: [
+                    "Content-Length": String(limit + 1),
+                    "Content-Type": "application/xml",
+                ],
+                chunks: [
+                    .init(body: Self.directoryResponse, delay: 30),
+                ],
+                completion: .finish,
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        await #expect(throws: ResourceSourceError.responseTooLarge) {
+            try await adapter.connect()
+        }
+
+        #expect(await Self.eventually { observation.wasStopped })
+        #expect(observation.emittedChunkCount == 0)
+        #expect(observation.emittedByteCount == 0)
+    }
+
+    @Test("取消 PROPFIND 会停止流式传输并保留取消错误")
+    func cancellingPropfindStopsTransport() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        let body = Self.directoryResponse
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                chunks: [
+                    .init(body: Data(body.prefix(32))),
+                    .init(body: Data(body.dropFirst(32)), delay: 30),
+                ],
+                completion: .finish,
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        let task = Task {
+            try await adapter.connect()
+        }
+        #expect(await Self.eventually { observation.emittedChunkCount == 1 })
+        task.cancel()
+
+        await #expect(throws: ResourceSourceError.cancelled) {
+            try await task.value
+        }
+        #expect(await Self.eventually { observation.wasStopped })
+        #expect(observation.emittedChunkCount == 1)
+        #expect(!observation.didFinish)
+    }
+
+    @Test("PROPFIND 传输错误保持统一映射")
+    func propfindTransportErrorsMapToSourceErrors() async throws {
+        WebDAVMockURLProtocol.reset()
+        let observation = WebDAVMockURLProtocol.StreamObservation()
+        WebDAVMockURLProtocol.register(Self.endpoint) { _ in
+            .stream(
+                status: 207,
+                headers: ["Content-Type": "application/xml"],
+                chunks: [
+                    .init(body: Data("<?xml".utf8), delay: 0.01),
+                    .init(body: Data(), delay: 0.05),
+                ],
+                completion: .fail(.networkConnectionLost),
+                observation: observation
+            )
+        }
+
+        let adapter = try WebDAVSourceAdapter(
+            source: Self.source,
+            endpoint: Self.endpoint,
+            session: WebDAVMockURLProtocol.makeSession()
+        )
+        await #expect(throws: ResourceSourceError.networkUnavailable) {
+            try await adapter.connect()
+        }
+        #expect(observation.emittedByteCount == 5)
+        #expect(!observation.didFinish)
+    }
+
     @Test("表单与 adapter 保留匿名 HTTP，但拒绝用户名或密码")
     func authenticatedHTTPIsRejectedAtFormAndAdapterBoundaries() throws {
         let endpoint = URL(string: "http://dav.test/dav/")!
@@ -1311,6 +1521,14 @@ struct WebDAVSourceAdapterTests {
         return ResourceByteRange(lowerBound: lower, upperBound: upper)
     }
 
+    private static func eventually(_ condition: @escaping @Sendable () -> Bool) async -> Bool {
+        for _ in 0..<100 {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
     private static func loopbackDirectoryXML(size: Int) -> Data {
         Data(
             """
@@ -1724,16 +1942,91 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
 /// WebDAV tests use an isolated protocol because the existing HTTP fixture is
 /// intentionally reset by its own suite while suites may run concurrently.
 private final class WebDAVMockURLProtocol: URLProtocol {
+    struct StreamChunk: Sendable {
+        let body: Data
+        let delay: TimeInterval
+
+        init(body: Data, delay: TimeInterval = 0) {
+            self.body = body
+            self.delay = delay
+        }
+    }
+
+    enum StreamCompletion: Sendable {
+        case finish
+        case fail(URLError.Code)
+    }
+
+    final class StreamObservation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var chunkCount = 0
+        private var byteCount = 0
+        private var finished = false
+        private var stopped = false
+
+        var emittedChunkCount: Int {
+            lock.withLock { chunkCount }
+        }
+
+        var emittedByteCount: Int {
+            lock.withLock { byteCount }
+        }
+
+        var didFinish: Bool {
+            lock.withLock { finished }
+        }
+
+        var wasStopped: Bool {
+            lock.withLock { stopped }
+        }
+
+        func recordChunk(byteCount: Int) {
+            lock.withLock {
+                chunkCount += 1
+                self.byteCount += byteCount
+            }
+        }
+
+        func recordFinished() {
+            lock.withLock { finished = true }
+        }
+
+        func recordStopped() {
+            lock.withLock { stopped = true }
+        }
+    }
+
+    private final class WeakProtocolReference: @unchecked Sendable {
+        weak var instance: WebDAVMockURLProtocol?
+
+        init(_ instance: WebDAVMockURLProtocol) {
+            self.instance = instance
+        }
+    }
+
     enum Outcome: Sendable {
         case respond(status: Int, headers: [String: String], body: Data)
         case redirect(status: Int, location: URL)
+        case stream(
+            status: Int,
+            headers: [String: String],
+            chunks: [StreamChunk],
+            completion: StreamCompletion,
+            observation: StreamObservation
+        )
     }
 
     typealias Handler = @Sendable (URLRequest) -> Outcome
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var handlers: [URL: Handler] = [:]
+    private let stateLock = NSLock()
     private var delivered = false
+    private var streamObservation: StreamObservation?
+    private static let streamQueue = DispatchQueue(
+        label: "WebDAVMockURLProtocol.stream",
+        qos: .userInitiated
+    )
 
     static func register(_ url: URL, handler: @escaping Handler) {
         lock.lock()
@@ -1804,6 +2097,21 @@ private final class WebDAVMockURLProtocol: URLProtocol {
             deliver {
                 client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
             }
+        case .stream(let status, let headers, let chunks, let completion, let observation):
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                deliver { client?.urlProtocol(self, didFailWithError: URLError(.badURL)) }
+                return
+            }
+            stateLock.withLock {
+                streamObservation = observation
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            schedule(chunks: chunks, completion: completion, observation: observation)
         }
     }
 
@@ -1811,14 +2119,62 @@ private final class WebDAVMockURLProtocol: URLProtocol {
         // URLSession may stop the original protocol instance after it asks the
         // task delegate to accept or reject a redirect. Complete that instance
         // so rejected redirects do not linger until the request timeout.
-        guard !delivered else { return }
-        delivered = true
+        let result: (shouldStop: Bool, observation: StreamObservation?) = stateLock.withLock {
+            guard !delivered else { return (false, nil) }
+            delivered = true
+            return (true, streamObservation)
+        }
+        guard result.shouldStop else { return }
+        result.observation?.recordStopped()
         client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
     }
 
     private func deliver(_ body: () -> Void) {
-        guard !delivered else { return }
-        delivered = true
+        let shouldDeliver = stateLock.withLock {
+            guard !delivered else { return false }
+            delivered = true
+            return true
+        }
+        guard shouldDeliver else { return }
         body()
+    }
+
+    private func schedule(
+        chunks: [StreamChunk],
+        completion: StreamCompletion,
+        observation: StreamObservation
+    ) {
+        let reference = WeakProtocolReference(self)
+        var deadline = DispatchTime.now()
+        for chunk in chunks {
+            deadline = deadline + chunk.delay
+            Self.streamQueue.asyncAfter(deadline: deadline) {
+                guard let instance = reference.instance, instance.isActive else { return }
+                observation.recordChunk(byteCount: chunk.body.count)
+                instance.client?.urlProtocol(instance, didLoad: chunk.body)
+            }
+        }
+        Self.streamQueue.asyncAfter(deadline: deadline) {
+            guard let instance = reference.instance, instance.markTerminal() else { return }
+            switch completion {
+            case .finish:
+                observation.recordFinished()
+                instance.client?.urlProtocolDidFinishLoading(instance)
+            case .fail(let code):
+                instance.client?.urlProtocol(instance, didFailWithError: URLError(code))
+            }
+        }
+    }
+
+    private var isActive: Bool {
+        stateLock.withLock { !delivered }
+    }
+
+    private func markTerminal() -> Bool {
+        stateLock.withLock {
+            guard !delivered else { return false }
+            delivered = true
+            return true
+        }
     }
 }

@@ -238,21 +238,26 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         }
         request.httpBody = Data(Self.propfindBody.utf8)
 
-        let data: Data
+        let bytes: URLSession.AsyncBytes
         let response: URLResponse
         let redirectReporter = RequestScopedRedirectReporter(policy: redirectDelegate)
         do {
-            (data, response) = try await session.data(for: request, delegate: redirectReporter)
+            (bytes, response) = try await session.bytes(for: request, delegate: redirectReporter)
         } catch {
             if redirectReporter.consumeUnsafeRedirect() {
                 throw ResourceSourceError.unsafeRedirect
             }
+            if Task.isCancelled {
+                throw ResourceSourceError.cancelled
+            }
             throw ResourceSourceError.mapping(error)
         }
         guard let httpResponse = response as? HTTPURLResponse else {
+            bytes.task.cancel()
             throw ResourceSourceError.unavailable
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
+            bytes.task.cancel()
             if (300..<400).contains(httpResponse.statusCode) {
                 throw ResourceSourceError.unsafeRedirect
             }
@@ -261,10 +266,43 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
         if let contentLength = Self.headerValue("Content-Length", in: httpResponse)
             .flatMap(Int64.init),
            contentLength > Int64(Self.maxPropfindResponseBytes) {
+            bytes.task.cancel()
             throw ResourceSourceError.responseTooLarge
         }
-        guard data.count <= Self.maxPropfindResponseBytes else {
-            throw ResourceSourceError.responseTooLarge
+
+        let data: Data
+        do {
+            data = try await withTaskCancellationHandler {
+                var collected = Data()
+                if let contentLength = Self.headerValue("Content-Length", in: httpResponse)
+                    .flatMap(Int.init),
+                   contentLength > 0 {
+                    collected.reserveCapacity(contentLength)
+                }
+                for try await byte in bytes {
+                    collected.append(byte)
+                    if collected.count > Self.maxPropfindResponseBytes {
+                        bytes.task.cancel()
+                        throw ResourceSourceError.responseTooLarge
+                    }
+                }
+                return collected
+            } onCancel: {
+                bytes.task.cancel()
+            }
+        } catch {
+            bytes.task.cancel()
+            if redirectReporter.consumeUnsafeRedirect() {
+                throw ResourceSourceError.unsafeRedirect
+            }
+            if Task.isCancelled {
+                throw ResourceSourceError.cancelled
+            }
+            throw ResourceSourceError.mapping(error)
+        }
+        if Task.isCancelled {
+            bytes.task.cancel()
+            throw ResourceSourceError.cancelled
         }
         let parser = DAVXMLParser()
         let entries: [DAVEntry]
