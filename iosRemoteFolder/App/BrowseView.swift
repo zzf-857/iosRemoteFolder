@@ -1,5 +1,27 @@
 import SwiftUI
 
+@MainActor
+enum BrowseSourceActivation {
+    static func activate(
+        selectedSourceID: UUID?,
+        store: SourcesStore
+    ) -> UUID? {
+        if let selectedSourceID,
+           let selectedEntry = store.entries.first(where: { $0.id == selectedSourceID }) {
+            if selectedEntry.hasAdapter {
+                store.ensureConnected(selectedSourceID)
+            }
+            return selectedSourceID
+        }
+
+        guard let fallbackSourceID = store.entries.first(where: \.hasAdapter)?.id else {
+            return nil
+        }
+        store.ensureConnected(fallbackSourceID)
+        return fallbackSourceID
+    }
+}
+
 struct BrowseView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -30,6 +52,10 @@ private struct BrowseContentView: View {
         return store.entries.first { $0.id == id }
     }
 
+    private var availableSourceIDs: [UUID] {
+        store.entries.filter(\.hasAdapter).map(\.id)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sourcePicker
@@ -44,16 +70,21 @@ private struct BrowseContentView: View {
         .toolbar { toolbarContent }
         .glassNavigationBar()
         .task {
-            store.connectAll()
-            // 未选来源时自动选中第一个可浏览来源，省去一次必然的点击。
-            if selectedSourceID == nil {
-                selectedSourceID = store.entries.first(where: \.hasAdapter)?.id
-            }
+            activateSelectedSource()
         }
-        .onChange(of: selectedSourceID) { _, newID in
-            guard let newID else { return }
-            store.ensureConnected(newID)
+        .onChange(of: selectedSourceID) { _, _ in
+            activateSelectedSource()
         }
+        .onChange(of: availableSourceIDs) { _, _ in
+            activateSelectedSource()
+        }
+    }
+
+    private func activateSelectedSource() {
+        selectedSourceID = BrowseSourceActivation.activate(
+            selectedSourceID: selectedSourceID,
+            store: store
+        )
     }
 
     // MARK: - 来源选择

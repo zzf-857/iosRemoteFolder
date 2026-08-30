@@ -179,9 +179,6 @@ struct SourcesView: View {
                     isShowingFolderImporter = true
                 }
             }
-            .task {
-                store.connectAll()
-            }
             .task(id: pendingAction) {
                 guard let pendingAction else { return }
                 defer { self.pendingAction = nil }

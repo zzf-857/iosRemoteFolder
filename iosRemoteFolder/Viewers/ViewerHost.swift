@@ -292,13 +292,19 @@ struct ResourceViewerHost: View {
             case .none:
                 payload = nil
             case .text(let maximumBytes):
-                let data = try await readContent(
+                var decodedText: String?
+                _ = try await readContent(
                     from: createdSession,
                     metadata: metadata,
                     maximumBytes: maximumBytes,
                     usePersistentCache: mode == .online
-                ) { _ in }
-                payload = .text(ViewerContentDecoder.decodeText(data))
+                ) { data in
+                    decodedText = try await ViewerContentDecoder.decodeTextOffMainActor(data)
+                }
+                guard let decodedText else {
+                    throw ResourceSourceError.invalidResponse
+                }
+                payload = .text(decodedText)
             case .pdf(let maximumBytes):
                 let data = try await readContent(
                     from: createdSession,
@@ -629,8 +635,71 @@ enum ViewerContentDecoder {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// Full viewer decoding intentionally crosses a concurrent executor boundary
+    /// so multi-megabyte text never occupies the main actor.
+    @concurrent
+    static func decodeTextOffMainActor(_ data: Data) async throws -> String {
+        try Task.checkCancellation()
+        guard let decoded = decodeValidatedText(data) else {
+            throw ResourceSourceError.invalidResponse
+        }
+        try Task.checkCancellation()
+        return decoded
+    }
+
+    private static func decodeValidatedText(_ data: Data) -> String? {
+        let bytes = Array(data)
+        guard !hasObviousBinarySignature(bytes) else { return nil }
+
+        if hasPrefix(bytes, [0xFF, 0xFE, 0x00, 0x00])
+            || hasPrefix(bytes, [0x00, 0x00, 0xFE, 0xFF]) {
+            guard bytes.count >= 4, (bytes.count - 4).isMultiple(of: 4) else {
+                return nil
+            }
+            return decodedText(data, encoding: .utf32)
+        } else if hasPrefix(bytes, [0xFF, 0xFE]) || hasPrefix(bytes, [0xFE, 0xFF]) {
+            guard bytes.count >= 2, (bytes.count - 2).isMultiple(of: 2) else {
+                return nil
+            }
+            return decodedText(data, encoding: .utf16)
+        } else if hasPrefix(bytes, [0xEF, 0xBB, 0xBF]) {
+            return decodedText(data, encoding: .utf8)
+        } else if let inferredUTF16 = inferredUTF16Encoding(bytes) {
+            return decodedText(data, encoding: inferredUTF16)
+        }
+
+        // Without a BOM or charset, UTF-8 and legacy Western encodings are
+        // inherently ambiguous. Preserve the viewer's established fallback in
+        // one deterministic order while scalar validation filters binary data.
+        for encoding in [String.Encoding.utf8, .windowsCP1252, .isoLatin1] {
+            if let decoded = decodedText(data, encoding: encoding) {
+                return decoded
+            }
+        }
+        return nil
+    }
+
+    private static func decodedText(_ data: Data, encoding: String.Encoding) -> String? {
+        guard let decoded = String(data: data, encoding: encoding),
+              containsOnlyTextScalars(decoded) else {
+            return nil
+        }
+        return decoded
+    }
+
     private static func hasPrefix(_ bytes: [UInt8], _ prefix: [UInt8]) -> Bool {
         bytes.starts(with: prefix)
+    }
+
+    private static func hasObviousBinarySignature(_ bytes: [UInt8]) -> Bool {
+        hasPrefix(bytes, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            || hasPrefix(bytes, [0xFF, 0xD8, 0xFF])
+            || hasPrefix(bytes, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61])
+            || hasPrefix(bytes, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+            || hasPrefix(bytes, [0x25, 0x50, 0x44, 0x46, 0x2D])
+            || hasPrefix(bytes, [0x50, 0x4B, 0x03, 0x04])
+            || hasPrefix(bytes, [0x50, 0x4B, 0x05, 0x06])
+            || hasPrefix(bytes, [0x50, 0x4B, 0x07, 0x08])
     }
 
     private static func looksLikeUTF16(_ bytes: [UInt8]) -> Bool {
@@ -643,6 +712,37 @@ enum ViewerContentDecoder {
         }
         let sampleCount = bytes.count / 2
         return oddZeroes * 4 >= sampleCount || evenZeroes * 4 >= sampleCount
+    }
+
+    private static func inferredUTF16Encoding(_ bytes: [UInt8]) -> String.Encoding? {
+        guard bytes.count >= 4, bytes.count.isMultiple(of: 2) else { return nil }
+        let pairCount = bytes.count / 2
+        let oddZeroes = stride(from: 1, to: bytes.count, by: 2).reduce(into: 0) { count, index in
+            if bytes[index] == 0 { count += 1 }
+        }
+        let evenZeroes = stride(from: 0, to: bytes.count, by: 2).reduce(into: 0) { count, index in
+            if bytes[index] == 0 { count += 1 }
+        }
+        let dominantZeroes = max(oddZeroes, evenZeroes)
+        let minimumSignal = (pairCount + 3) / 4
+        guard dominantZeroes >= minimumSignal, oddZeroes != evenZeroes else { return nil }
+        return oddZeroes > evenZeroes ? .utf16LittleEndian : .utf16BigEndian
+    }
+
+    private static func containsOnlyTextScalars(_ text: String) -> Bool {
+        text.unicodeScalars.allSatisfy { scalar in
+            let value = scalar.value
+            if value == 0x09 || value == 0x0A || value == 0x0D {
+                return true
+            }
+            if value < 0x20 || (0x7F...0x9F).contains(value) {
+                return false
+            }
+            if (0xFDD0...0xFDEF).contains(value) || value & 0xFFFF >= 0xFFFE {
+                return false
+            }
+            return true
+        }
     }
 }
 

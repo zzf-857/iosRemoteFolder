@@ -35,7 +35,7 @@
 
 ### Loading
 
-- [ ] LOAD-001 Connect/list only the selected source; unselected sources remain idle.
+- [x] LOAD-001 Connect/list only the selected source; unselected sources remain idle.
 - [ ] LOAD-002 Reuse only authoritative WebDAV snapshot fields; coalesce probes; enforce DAV body-only preview and zero-request disk-hit budgets.
 - [ ] LOAD-003 Add 30 s per-source directory snapshots capped at 20 directories/8 MiB with stale-while-revalidate navigation.
 - [ ] LOAD-004 Prioritize viewer/visible/prefetch work; cancel off-screen network within 200 ms and <=64 KiB residual transfer.
@@ -66,6 +66,7 @@
 ### Formats And Viewers
 
 - [ ] LOAD-008A Move text decoding off the main actor with deterministic encoding/binary tests.
+  - Implementation and deterministic encoding/binary coverage complete; keep open until the reference-device 100 ms stall gate is measured under OBS-004.
 - [ ] LOAD-008B Move image validation/downsampling off the main actor with one decode and a pixel budget.
 - [ ] LOAD-008C Move PDF preparation off the main actor with one file-backed parse.
 - [ ] LOAD-008D Move Markdown attributed parsing off the main actor and cache it per revision.

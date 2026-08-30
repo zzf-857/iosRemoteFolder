@@ -282,9 +282,10 @@ final class SourcesStore {
         recoverTransientFailures()
     }
 
-    /// 若来源处于可连接状态则发起连接（用于来源被选中时按需连接）。
+    /// 仅为尚未连接的来源发起首次按需连接。失败后的再次连接必须走
+    /// 显式 retry 或受控的瞬时故障恢复，避免视图生命周期回调暗中重试。
     func ensureConnected(_ sourceID: UUID) {
-        guard let entry = entry(for: sourceID), entry.state.canConnect else { return }
+        guard let entry = entry(for: sourceID), case .disconnected = entry.state else { return }
         connect(sourceID)
     }
 

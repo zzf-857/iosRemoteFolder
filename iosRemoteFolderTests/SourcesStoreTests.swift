@@ -238,6 +238,121 @@ struct SourcesStoreTests {
         #expect(store.entries.first?.state == .ready)
     }
 
+    @Test("浏览只按需连接选中来源并在切换时激活新来源")
+    func browseActivationConnectsOnlySelectedSource() async throws {
+        let firstSource = makeSource()
+        let secondSource = makeSource()
+        let firstStub = StubSourceAdapter(
+            source: firstSource,
+            items: [sampleItem(firstSource.id)]
+        )
+        let secondStub = StubSourceAdapter(
+            source: secondSource,
+            items: [sampleItem(secondSource.id)]
+        )
+        let store = try makeStore(
+            sources: [firstSource, secondSource],
+            adapters: [firstStub, secondStub]
+        )
+
+        let initialSelection = BrowseSourceActivation.activate(
+            selectedSourceID: nil,
+            store: store
+        )
+
+        #expect(initialSelection == firstSource.id)
+        #expect(entry(of: firstSource, in: store)?.state == .connecting)
+        #expect(entry(of: secondSource, in: store)?.state == .disconnected)
+        #expect(secondStub.calls == 0)
+        #expect(secondStub.listPaths.isEmpty)
+
+        firstStub.release()
+        try await waitUntil { entry(of: firstSource, in: store)?.state == .ready }
+
+        let switchedSelection = BrowseSourceActivation.activate(
+            selectedSourceID: secondSource.id,
+            store: store
+        )
+
+        #expect(switchedSelection == secondSource.id)
+        #expect(entry(of: secondSource, in: store)?.state == .connecting)
+        #expect(firstStub.calls == 1)
+        secondStub.release()
+        try await waitUntil { entry(of: secondSource, in: store)?.state == .ready }
+        #expect(secondStub.calls == 1)
+        #expect(secondStub.listPaths == [.root])
+    }
+
+    @Test("浏览保留无适配器的现有选择且不发起连接")
+    func browseActivationPreservesUnavailableSelection() throws {
+        let unavailableSource = makeSource(kind: .alist)
+        let availableSource = makeSource()
+        let availableStub = StubSourceAdapter(source: availableSource)
+        let store = try makeStore(
+            sources: [unavailableSource, availableSource],
+            adapters: [availableStub]
+        )
+
+        let resolvedSelection = BrowseSourceActivation.activate(
+            selectedSourceID: unavailableSource.id,
+            store: store
+        )
+
+        #expect(resolvedSelection == unavailableSource.id)
+        #expect(entry(of: unavailableSource, in: store)?.state == .disconnected)
+        #expect(entry(of: availableSource, in: store)?.state == .disconnected)
+        #expect(availableStub.calls == 0)
+        #expect(availableStub.listPaths.isEmpty)
+    }
+
+    @Test("浏览没有可用适配器时保留现有选择且不连接")
+    func browseActivationDoesNotConnectWithoutAvailableAdapter() throws {
+        let firstSource = makeSource(kind: .alist)
+        let secondSource = makeSource(kind: .http)
+        let store = try makeStore(
+            sources: [firstSource, secondSource],
+            adapters: []
+        )
+
+        let resolvedSelection = BrowseSourceActivation.activate(
+            selectedSourceID: firstSource.id,
+            store: store
+        )
+
+        #expect(resolvedSelection == firstSource.id)
+        #expect(entry(of: firstSource, in: store)?.state == .disconnected)
+        #expect(entry(of: secondSource, in: store)?.state == .disconnected)
+
+        let emptySelection = BrowseSourceActivation.activate(
+            selectedSourceID: nil,
+            store: store
+        )
+        #expect(emptySelection == nil)
+    }
+
+    @Test("浏览生命周期不会隐式重试失败来源")
+    func browseActivationDoesNotRetryFailedSource() async throws {
+        let source = makeSource()
+        let stub = StubSourceAdapter(source: source)
+        stub.setFailure(.networkUnavailable)
+        let store = try makeStore(sources: [source], adapters: [stub])
+
+        #expect(
+            BrowseSourceActivation.activate(selectedSourceID: source.id, store: store)
+                == source.id
+        )
+        stub.release()
+        try await waitUntil { entry(of: source, in: store)?.state == .failed(.networkUnavailable) }
+
+        #expect(
+            BrowseSourceActivation.activate(selectedSourceID: source.id, store: store)
+                == source.id
+        )
+        #expect(stub.calls == 1)
+        #expect(stub.listPaths.isEmpty)
+        #expect(entry(of: source, in: store)?.state == .failed(.networkUnavailable))
+    }
+
     @Test("重复连接会替换上一次未完成任务")
     func duplicateConnectReplacesTask() async throws {
         let source = makeSource()
@@ -1959,11 +2074,122 @@ struct ViewerResolutionTests {
         #expect(conflictResolution.fallbackDescription?.contains("扩展名") == true)
     }
 
-    @Test("文本解码优先 UTF-8 并支持 UTF-16")
+    @Test("同步文本解码保持现有 UTF-8 与无 BOM UTF-16 结果")
     func decodesTextPayloads() {
         #expect(ViewerContentDecoder.decodeText(Data("你好".utf8)) == "你好")
         let utf16 = "hello".data(using: .utf16LittleEndian)!
         #expect(ViewerContentDecoder.decodeText(utf16) == "hello")
+    }
+
+    @Test("全文解码支持 UTF-8、UTF-16 与 UTF-32 BOM")
+    @MainActor
+    func decodesBOMTextAcrossConcurrentBoundary() async throws {
+        var utf8 = Data([0xEF, 0xBB, 0xBF])
+        utf8.append(Data("你好 UTF-8".utf8))
+
+        var utf16LittleEndian = Data([0xFF, 0xFE])
+        utf16LittleEndian.append("你好 UTF-16 LE".data(using: .utf16LittleEndian)!)
+
+        var utf16BigEndian = Data([0xFE, 0xFF])
+        utf16BigEndian.append("你好 UTF-16 BE".data(using: .utf16BigEndian)!)
+
+        let utf32LittleEndian = Data([
+            0xFF, 0xFE, 0x00, 0x00,
+            0x48, 0x00, 0x00, 0x00,
+            0x69, 0x00, 0x00, 0x00
+        ])
+        let utf32BigEndian = Data([
+            0x00, 0x00, 0xFE, 0xFF,
+            0x00, 0x00, 0x00, 0x48,
+            0x00, 0x00, 0x00, 0x69
+        ])
+
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(utf8)
+                == "你好 UTF-8"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(utf16LittleEndian)
+                == "你好 UTF-16 LE"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(utf16BigEndian)
+                == "你好 UTF-16 BE"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(utf32LittleEndian)
+                == "Hi"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(utf32BigEndian)
+                == "Hi"
+        )
+    }
+
+    @Test("全文解码确定识别无 BOM UTF-16 字节序")
+    func decodesUTF16WithoutBOM() async throws {
+        let littleEndian = "plain UTF-16 LE".data(using: .utf16LittleEndian)!
+        let bigEndian = "plain UTF-16 BE".data(using: .utf16BigEndian)!
+
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(littleEndian)
+                == "plain UTF-16 LE"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(bigEndian)
+                == "plain UTF-16 BE"
+        )
+    }
+
+    @Test("全文解码保留 ISO Latin-1 与 Windows CP1252 兼容")
+    func decodesLegacyWesternText() async throws {
+        let latin1 = Data([
+            0x43, 0x72, 0xE8, 0x6D, 0x65, 0x20, 0x62, 0x72, 0xFB, 0x6C, 0xE9, 0x65
+        ])
+        let windows1252 = Data([
+            0x93, 0x71, 0x75, 0x6F, 0x74, 0x65, 0x94, 0x20, 0x80
+        ])
+
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(latin1)
+                == "Crème brûlée"
+        )
+        #expect(
+            try await ViewerContentDecoder.decodeTextOffMainActor(windows1252)
+                == "“quote” €"
+        )
+    }
+
+    @Test("全文解码拒绝截断与非法编码")
+    func rejectsTruncatedAndInvalidTextEncoding() async {
+        let invalidPayloads = [
+            Data([0xEF, 0xBB, 0xBF, 0xF0, 0x9F, 0x92]),
+            Data([0xEF, 0xBB, 0xBF, 0xC3, 0x28]),
+            Data([0xFF, 0xFE, 0x61]),
+            Data([0x00, 0x00, 0xFE, 0xFF, 0x00])
+        ]
+
+        for payload in invalidPayloads {
+            await #expect(throws: ResourceSourceError.invalidResponse) {
+                try await ViewerContentDecoder.decodeTextOffMainActor(payload)
+            }
+        }
+    }
+
+    @Test("全文解码拒绝控制字节与二进制签名")
+    func rejectsBinaryPayloads() async {
+        let binaryPayloads = [
+            Data([0x00, 0x01, 0x02, 0x03]),
+            Data([0x7F]),
+            Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            Data([0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37])
+        ]
+
+        for payload in binaryPayloads {
+            await #expect(throws: ResourceSourceError.invalidResponse) {
+                try await ViewerContentDecoder.decodeTextOffMainActor(payload)
+            }
+        }
     }
 
     private func makeItem(path: String, kind: ResourceKind) -> ResourceItem {
