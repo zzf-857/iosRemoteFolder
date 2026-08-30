@@ -56,6 +56,28 @@ private enum SourcesStoreSignposts {
 @MainActor
 @Observable
 final class SourcesStore {
+    struct DirectorySnapshotPolicy: Hashable, Sendable {
+        static let standard = DirectorySnapshotPolicy(
+            timeToLive: .seconds(30),
+            maximumDirectoriesPerSource: 20,
+            maximumEstimatedBytes: 8 * 1_024 * 1_024
+        )
+
+        let timeToLive: Duration
+        let maximumDirectoriesPerSource: Int
+        let maximumEstimatedBytes: Int
+
+        init(
+            timeToLive: Duration,
+            maximumDirectoriesPerSource: Int,
+            maximumEstimatedBytes: Int
+        ) {
+            self.timeToLive = max(timeToLive, .zero)
+            self.maximumDirectoriesPerSource = max(maximumDirectoriesPerSource, 0)
+            self.maximumEstimatedBytes = max(maximumEstimatedBytes, 0)
+        }
+    }
+
     struct Entry: Identifiable {
         var source: ResourceSource
         var state: ResourceSourceState
@@ -89,14 +111,27 @@ final class SourcesStore {
     @ObservationIgnored private var connectionGenerations: [UUID: Int] = [:]
     /// 浏览加载代数：与连接代数同理，避免过期列举覆盖新目录。
     @ObservationIgnored private var browseGenerations: [UUID: Int] = [:]
+    @ObservationIgnored private let directorySnapshotPolicy: DirectorySnapshotPolicy
+    @ObservationIgnored private let directorySnapshotNow: @MainActor () -> ContinuousClock.Instant
+    @ObservationIgnored private var directorySnapshots: [DirectorySnapshotKey: DirectorySnapshot] = [:]
+    @ObservationIgnored private var directorySnapshotAccessSequence: UInt64 = 0
+    @ObservationIgnored private var directorySnapshotEstimatedBytes = 0
     /// Composition-root hook for indexing successful, current-generation
     /// directory listings. Failure and cancellation paths never invoke it.
     @ObservationIgnored var onDirectorySnapshot: (
         @MainActor (UUID, ResourcePath, [ResourceItem]) async -> Void
     )?
 
-    init(registry: SourceRegistry) {
+    init(
+        registry: SourceRegistry,
+        directorySnapshotPolicy: DirectorySnapshotPolicy = .standard,
+        directorySnapshotNow: @escaping @MainActor () -> ContinuousClock.Instant = {
+            ContinuousClock.now
+        }
+    ) {
         self.registry = registry
+        self.directorySnapshotPolicy = directorySnapshotPolicy
+        self.directorySnapshotNow = directorySnapshotNow
         let snapshots = registry.initialSnapshots
         self.adapterRevisions = Dictionary(
             uniqueKeysWithValues: snapshots.map { ($0.id, $0.adapterRevision) }
@@ -135,6 +170,7 @@ final class SourcesStore {
 
         for sourceID in removedIDs {
             cancelWork(for: sourceID)
+            removeDirectorySnapshots(for: sourceID)
             connectionGenerations.removeValue(forKey: sourceID)
             browseGenerations.removeValue(forKey: sourceID)
             adapterRevisions.removeValue(forKey: sourceID)
@@ -158,6 +194,7 @@ final class SourcesStore {
 
             if oldEntriesByID[snapshot.id] != nil {
                 cancelWork(for: snapshot.id)
+                removeDirectorySnapshots(for: snapshot.id)
             }
             adapterRevisions[snapshot.id] = snapshot.adapterRevision
             let state: ResourceSourceState
@@ -234,6 +271,7 @@ final class SourcesStore {
                     entry.browse.isLoading = false
                     entry.browse.error = nil
                 }
+                self.storeDirectorySnapshot(resources, sourceID: sourceID, path: initialPath)
                 await self.onDirectorySnapshot?(sourceID, initialPath, resources)
             } catch {
                 guard self.isCurrentConnectionGeneration(sourceID, generation) else { return }
@@ -326,15 +364,19 @@ final class SourcesStore {
     func loadDirectory(_ sourceID: UUID, at path: ResourcePath) {
         guard let entry = entry(for: sourceID), entry.hasAdapter else { return }
         browseTasks[sourceID]?.cancel()
+        browseTasks.removeValue(forKey: sourceID)
         let generation = nextBrowseGeneration(for: sourceID)
+        let cachedSnapshot = directorySnapshot(sourceID: sourceID, path: path)
         update(sourceID) { entry in
             entry.browse.currentPath = path
-            // 切换目录时立即清空旧 items，避免在新面包屑下继续展示旧目录内容；
-            // 失败状态也与目标目录一致（error 在结果返回时再写入）。
-            entry.browse.items = []
-            entry.browse.isLoading = true
+            entry.browse.items = cachedSnapshot?.items ?? []
+            entry.browse.isLoading = cachedSnapshot?.isFresh != true
             entry.browse.error = nil
         }
+        // Fresh snapshots are the requested directory state, so no adapter
+        // call or indexing callback is needed. Stale snapshots remain visible
+        // while the normal current-generation request refreshes them.
+        guard cachedSnapshot?.isFresh != true else { return }
         let registry = self.registry
         let task = Task {
             defer {
@@ -353,12 +395,20 @@ final class SourcesStore {
                     entry.browse.isLoading = false
                     entry.browse.error = nil
                 }
+                self.storeDirectorySnapshot(items, sourceID: sourceID, path: path)
                 await self.onDirectorySnapshot?(sourceID, path, items)
             } catch {
                 guard self.isCurrentBrowseGeneration(sourceID, generation) else { return }
                 let mapped = ResourceSourceError.mapping(error)
                 if Task.isCancelled || error is CancellationError || mapped == .cancelled {
                     self.update(sourceID) { entry in entry.browse.isLoading = false }
+                } else if cachedSnapshot != nil {
+                    // A refresh failure must not turn a usable stale snapshot
+                    // into a blocking error page. A later navigation can retry.
+                    self.update(sourceID) { entry in
+                        entry.browse.isLoading = false
+                        entry.browse.error = nil
+                    }
                 } else {
                     self.update(sourceID) { entry in
                         entry.browse.isLoading = false
@@ -406,6 +456,148 @@ final class SourcesStore {
     }
 
     // MARK: - Private
+
+    private struct DirectorySnapshotKey: Hashable {
+        let sourceID: UUID
+        let path: ResourcePath
+    }
+
+    private struct DirectorySnapshot {
+        let items: [ResourceItem]
+        let storedAt: ContinuousClock.Instant
+        var lastAccessSequence: UInt64
+        let estimatedBytes: Int
+    }
+
+    private struct DirectorySnapshotLookup {
+        let items: [ResourceItem]
+        let isFresh: Bool
+    }
+
+    private func directorySnapshot(
+        sourceID: UUID,
+        path: ResourcePath
+    ) -> DirectorySnapshotLookup? {
+        let key = DirectorySnapshotKey(sourceID: sourceID, path: path)
+        guard var snapshot = directorySnapshots[key] else { return nil }
+        snapshot.lastAccessSequence = nextDirectorySnapshotAccessSequence()
+        directorySnapshots[key] = snapshot
+        let age = snapshot.storedAt.duration(to: directorySnapshotNow())
+        return DirectorySnapshotLookup(
+            items: snapshot.items,
+            isFresh: age >= .zero && age < directorySnapshotPolicy.timeToLive
+        )
+    }
+
+    private func storeDirectorySnapshot(
+        _ items: [ResourceItem],
+        sourceID: UUID,
+        path: ResourcePath
+    ) {
+        guard directorySnapshotPolicy.maximumDirectoriesPerSource > 0,
+              directorySnapshotPolicy.maximumEstimatedBytes > 0 else {
+            removeDirectorySnapshot(sourceID: sourceID, path: path)
+            return
+        }
+
+        let key = DirectorySnapshotKey(sourceID: sourceID, path: path)
+        if let previous = directorySnapshots.removeValue(forKey: key) {
+            directorySnapshotEstimatedBytes -= previous.estimatedBytes
+        }
+        let estimatedBytes = Self.estimatedDirectorySnapshotBytes(path: path, items: items)
+        directorySnapshots[key] = DirectorySnapshot(
+            items: items,
+            storedAt: directorySnapshotNow(),
+            lastAccessSequence: nextDirectorySnapshotAccessSequence(),
+            estimatedBytes: estimatedBytes
+        )
+        directorySnapshotEstimatedBytes = Self.saturatingAdd(
+            directorySnapshotEstimatedBytes,
+            estimatedBytes
+        )
+        evictDirectorySnapshotsIfNeeded(for: sourceID)
+    }
+
+    private func evictDirectorySnapshotsIfNeeded(for sourceID: UUID) {
+        while directorySnapshots.keys.lazy.filter({ $0.sourceID == sourceID }).count
+            > directorySnapshotPolicy.maximumDirectoriesPerSource,
+              let key = leastRecentlyUsedDirectorySnapshotKey(sourceID: sourceID) {
+            removeDirectorySnapshot(for: key)
+        }
+        while directorySnapshotEstimatedBytes > directorySnapshotPolicy.maximumEstimatedBytes,
+              let key = leastRecentlyUsedDirectorySnapshotKey(sourceID: nil) {
+            removeDirectorySnapshot(for: key)
+        }
+    }
+
+    private func leastRecentlyUsedDirectorySnapshotKey(
+        sourceID: UUID?
+    ) -> DirectorySnapshotKey? {
+        directorySnapshots.lazy
+            .filter { sourceID == nil || $0.key.sourceID == sourceID }
+            .min { lhs, rhs in
+                if lhs.value.lastAccessSequence == rhs.value.lastAccessSequence {
+                    if lhs.key.sourceID == rhs.key.sourceID {
+                        return lhs.key.path.normalized < rhs.key.path.normalized
+                    }
+                    return lhs.key.sourceID.uuidString < rhs.key.sourceID.uuidString
+                }
+                return lhs.value.lastAccessSequence < rhs.value.lastAccessSequence
+            }?
+            .key
+    }
+
+    private func removeDirectorySnapshots(for sourceID: UUID) {
+        let keys = directorySnapshots.keys.filter { $0.sourceID == sourceID }
+        for key in keys {
+            removeDirectorySnapshot(for: key)
+        }
+    }
+
+    private func removeDirectorySnapshot(sourceID: UUID, path: ResourcePath) {
+        removeDirectorySnapshot(for: DirectorySnapshotKey(sourceID: sourceID, path: path))
+    }
+
+    private func removeDirectorySnapshot(for key: DirectorySnapshotKey) {
+        guard let removed = directorySnapshots.removeValue(forKey: key) else { return }
+        directorySnapshotEstimatedBytes = max(
+            directorySnapshotEstimatedBytes - removed.estimatedBytes,
+            0
+        )
+    }
+
+    private func nextDirectorySnapshotAccessSequence() -> UInt64 {
+        directorySnapshotAccessSequence &+= 1
+        return directorySnapshotAccessSequence
+    }
+
+    private static func estimatedDirectorySnapshotBytes(
+        path: ResourcePath,
+        items: [ResourceItem]
+    ) -> Int {
+        var total = saturatingAdd(128, path.normalized.utf8.count)
+        for item in items {
+            var itemBytes = 256
+            itemBytes = saturatingAdd(itemBytes, item.name.utf8.count)
+            itemBytes = saturatingAdd(itemBytes, item.path.utf8.count)
+            itemBytes = saturatingAdd(itemBytes, item.id.logicalPath.utf8.count)
+            itemBytes = saturatingAdd(itemBytes, item.metadata.mimeType?.utf8.count ?? 0)
+            itemBytes = saturatingAdd(itemBytes, item.metadata.typeIdentifier?.utf8.count ?? 0)
+            switch item.metadata.revision {
+            case .etag(let value), .serverVersion(let value):
+                itemBytes = saturatingAdd(itemBytes, value.utf8.count)
+            case .modifiedAndSize, .unknown:
+                break
+            }
+            total = saturatingAdd(total, itemBytes)
+        }
+        return total
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : sum
+    }
 
     private static func measuredDirectoryList(
         registry: SourceRegistry,

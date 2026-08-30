@@ -37,7 +37,7 @@
 
 - [x] LOAD-001 Connect/list only the selected source; unselected sources remain idle.
 - [ ] LOAD-002 Reuse only authoritative WebDAV snapshot fields; coalesce probes; enforce DAV body-only preview and zero-request disk-hit budgets.
-- [ ] LOAD-003 Add 30 s per-source directory snapshots capped at 20 directories/8 MiB with stale-while-revalidate navigation.
+- [x] LOAD-003 Add 30 s per-source directory snapshots capped at 20 directories/8 MiB with stale-while-revalidate navigation.
 - [ ] LOAD-004 Prioritize viewer/visible/prefetch work; cancel off-screen network within 200 ms and <=64 KiB residual transfer.
 - [ ] LOAD-005 Start preview deadline after admission; cache only oversized/unsupported failures for 5 minutes, revision-keyed, capped at 512.
 - [x] LOAD-006 Read at most a 64 KiB range for large text previews with safe truncated-character handling.

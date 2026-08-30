@@ -9,6 +9,39 @@ import UniformTypeIdentifiers
 
 @testable import iosRemoteFolder
 
+private actor StubListGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+@MainActor
+private final class TestDirectorySnapshotClock {
+    private(set) var now: ContinuousClock.Instant
+
+    init(now: ContinuousClock.Instant = ContinuousClock.now) {
+        self.now = now
+    }
+
+    func advance(by duration: Duration) {
+        now = now.advanced(by: duration)
+    }
+}
+
 /// 可控行为的桩 adapter：连接会等待测试释放，可注入失败、统计调用次数。
 private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendable {
     let source: ResourceSource
@@ -21,6 +54,10 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
     private var listDelay: Duration?
     private var connectCount = 0
     private var requestedListPaths: [ResourcePath] = []
+    private var completedListPaths: [ResourcePath] = []
+    private var listItemSequences: [ResourcePath: [[ResourceItem]]] = [:]
+    private var listCallCounts: [ResourcePath: Int] = [:]
+    private var listGates: [ResourcePath: StubListGate] = [:]
 
     init(source: ResourceSource, items: [ResourceItem] = []) {
         self.source = source
@@ -39,6 +76,12 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         return requestedListPaths
     }
 
+    var completedPaths: [ResourcePath] {
+        lock.lock()
+        defer { lock.unlock() }
+        return completedListPaths
+    }
+
     func setFailure(_ error: ResourceSourceError?) {
         lock.lock()
         defer { lock.unlock() }
@@ -55,6 +98,19 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
         lock.lock()
         defer { lock.unlock() }
         listDelay = delay
+    }
+
+    func setListItemSequence(_ sequence: [[ResourceItem]], at path: ResourcePath) {
+        lock.lock()
+        defer { lock.unlock() }
+        listItemSequences[path] = sequence
+        listCallCounts[path] = 0
+    }
+
+    func setListGate(_ gate: StubListGate?, at path: ResourcePath) {
+        lock.lock()
+        defer { lock.unlock() }
+        listGates[path] = gate
     }
 
     /// 释放所有等待中的 connect，使连接任务继续执行。
@@ -78,13 +134,17 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
 
     func listResources(at path: ResourcePath) async throws -> [ResourceItem] {
         let behavior = beginList(path)
+        if let gate = behavior.gate {
+            await gate.wait()
+        }
         if let delay = behavior.delay {
             try await Task.sleep(for: delay)
         }
+        finishList(path)
         if let failure = behavior.failure {
             throw failure
         }
-        return items
+        return behavior.items
     }
 
     func reference(for item: ResourceItem) async throws -> ResourceReference {
@@ -110,11 +170,30 @@ private final class StubSourceAdapter: ResourceSourceAdapter, @unchecked Sendabl
 
     private func beginList(
         _ path: ResourcePath
-    ) -> (failure: ResourceSourceError?, delay: Duration?) {
+    ) -> (
+        failure: ResourceSourceError?,
+        delay: Duration?,
+        items: [ResourceItem],
+        gate: StubListGate?
+    ) {
         lock.lock()
         defer { lock.unlock() }
         requestedListPaths.append(path)
-        return (listFailure, listDelay)
+        let callIndex = listCallCounts[path, default: 0]
+        listCallCounts[path] = callIndex + 1
+        let sequencedItems: [ResourceItem]
+        if let sequence = listItemSequences[path], !sequence.isEmpty {
+            sequencedItems = sequence[min(callIndex, sequence.count - 1)]
+        } else {
+            sequencedItems = items
+        }
+        return (listFailure, listDelay, sequencedItems, listGates[path])
+    }
+
+    private func finishList(_ path: ResourcePath) {
+        lock.lock()
+        defer { lock.unlock() }
+        completedListPaths.append(path)
     }
 
     private var isReleasedSnapshot: Bool {
@@ -404,6 +483,320 @@ struct SourcesStoreTests {
         #expect(!snapshotPaths.contains(failedPath))
     }
 
+    @Test("30 秒内 fresh 目录快照同步命中且零请求")
+    func freshDirectorySnapshotSkipsRequest() async throws {
+        let policy = SourcesStore.DirectorySnapshotPolicy.standard
+        #expect(policy.timeToLive == .seconds(30))
+        #expect(policy.maximumDirectoriesPerSource == 20)
+        #expect(policy.maximumEstimatedBytes == 8 * 1_024 * 1_024)
+
+        let source = makeSource()
+        let path = try #require(ResourcePath(rawValue: "/cached"))
+        let cachedItem = sampleItem(source.id, path: "/cached/first.txt")
+        let unexpectedItem = sampleItem(source.id, path: "/cached/unexpected.txt")
+        let stub = StubSourceAdapter(source: source)
+        stub.setListItemSequence([[cachedItem], [unexpectedItem]], at: path)
+        stub.release()
+        let clock = TestDirectorySnapshotClock()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            directorySnapshotNow: { clock.now }
+        )
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil {
+            store.entries.first?.browse.items == [cachedItem]
+                && store.entries.first?.browse.isLoading == false
+        }
+        let requestsBeforeHit = stub.listPaths.filter { $0 == path }.count
+
+        clock.advance(by: .seconds(29))
+        store.loadDirectory(source.id, at: path)
+
+        #expect(store.entries.first?.browse.items == [cachedItem])
+        #expect(store.entries.first?.browse.isLoading == false)
+        #expect(store.entries.first?.browse.error == nil)
+        #expect(stub.listPaths.filter { $0 == path }.count == requestsBeforeHit)
+    }
+
+    @Test("恰好 30 秒的 stale 快照立即显示并在后台刷新")
+    func staleDirectorySnapshotRevalidatesAtExactTTL() async throws {
+        let source = makeSource()
+        let path = try #require(ResourcePath(rawValue: "/stale"))
+        let staleItem = sampleItem(source.id, path: "/stale/old.txt")
+        let refreshedItem = sampleItem(source.id, path: "/stale/new.txt")
+        let stub = StubSourceAdapter(source: source)
+        stub.setListItemSequence([[staleItem], [refreshedItem]], at: path)
+        stub.release()
+        let clock = TestDirectorySnapshotClock()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            directorySnapshotNow: { clock.now }
+        )
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil { store.entries.first?.browse.items == [staleItem] }
+
+        let refreshGate = StubListGate()
+        stub.setListGate(refreshGate, at: path)
+        clock.advance(by: .seconds(30))
+        store.loadDirectory(source.id, at: path)
+
+        #expect(store.entries.first?.browse.items == [staleItem])
+        #expect(store.entries.first?.browse.isLoading == true)
+        #expect(store.entries.first?.browse.error == nil)
+        try await waitUntil { stub.listPaths.filter { $0 == path }.count == 2 }
+
+        await refreshGate.open()
+        try await waitUntil {
+            store.entries.first?.browse.items == [refreshedItem]
+                && store.entries.first?.browse.isLoading == false
+        }
+    }
+
+    @Test("stale 后台刷新失败时保留可浏览内容")
+    func staleRefreshFailurePreservesCachedItems() async throws {
+        let source = makeSource()
+        let path = try #require(ResourcePath(rawValue: "/offline-cache"))
+        let cachedItem = sampleItem(source.id, path: "/offline-cache/available.txt")
+        let stub = StubSourceAdapter(source: source)
+        stub.setListItemSequence([[cachedItem]], at: path)
+        stub.release()
+        let clock = TestDirectorySnapshotClock()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            transientRetryDelays: [],
+            directorySnapshotNow: { clock.now }
+        )
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil { store.entries.first?.browse.items == [cachedItem] }
+
+        clock.advance(by: .seconds(30))
+        stub.setListFailure(.networkUnavailable)
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil {
+            stub.completedPaths.filter { $0 == path }.count == 2
+                && store.entries.first?.browse.isLoading == false
+        }
+
+        #expect(store.entries.first?.browse.items == [cachedItem])
+        #expect(store.entries.first?.browse.error == nil)
+
+        stub.setListFailure(nil)
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil {
+            stub.listPaths.filter { $0 == path }.count == 3
+                && store.entries.first?.browse.isLoading == false
+        }
+    }
+
+    @Test("每来源最多保留 20 个目录并按访问顺序淘汰")
+    func directorySnapshotPerSourceLimitUsesLRU() async throws {
+        let source = makeSource()
+        let stub = StubSourceAdapter(source: source)
+        stub.release()
+        let clock = TestDirectorySnapshotClock()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            directorySnapshotNow: { clock.now }
+        )
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        let paths = try (1...20).map { index in
+            try #require(ResourcePath(rawValue: "/directory-\(index)"))
+        }
+        for path in paths.prefix(19) {
+            store.loadDirectory(source.id, at: path)
+            try await waitUntil { stub.completedPaths.contains(path) }
+        }
+
+        // Root + 19 directories fill the 20-entry source budget. Touching root
+        // makes directory-1 the oldest before the 21st snapshot is inserted.
+        let rootRequestCount = stub.listPaths.filter { $0 == .root }.count
+        store.loadRoot(source.id)
+        #expect(store.entries.first?.browse.isLoading == false)
+        #expect(stub.listPaths.filter { $0 == .root }.count == rootRequestCount)
+
+        store.loadDirectory(source.id, at: paths[19])
+        try await waitUntil { stub.completedPaths.contains(paths[19]) }
+        let firstPathRequests = stub.listPaths.filter { $0 == paths[0] }.count
+        store.loadDirectory(source.id, at: paths[0])
+
+        #expect(store.entries.first?.browse.isLoading == true)
+        try await waitUntil {
+            stub.listPaths.filter { $0 == paths[0] }.count == firstPathRequests + 1
+                && store.entries.first?.browse.isLoading == false
+        }
+    }
+
+    @Test("全局 metadata 字节预算跨目录执行 LRU")
+    func directorySnapshotGlobalByteLimitUsesLRU() async throws {
+        let firstSource = makeSource()
+        let secondSource = makeSource()
+        let firstStub = StubSourceAdapter(source: firstSource)
+        let secondStub = StubSourceAdapter(source: secondSource)
+        firstStub.release()
+        secondStub.release()
+        let clock = TestDirectorySnapshotClock()
+        let policy = SourcesStore.DirectorySnapshotPolicy(
+            timeToLive: .seconds(30),
+            maximumDirectoriesPerSource: 20,
+            maximumEstimatedBytes: 300
+        )
+        let store = try makeStore(
+            sources: [firstSource, secondSource],
+            adapters: [firstStub, secondStub],
+            directorySnapshotPolicy: policy,
+            directorySnapshotNow: { clock.now }
+        )
+        let secondPath = try #require(ResourcePath(rawValue: "/two"))
+
+        store.connect(firstSource.id)
+        try await waitUntil { entry(of: firstSource, in: store)?.state == .ready }
+        store.connect(secondSource.id)
+        try await waitUntil { entry(of: secondSource, in: store)?.state == .ready }
+
+        // Empty root snapshots cost 129 bytes each. Both fit under 300 bytes;
+        // touching source one makes source two's root the global LRU entry.
+        store.loadRoot(firstSource.id)
+        #expect(entry(of: firstSource, in: store)?.browse.isLoading == false)
+        store.loadDirectory(secondSource.id, at: secondPath)
+        try await waitUntil { secondStub.completedPaths.contains(secondPath) }
+
+        let requestsBeforeEvictedLookup = secondStub.listPaths.filter { $0 == .root }.count
+        store.loadRoot(secondSource.id)
+        #expect(entry(of: secondSource, in: store)?.browse.isLoading == true)
+        try await waitUntil {
+            secondStub.listPaths.filter { $0 == .root }.count == requestsBeforeEvictedLookup + 1
+                && entry(of: secondSource, in: store)?.browse.isLoading == false
+        }
+    }
+
+    @Test("来源删除与 adapter revision 替换清理目录快照")
+    func sourceSynchronizationInvalidatesDirectorySnapshots() async throws {
+        let source = makeSource()
+        let path = try #require(ResourcePath(rawValue: "/replace"))
+        let oldItem = sampleItem(source.id, path: "/replace/old.txt")
+        let replacedItem = sampleItem(source.id, path: "/replace/replaced.txt")
+        let readdedItem = sampleItem(source.id, path: "/replace/readded.txt")
+        let oldAdapter = StubSourceAdapter(source: source)
+        oldAdapter.setListItemSequence([[oldItem]], at: path)
+        oldAdapter.release()
+        let registry = try SourceRegistry(sources: [source], adapters: [oldAdapter])
+        let clock = TestDirectorySnapshotClock()
+        let store = SourcesStore(
+            registry: registry,
+            directorySnapshotNow: { clock.now }
+        )
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        store.loadDirectory(source.id, at: path)
+        try await waitUntil { store.entries.first?.browse.items == [oldItem] }
+
+        let replacement = StubSourceAdapter(source: source)
+        replacement.setListItemSequence([[replacedItem]], at: path)
+        replacement.release()
+        try await registry.replace(source: source, adapter: replacement)
+        store.sync(with: await registry.currentSnapshots())
+
+        store.loadDirectory(source.id, at: path)
+        #expect(store.entries.first?.browse.items.isEmpty == true)
+        #expect(store.entries.first?.browse.isLoading == true)
+        try await waitUntil {
+            replacement.completedPaths.contains(path)
+                && store.entries.first?.browse.items == [replacedItem]
+        }
+
+        _ = try await registry.remove(sourceID: source.id)
+        store.sync(with: await registry.currentSnapshots())
+        #expect(store.entries.isEmpty)
+
+        let readdedAdapter = StubSourceAdapter(source: source)
+        readdedAdapter.setListItemSequence([[readdedItem]], at: path)
+        readdedAdapter.release()
+        try await registry.register(source: source, adapter: readdedAdapter)
+        store.sync(with: await registry.currentSnapshots())
+        store.loadDirectory(source.id, at: path)
+
+        #expect(store.entries.first?.browse.items.isEmpty == true)
+        #expect(store.entries.first?.browse.isLoading == true)
+        try await waitUntil {
+            readdedAdapter.completedPaths.contains(path)
+                && store.entries.first?.browse.items == [readdedItem]
+        }
+    }
+
+    @Test("过期 refresh 的旧 generation 不覆盖新路径或缓存")
+    func supersededStaleRefreshCannotOverwriteCurrentDirectory() async throws {
+        let source = makeSource()
+        let stalePath = try #require(ResourcePath(rawValue: "/slow"))
+        let currentPath = try #require(ResourcePath(rawValue: "/current"))
+        let staleItem = sampleItem(source.id, path: "/slow/old.txt")
+        let supersededItem = sampleItem(source.id, path: "/slow/superseded.txt")
+        let currentItem = sampleItem(source.id, path: "/current/current.txt")
+        let stub = StubSourceAdapter(source: source)
+        stub.setListItemSequence([[staleItem], [supersededItem]], at: stalePath)
+        stub.setListItemSequence([[currentItem]], at: currentPath)
+        stub.release()
+        let clock = TestDirectorySnapshotClock()
+        let store = try makeStore(
+            sources: [source],
+            adapters: [stub],
+            directorySnapshotNow: { clock.now }
+        )
+        var publishedPaths: [ResourcePath] = []
+        store.onDirectorySnapshot = { _, path, _ in publishedPaths.append(path) }
+
+        store.connect(source.id)
+        try await waitUntil { store.entries.first?.state == .ready }
+        store.loadDirectory(source.id, at: stalePath)
+        try await waitUntil { store.entries.first?.browse.items == [staleItem] }
+
+        let staleGate = StubListGate()
+        stub.setListGate(staleGate, at: stalePath)
+        clock.advance(by: .seconds(30))
+        store.loadDirectory(source.id, at: stalePath)
+        try await waitUntil { stub.listPaths.filter { $0 == stalePath }.count == 2 }
+
+        store.loadDirectory(source.id, at: currentPath)
+        try await waitUntil {
+            store.entries.first?.browse.currentPath == currentPath
+                && store.entries.first?.browse.items == [currentItem]
+                && store.entries.first?.browse.isLoading == false
+        }
+
+        await staleGate.open()
+        try await waitUntil { stub.completedPaths.filter { $0 == stalePath }.count == 2 }
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(store.entries.first?.browse.currentPath == currentPath)
+        #expect(store.entries.first?.browse.items == [currentItem])
+        #expect(publishedPaths.filter { $0 == stalePath }.count == 1)
+
+        // The cancelled refresh must not refresh the cache timestamp or payload.
+        let verificationGate = StubListGate()
+        stub.setListGate(verificationGate, at: stalePath)
+        store.loadDirectory(source.id, at: stalePath)
+        #expect(store.entries.first?.browse.items == [staleItem])
+        #expect(store.entries.first?.browse.isLoading == true)
+        store.cancelAllConnections()
+        await verificationGate.open()
+        try await waitUntil { stub.completedPaths.filter { $0 == stalePath }.count == 3 }
+    }
+
     @Test("断线来源从搜索结果直接连接目标目录")
     func openDirectoryConnectsAtTargetPath() async throws {
         let source = makeSource()
@@ -650,14 +1043,22 @@ struct SourcesStoreTests {
     private func makeStore(
         sources: [ResourceSource],
         adapters: [any ResourceSourceAdapter],
-        transientRetryDelays: [Duration] = SourceRegistry.defaultTransientRetryDelays
+        transientRetryDelays: [Duration] = SourceRegistry.defaultTransientRetryDelays,
+        directorySnapshotPolicy: SourcesStore.DirectorySnapshotPolicy = .standard,
+        directorySnapshotNow: @escaping @MainActor () -> ContinuousClock.Instant = {
+            ContinuousClock.now
+        }
     ) throws -> SourcesStore {
         let registry = try SourceRegistry(
             sources: sources,
             adapters: adapters,
             transientRetryDelays: transientRetryDelays
         )
-        return SourcesStore(registry: registry)
+        return SourcesStore(
+            registry: registry,
+            directorySnapshotPolicy: directorySnapshotPolicy,
+            directorySnapshotNow: directorySnapshotNow
+        )
     }
 
     private func makeSource(kind: ResourceSource.SourceKind = .local) -> ResourceSource {
