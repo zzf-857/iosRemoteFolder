@@ -1554,6 +1554,37 @@ struct ResourceAccessServiceTests {
 @Suite("AVPlayer 内容会话桥接")
 @MainActor
 struct SessionMediaPlayerTests {
+    @Test("媒体准备策略仅让已知大于 4 MiB 的在线 Range 资源流式加载")
+    func resolvesMediaPreparationStrategyAtStreamingBoundary() {
+        let threshold = MediaPreparationStrategy.streamingThresholdBytes
+        let cases: [(
+            name: String,
+            mode: ResourceViewerMode,
+            acceptsRanges: Bool,
+            byteSize: Int64?,
+            expected: MediaPreparationStrategy
+        )] = [
+            ("大于阈值", .online, true, threshold + 1, .rangeStream),
+            ("等于阈值", .online, true, threshold, .completeContent),
+            ("离线资源", .offline, true, threshold + 1, .completeContent),
+            ("服务端不支持 Range", .online, false, threshold + 1, .completeContent),
+            ("大小未知", .online, true, nil, .completeContent)
+        ]
+
+        for testCase in cases {
+            let metadata = ResourceMetadata(
+                byteSize: testCase.byteSize,
+                acceptsRanges: testCase.acceptsRanges
+            )
+
+            #expect(
+                MediaPreparationStrategy.resolve(mode: testCase.mode, metadata: metadata)
+                    == testCase.expected,
+                "\(testCase.name)的分流结果不正确"
+            )
+        }
+    }
+
     @Test("音频通过有界 Range 会话完成准备并在停止后关闭会话")
     func preparesAudioThroughBoundedRanges() async throws {
         let source = try #require(
@@ -1797,6 +1828,7 @@ struct SessionMediaPlayerTests {
 
         let ranges = adapter.readRanges.compactMap { $0 }
         #expect(!ranges.isEmpty)
+        #expect(!adapter.readRanges.contains { $0 == nil })
         #expect(ranges.allSatisfy { ($0.validatedLength ?? .max) <= 4 * 1024 * 1024 })
         if assertHighRangeCoverage {
             #expect(ranges.contains { $0.upperBound >= Int64(bytes.count / 2) })

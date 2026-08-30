@@ -10,6 +10,26 @@ enum ResourceViewerMode: Hashable, Sendable {
     case offline
 }
 
+enum MediaPreparationStrategy: Equatable, Sendable {
+    case completeContent
+    case rangeStream
+
+    static let streamingThresholdBytes: Int64 = 4 * 1024 * 1024
+
+    static func resolve(
+        mode: ResourceViewerMode,
+        metadata: ResourceMetadata
+    ) -> MediaPreparationStrategy {
+        guard mode == .online,
+              metadata.acceptsRanges,
+              let byteSize = metadata.byteSize,
+              byteSize > streamingThresholdBytes else {
+            return .completeContent
+        }
+        return .rangeStream
+    }
+}
+
 struct ResourceViewerHost: View {
     @Environment(AppModel.self) private var appModel
 
@@ -373,10 +393,7 @@ struct ResourceViewerHost: View {
     ) async throws -> (engine: AVMediaPlayerEngine, ownsSession: Bool) {
         let deadline = ContinuousClock().now
             + .seconds(AVMediaPlayerEngine.defaultPreparationTimeoutSeconds)
-        let shouldStream = mode == .online
-            && metadata.acceptsRanges
-            && (metadata.byteSize ?? 0) > maximumBytes
-        if shouldStream {
+        if MediaPreparationStrategy.resolve(mode: mode, metadata: metadata) == .rangeStream {
             let engine = try AVMediaPlayerEngine(
                 session: session,
                 metadata: metadata,

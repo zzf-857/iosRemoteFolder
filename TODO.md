@@ -41,7 +41,7 @@
 - [ ] LOAD-004 Prioritize viewer/visible/prefetch work; cancel off-screen network within 200 ms and <=64 KiB residual transfer.
 - [ ] LOAD-005 Start preview deadline after admission; cache only oversized/unsupported failures for 5 minutes, revision-keyed, capped at 512.
 - [ ] LOAD-006 Read at most a 64 KiB range for large text previews with safe truncated-character handling.
-- [ ] LOAD-007 For online Range media above the dedicated 4 MiB fast path, avoid full GET before player preparation; preserve exact-boundary/offline/unknown/non-Range behavior.
+- [x] LOAD-007 For online Range media above the dedicated 4 MiB fast path, avoid full GET before player preparation; preserve exact-boundary/offline/unknown/non-Range behavior.
 - [ ] LOAD-009 Enforce the interim 2 MiB PROPFIND cap during transfer, bounded to limit plus one chunk.
 - [ ] LOAD-011 Reuse HTTP connect discovery and propagate trustworthy revisions into list/cache state.
 - [ ] LOAD-012 Share same-revision preview/viewer bodies and make cached online open use <=1 validation and zero body GETs.
