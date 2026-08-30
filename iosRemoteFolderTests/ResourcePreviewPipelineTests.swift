@@ -52,6 +52,107 @@ struct ResourcePreviewPipelineTests {
         #expect(!excerpt.contains("<script"))
     }
 
+    @Test("大文本与 Markdown 仅读取前 64 KiB")
+    func largeTextAndMarkdownReadOnePrefixRange() async throws {
+        for kind in [ResourceKind.text, .markdown] {
+            var content = Data("标题\n摘要\n".utf8)
+            content.append(Data(repeating: 0x61, count: 64 * 1024))
+            let fixture = makeFixture(
+                kind: kind,
+                revision: .etag("large-text-\(kind)"),
+                acceptsRanges: true,
+                content: content,
+                readsReleased: true
+            )
+
+            let artifact = try await fixture.pipeline.preview(
+                for: makeRequest(item: fixture.item)
+            )
+            guard case .textExcerpt(let excerpt) = artifact else {
+                Issue.record("文本资源应生成文本摘要")
+                continue
+            }
+            #expect(excerpt.contains("标题 摘要"))
+
+            let snapshot = await fixture.adapter.snapshot()
+            #expect(snapshot.metadataCalls == 1)
+            #expect(snapshot.readCalls == 1)
+            let range = try #require(snapshot.readRanges.first ?? nil)
+            #expect(range == ResourceByteRange(lowerBound: 0, upperBound: 65_535))
+        }
+    }
+
+    @Test("恰好 64 KiB 或不支持 Range 的文本保持完整读取")
+    func boundaryAndNonRangeTextKeepFullRead() async throws {
+        let cases: [(name: String, byteCount: Int, acceptsRanges: Bool)] = [
+            ("恰好 64 KiB", 64 * 1024, true),
+            ("无 Range", 64 * 1024 + 1, false)
+        ]
+
+        for testCase in cases {
+            var content = Data("完整读取".utf8)
+            content.append(Data(
+                repeating: 0x20,
+                count: testCase.byteCount - content.count
+            ))
+            let fixture = makeFixture(
+                revision: .etag("full-text-\(testCase.name)"),
+                acceptsRanges: testCase.acceptsRanges,
+                content: content,
+                readsReleased: true
+            )
+
+            #expect(
+                try await fixture.pipeline.preview(for: makeRequest(item: fixture.item))
+                    == .textExcerpt("完整读取")
+            )
+            let snapshot = await fixture.adapter.snapshot()
+            #expect(snapshot.readCalls == 1)
+            #expect(snapshot.readRanges.count == 1)
+            #expect(snapshot.readRanges[0] == nil)
+        }
+    }
+
+    @Test("截断前缀安全修复 UTF-8 与 UTF-16 多字节尾部")
+    func repairsTruncatedMultibyteTextTails() {
+        var utf8 = Data([0xEF, 0xBB, 0xBF])
+        utf8.append(Data("UTF-8 正文".utf8))
+        utf8.append(contentsOf: [0xF0, 0x9F, 0x92])
+        #expect(
+            ResourceTextPreviewDecoder.decode(utf8, repairingTruncatedTail: true)
+                == "UTF-8 正文"
+        )
+
+        var utf16LittleEndian = Data([0xFF, 0xFE])
+        utf16LittleEndian.append("UTF-16 LE".data(using: .utf16LittleEndian)!)
+        utf16LittleEndian.append(contentsOf: [0x3D, 0xD8])
+        #expect(
+            ResourceTextPreviewDecoder.decode(
+                utf16LittleEndian,
+                repairingTruncatedTail: true
+            ) == "UTF-16 LE"
+        )
+
+        var utf16BigEndian = Data([0xFE, 0xFF])
+        utf16BigEndian.append("UTF-16 BE".data(using: .utf16BigEndian)!)
+        utf16BigEndian.append(contentsOf: [0xD8, 0x3D])
+        #expect(
+            ResourceTextPreviewDecoder.decode(
+                utf16BigEndian,
+                repairingTruncatedTail: true
+            ) == "UTF-16 BE"
+        )
+
+        var completeUTF16 = Data([0xFF, 0xFE])
+        completeUTF16.append("完整😀".data(using: .utf16LittleEndian)!)
+        #expect(
+            ResourceTextPreviewDecoder.decode(
+                completeUTF16,
+                repairingTruncatedTail: true
+            ) == ViewerContentDecoder.decodeText(completeUTF16)
+        )
+    }
+
     @Test("视频通过有界 Range 生成真实代表帧")
     func rendersVideoFrameThroughBoundedRanges() async throws {
         let content = try await sampleContent(

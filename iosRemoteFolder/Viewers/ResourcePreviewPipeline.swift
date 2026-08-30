@@ -140,6 +140,78 @@ enum ResourcePreviewArtifact: Codable, Hashable, Sendable {
     case textExcerpt(String)
 }
 
+enum ResourceTextPreviewDecoder {
+    static func decode(_ data: Data, repairingTruncatedTail: Bool) -> String {
+        let input = repairingTruncatedTail ? decodablePrefix(of: data) : data
+        return ViewerContentDecoder.decodeText(input)
+    }
+
+    private static func decodablePrefix(of data: Data) -> Data {
+        let bytes = Array(data)
+        if bytes.starts(with: [0xFF, 0xFE, 0x00, 0x00])
+            || bytes.starts(with: [0x00, 0x00, 0xFE, 0xFF]) {
+            return fixedWidthPrefix(bytes, bomLength: 4, codeUnitWidth: 4)
+        }
+        if bytes.starts(with: [0xFF, 0xFE]) {
+            return utf16Prefix(bytes, littleEndian: true)
+        }
+        if bytes.starts(with: [0xFE, 0xFF]) {
+            return utf16Prefix(bytes, littleEndian: false)
+        }
+        return Data(bytes.prefix(validUTF8PrefixLength(bytes)))
+    }
+
+    private static func fixedWidthPrefix(
+        _ bytes: [UInt8],
+        bomLength: Int,
+        codeUnitWidth: Int
+    ) -> Data {
+        guard bytes.count > bomLength else { return Data(bytes) }
+        let completePayloadBytes = ((bytes.count - bomLength) / codeUnitWidth) * codeUnitWidth
+        return Data(bytes.prefix(bomLength + completePayloadBytes))
+    }
+
+    private static func utf16Prefix(
+        _ bytes: [UInt8],
+        littleEndian: Bool
+    ) -> Data {
+        var endIndex = 2 + ((max(bytes.count - 2, 0) / 2) * 2)
+        guard endIndex >= 4 else { return Data(bytes.prefix(endIndex)) }
+
+        let lastUnitStart = endIndex - 2
+        let codeUnit: UInt16
+        if littleEndian {
+            codeUnit = UInt16(bytes[lastUnitStart])
+                | (UInt16(bytes[lastUnitStart + 1]) << 8)
+        } else {
+            codeUnit = (UInt16(bytes[lastUnitStart]) << 8)
+                | UInt16(bytes[lastUnitStart + 1])
+        }
+        if (0xD800...0xDBFF).contains(codeUnit) {
+            endIndex -= 2
+        }
+        return Data(bytes.prefix(endIndex))
+    }
+
+    private static func validUTF8PrefixLength(_ bytes: [UInt8]) -> Int {
+        guard !bytes.isEmpty else { return 0 }
+        var sequenceStart = bytes.count - 1
+        while sequenceStart >= 0, bytes[sequenceStart] & 0xC0 == 0x80 {
+            sequenceStart -= 1
+        }
+        guard sequenceStart >= 0 else { return bytes.count }
+
+        let expectedLength: Int
+        switch bytes[sequenceStart] {
+        case 0xC2...0xDF: expectedLength = 2
+        case 0xE0...0xEF: expectedLength = 3
+        case 0xF0...0xF4: expectedLength = 4
+        default: return bytes.count
+        }
+        return bytes.count - sequenceStart < expectedLength ? sequenceStart : bytes.count
+    }
+}
+
 actor ResourcePreviewPipeline {
     private struct CacheKey: Hashable, Sendable {
         let identity: ResourceIdentity
@@ -202,6 +274,11 @@ actor ResourcePreviewPipeline {
         let revision: ResourceRevision
     }
 
+    private struct TextPreviewInput: Sendable {
+        let data: Data
+        let isTruncatedPrefix: Bool
+    }
+
     private struct Waiter {
         let continuation: CheckedContinuation<ResourcePreviewArtifact, any Error>
     }
@@ -219,6 +296,7 @@ actor ResourcePreviewPipeline {
     private static let artworkByteBudget: Int64 = 12 * 1024 * 1024
     private static let pdfByteBudget: Int64 = 16 * 1024 * 1024
     private static let textByteBudget: Int64 = 256 * 1024
+    private static let textPrefixByteBudget: Int64 = 64 * 1024
     private static let quickLookByteBudget: Int64 = 4 * 1024 * 1024
     private static let requestDeadline: Duration = .seconds(8)
     private static let memoryCostBudget = 16 * 1024 * 1024
@@ -624,12 +702,11 @@ actor ResourcePreviewPipeline {
             )
             artifact = try renderPDF(data, request: request)
         case .text, .markdown:
-            let data = try await boundedData(
+            let input = try await textPreviewInput(
                 from: session,
-                metadata: metadata,
-                maximumBytes: textByteBudget
+                metadata: metadata
             )
-            artifact = try renderText(data)
+            artifact = try renderText(input)
         case .unknown:
             artifact = try await renderQuickLookThumbnail(
                 session: session,
@@ -684,6 +761,32 @@ actor ResourcePreviewPipeline {
             throw ResourceSourceError.responseTooLarge
         }
         return try await session.readData(maximumBytes: maximumBytes)
+    }
+
+    private static func textPreviewInput(
+        from session: ResourceContentSession,
+        metadata: ResourceMetadata
+    ) async throws -> TextPreviewInput {
+        if metadata.acceptsRanges,
+           let byteSize = metadata.byteSize,
+           byteSize > textPrefixByteBudget {
+            let range = ResourceByteRange(
+                lowerBound: 0,
+                upperBound: textPrefixByteBudget - 1
+            )
+            let data = try await session.readData(
+                range: range,
+                maximumBytes: textPrefixByteBudget
+            )
+            return TextPreviewInput(data: data, isTruncatedPrefix: true)
+        }
+
+        let data = try await boundedData(
+            from: session,
+            metadata: metadata,
+            maximumBytes: textByteBudget
+        )
+        return TextPreviewInput(data: data, isTruncatedPrefix: false)
     }
 
     private static func renderQuickLookThumbnail(
@@ -854,13 +957,12 @@ actor ResourcePreviewPipeline {
         )
     }
 
-    private static func renderText(_ data: Data) throws -> ResourcePreviewArtifact {
+    private static func renderText(_ input: TextPreviewInput) throws -> ResourcePreviewArtifact {
         try Task.checkCancellation()
-        let decoded = String(data: data, encoding: .utf8)
-            ?? String(data: data, encoding: .utf16)
-            ?? String(data: data, encoding: .unicode)
-            ?? String(data: data, encoding: .isoLatin1)
-        guard let decoded else { throw ResourceSourceError.invalidResponse }
+        let decoded = ResourceTextPreviewDecoder.decode(
+            input.data,
+            repairingTruncatedTail: input.isTruncatedPrefix
+        )
 
         let lines = decoded
             .replacingOccurrences(of: "\r\n", with: "\n")
