@@ -160,13 +160,14 @@ Cross-cutting rules:
 | QUAL-005 | Resolve placeholder controls | Every visible control is implemented, clearly disabled, or removed from release UI. |
 | QUAL-006 | Add UI and accessibility regression coverage | Core flows pass on iPhone/iPad, large Dynamic Type, VoiceOver, Reduce Motion, rotation, and split view. |
 | QUAL-007 | Make external integration tests truthful | Missing real-service configuration reports skipped/not-run rather than passed. |
+| QUAL-008 | Enforce SwiftData context isolation | Tests and production flows use `ModelActor` or actor-confined contexts and emit no cross-queue `ModelContext` warning. |
 
 ### 5.7 Task Control Metadata
 
 Priority definitions:
 
 - P0: release or credential blocker (`SEC-001A/001B/002..004`).
-- P1: critical loading, format fallback, bounded storage, startup recovery, warnings, and truthful integration tests (`OBS-001A/001B/002..005`, `LOAD-001..012`, `FMT-001..007`, `CACHE-001..004/007`, `QUAL-001/002/004/005/007`).
+- P1: critical loading, format fallback, bounded storage, startup recovery, warnings, and truthful integration tests (`OBS-001A/001B/002..005`, `LOAD-001..012`, `FMT-001..007`, `CACHE-001..004/007`, `QUAL-001/002/004/005/007/008`).
 - P2: durable offline expansion, multi-window, accessibility breadth, and long-horizon release scale (`SEC-005/006`, `CACHE-005/006`, `QUAL-003/006`).
 
 Owner roles and target releases:
@@ -204,7 +205,7 @@ Phase 1 lands as independent, reversible slices rather than one broad PR: securi
 
 ### Phase 2 - Unified Formats And Bounded Storage (3-6 weeks)
 
-`FMT-001..007`, `CACHE-001/004`, `SEC-005..006`, `QUAL-002/004/005`, and the split `LOAD-008A..D` tasks.
+`FMT-001..007`, `CACHE-001/004`, `SEC-005..006`, `QUAL-002/004/005/008`, and the split `LOAD-008A..D` tasks.
 
 ### Phase 3 - Durable Offline And Scale (6-12 weeks)
 

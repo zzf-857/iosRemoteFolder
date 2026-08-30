@@ -12,7 +12,7 @@
 - [x] PLAN-001 Write the versioned optimization plan.
 - [x] PLAN-002 Create this progress tracker with stable task IDs and acceptance gates.
 - [x] REL-001 Commit only the plan/tracker and confirm `8db207b` exists on `origin/main`.
-- [ ] REL-002 Record the first optimization slice evidence and push its code/tests in a separate commit.
+- [x] REL-002 Record the first optimization slice evidence and push its code/tests in separate commits.
 
 ## Phase 1 - Release Blockers And Critical-Path Wins
 
@@ -89,6 +89,7 @@
 - [ ] QUAL-002 Replace persistence `fatalError` with recovery/export/rebuild and isolate corrupt records.
 - [ ] QUAL-004 Pause/cancel directory, preview, and index tasks in background without breaking audio.
 - [ ] QUAL-005 Implement, clearly disable, or remove every placeholder action.
+- [ ] QUAL-008 Confine SwiftData `ModelContext` use to its actor and eliminate the cross-queue runtime warning.
 
 ### Phase 2 Exit Gate
 
@@ -134,3 +135,4 @@ Dependencies: `OBS-001A/001B/002/003 -> baseline -> performance changes -> OBS-0
 | Date | Commit | Completed | Verification | Notes |
 |---|---|---|---|---|
 | 2026-08-30 | `8db207b` | REV-001, PLAN-001, PLAN-002, REL-001 | 180/180 baseline tests; analyze exit 0; `origin/main` verified | PDFKit isolation warnings remain; real Alist is not configured. |
+| 2026-08-30 | `fcc58c3`, `4a25d2f`, `ca3edb9` | SEC-001A, OBS-001A, LOAD-007, REL-002 | 184/184 tests; Release Analyze succeeded; `git diff --check` passed; `origin/main` verified | Existing PDFKit warnings and a SwiftData context-isolation runtime warning remain; real Alist still reports passed when unconfigured. |
