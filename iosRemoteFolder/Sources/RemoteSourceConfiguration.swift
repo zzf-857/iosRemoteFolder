@@ -74,6 +74,7 @@ enum RemoteSourceConfigurationError: LocalizedError, Hashable, Sendable {
     case invalidDisplayName
     case invalidEndpoint
     case invalidCredentialReference
+    case insecureCredentialTransport
     case invalidStoredData
     case credentialUnavailable
 
@@ -89,6 +90,8 @@ enum RemoteSourceConfigurationError: LocalizedError, Hashable, Sendable {
             "远端地址无效；请输入不含账号密码、查询参数或片段的 HTTP(S) 地址"
         case .invalidCredentialReference:
             "来源凭证引用无效"
+        case .insecureCredentialTransport:
+            "HTTP 来源不允许使用已保存的凭证，请改用 HTTPS 或移除认证信息"
         case .invalidStoredData:
             "远端来源配置无法读取"
         case .credentialUnavailable:
@@ -223,6 +226,12 @@ final class RemoteSourceConfigurationStore {
                   reference == reference.lowercased() else {
                 throw RemoteSourceConfigurationError.invalidCredentialReference
             }
+        }
+        guard RemoteSourceTransportPolicy.permitsCredentials(
+            endpoint: normalized,
+            hasCredentials: configuration.credentialReference != nil
+        ) else {
+            throw RemoteSourceConfigurationError.insecureCredentialTransport
         }
     }
 

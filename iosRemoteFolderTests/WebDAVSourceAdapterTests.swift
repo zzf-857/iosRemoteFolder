@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import SwiftData
 import Testing
 import UniformTypeIdentifiers
 
@@ -394,6 +395,120 @@ struct WebDAVSourceAdapterTests {
         }
     }
 
+    @Test("表单与 adapter 保留匿名 HTTP，但拒绝用户名或密码")
+    func authenticatedHTTPIsRejectedAtFormAndAdapterBoundaries() throws {
+        let endpoint = URL(string: "http://dav.test/dav/")!
+        let source = ResourceSource(
+            id: UUID(),
+            name: "匿名 HTTP",
+            kind: .webdav,
+            endpoint: endpoint.absoluteString,
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+
+        #expect(RemoteSourceFormValidation.canSubmit(
+            name: "匿名 HTTP",
+            endpoint: endpoint.absoluteString,
+            username: "  ",
+            password: ""
+        ))
+        #expect(!RemoteSourceFormValidation.canSubmit(
+            name: "HTTP 用户名",
+            endpoint: endpoint.absoluteString,
+            username: "user",
+            password: ""
+        ))
+        #expect(!RemoteSourceFormValidation.canSubmit(
+            name: "HTTP 密码",
+            endpoint: endpoint.absoluteString,
+            username: "",
+            password: "pass"
+        ))
+        #expect(RemoteSourceFormValidation.canSubmit(
+            name: "HTTPS 认证",
+            endpoint: Self.endpoint.absoluteString,
+            username: "user",
+            password: "pass"
+        ))
+
+        _ = try WebDAVSourceAdapter(source: source, endpoint: endpoint)
+        #expect(throws: ResourceSourceError.insecureCredentialTransport) {
+            _ = try WebDAVSourceAdapter(
+                source: source,
+                endpoint: endpoint,
+                username: "user"
+            )
+        }
+        #expect(throws: ResourceSourceError.insecureCredentialTransport) {
+            _ = try WebDAVSourceAdapter(
+                source: source,
+                endpoint: endpoint,
+                password: "pass"
+            )
+        }
+        #expect(
+            ResourceSourceError.insecureCredentialTransport.localizedDescription
+                == "HTTP 来源不允许使用用户名或密码，请改用 HTTPS 或移除认证信息"
+        )
+    }
+
+    @Test("配置存储保留匿名 HTTP，并拒绝 HTTP credentialReference")
+    @MainActor
+    func configurationStoreRejectsCredentialReferenceOverHTTP() throws {
+        let store = RemoteSourceConfigurationStore(
+            modelContainer: SourceConfigurationPersistence.makeInMemoryContainer()
+        )
+        let endpoint = URL(string: "http://dav.test/dav/")!
+        let anonymous = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "匿名 HTTP",
+            endpoint: endpoint,
+            kind: .webdav,
+            credentialReference: nil
+        )
+        try store.insert(anonymous)
+
+        let insecure = RemoteSourceConfiguration(
+            id: UUID(),
+            displayName: "带凭证 HTTP",
+            endpoint: endpoint,
+            kind: .alist,
+            credentialReference: UUID().uuidString.lowercased()
+        )
+        #expect(throws: RemoteSourceConfigurationError.insecureCredentialTransport) {
+            try store.insert(insecure)
+        }
+        #expect(store.configurations == [anonymous])
+        #expect(
+            RemoteSourceConfigurationError.insecureCredentialTransport.localizedDescription
+                == "HTTP 来源不允许使用已保存的凭证，请改用 HTTPS 或移除认证信息"
+        )
+    }
+
+    @Test("旧 SwiftData HTTP 凭证记录恢复时返回明确安全错误")
+    @MainActor
+    func storedAuthenticatedHTTPConfigurationIsRejectedOnLoad() throws {
+        let container = SourceConfigurationPersistence.makeInMemoryContainer()
+        let context = ModelContext(container)
+        context.insert(
+            RemoteSourceConfigurationRecord(
+                id: UUID(),
+                displayName: "旧 HTTP 来源",
+                endpoint: "http://dav.test/dav/",
+                kindRawValue: ResourceSource.SourceKind.webdav.rawValue,
+                credentialReference: UUID().uuidString.lowercased()
+            )
+        )
+        try context.save()
+
+        let store = RemoteSourceConfigurationStore(modelContainer: container)
+        #expect(throws: RemoteSourceConfigurationError.insecureCredentialTransport) {
+            _ = try store.load()
+        }
+        #expect(store.configurations.isEmpty)
+    }
+
     @Test("重定向只允许同源且仍在 endpoint 根路径内")
     func redirectsStayWithinTrustedRoot() async throws {
         let sameOriginTarget = URL(string: "https://dav.test/dav/redirected/")!
@@ -697,8 +812,6 @@ struct WebDAVSourceAdapterTests {
         let adapter = try WebDAVSourceAdapter(
             source: source,
             endpoint: httpEndpoint,
-            username: "user",
-            password: "pass",
             session: WebDAVMockURLProtocol.makeSession()
         )
         let item = try #require(try await adapter.listResources(at: .root).first)
@@ -960,8 +1073,6 @@ struct WebDAVSourceAdapterTests {
         let adapter = try WebDAVSourceAdapter(
             source: source,
             endpoint: endpoint,
-            username: "user",
-            password: "pass",
             session: URLSession(configuration: sessionConfiguration)
         )
         let registry = try SourceRegistry(sources: [source], adapters: [adapter])

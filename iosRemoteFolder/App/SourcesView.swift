@@ -264,6 +264,56 @@ struct SourcesView: View {
     }
 }
 
+/// Pure validation kept outside the view so the UI security boundary has
+/// deterministic coverage without exposing the form's transient password state.
+enum RemoteSourceFormValidation {
+    static func canSubmit(
+        name: String,
+        endpoint: String,
+        username: String,
+        password: String
+    ) -> Bool {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let endpointURL = validEndpointURL(endpoint) else {
+            return false
+        }
+        return RemoteSourceTransportPolicy.permitsCredentials(
+            endpoint: endpointURL,
+            hasCredentials: hasCredentials(username: username, password: password)
+        )
+    }
+
+    static func hasInsecureCredentialTransport(
+        endpoint: String,
+        username: String,
+        password: String
+    ) -> Bool {
+        guard let endpointURL = validEndpointURL(endpoint),
+              endpointURL.scheme?.lowercased() == "http" else {
+            return false
+        }
+        return hasCredentials(username: username, password: password)
+    }
+
+    private static func validEndpointURL(_ endpoint: String) -> URL? {
+        guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil else {
+            return nil
+        }
+        return url
+    }
+
+    private static func hasCredentials(username: String, password: String) -> Bool {
+        !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !password.isEmpty
+    }
+}
+
 /// Temporary WebDAV/Alist source form. The password is passed directly to the
 /// composition root and is not stored in view state beyond this presentation.
 private struct RemoteSourceFormView: View {
@@ -292,20 +342,20 @@ private struct RemoteSourceFormView: View {
     }
 
     private var canSubmit: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && validEndpoint
+        RemoteSourceFormValidation.canSubmit(
+            name: name,
+            endpoint: endpoint,
+            username: username,
+            password: password
+        )
     }
 
-    private var validEndpoint: Bool {
-        guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = url.scheme?.lowercased(),
-              (scheme == "http" || scheme == "https"),
-              url.host != nil,
-              url.query == nil,
-              url.fragment == nil else {
-            return false
-        }
-        return true
+    private var hasInsecureCredentialTransport: Bool {
+        RemoteSourceFormValidation.hasInsecureCredentialTransport(
+            endpoint: endpoint,
+            username: username,
+            password: password
+        )
     }
 
     var body: some View {
@@ -346,6 +396,15 @@ private struct RemoteSourceFormView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     SecureField("密码", text: $password)
+                    if hasInsecureCredentialTransport {
+                        Label(
+                            ResourceSourceError.insecureCredentialTransport.localizedDescription,
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                     if draft.sourceID != nil {
                         Text("留空以保留当前凭证；填写任一字段会替换当前凭证。")
                             .font(.caption)

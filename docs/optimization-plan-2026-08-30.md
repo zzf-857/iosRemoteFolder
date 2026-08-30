@@ -86,7 +86,8 @@ Cross-cutting rules:
 
 | ID | Deliverable | Acceptance |
 |---|---|---|
-| SEC-001 | Enforce production remote-source policy | HTTPS is the default. HTTP is limited to explicitly authorized local-network, credential-free sources; public HTTP and HTTP with sensitive headers are rejected in UI, migration, persistence, and adapter layers. Injected loopback test transports do not enter product configuration. |
+| SEC-001A | Block clear-text WebDAV credentials | HTTP WebDAV/Alist endpoints with username, password, or credential reference are rejected in UI, persistence, and adapter layers before an Authorization header can be created. Injected credential-free loopback transports remain testable. |
+| SEC-001B | Enforce production anonymous-HTTP policy | HTTPS is the default. Anonymous HTTP is limited to explicitly authorized local-network sources; public HTTP is rejected, and unsafe saved entries have an explicit migration result. |
 | SEC-002 | Narrow ATS | Global arbitrary loads are removed; any retained local-network exception is the narrowest platform-supported entitlement and passes archive validation. |
 | SEC-003 | Isolate remote sessions | Remote sessions use controlled ephemeral configuration without shared cookies, URL cache, or credential storage. |
 | SEC-004 | Protect redirects and headers | HTTPS-to-HTTP downgrade is rejected; cross-origin redirects strip Authorization, Cookie, validators, and sensitive custom headers for PROPFIND/HEAD/GET/Range. |
@@ -163,7 +164,7 @@ Cross-cutting rules:
 
 Priority definitions:
 
-- P0: release or credential blocker (`SEC-001..004`).
+- P0: release or credential blocker (`SEC-001A/001B/002..004`).
 - P1: critical loading, format fallback, bounded storage, startup recovery, warnings, and truthful integration tests (`OBS-001..005`, `LOAD-001..012`, `FMT-001..007`, `CACHE-001..004/007`, `QUAL-001/002/004/005/007`).
 - P2: durable offline expansion, multi-window, accessibility breadth, and long-horizon release scale (`SEC-005/006`, `CACHE-005/006`, `QUAL-003/006`).
 
@@ -181,7 +182,7 @@ Owner roles and target releases:
 Mandatory dependency graph:
 
 - `OBS-001..003 -> initial baseline -> LOAD/CACHE performance changes -> OBS-004`.
-- `SEC-001 -> SEC-002/003/004`; security implementation and tests land separately from loading changes.
+- `SEC-001A -> SEC-001B -> SEC-002/003/004`; security implementation and tests land separately from loading changes.
 - `OBS-002/003 -> LOAD-002/004/009/011/012`; `LOAD-003 -> LOAD-010`.
 - `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`.
 - `QUAL-002 + CACHE-001 -> CACHE-006`.
@@ -196,7 +197,7 @@ Mandatory dependency graph:
 
 ### Phase 1 - Release Blockers And Critical-Path Wins (0-2 weeks)
 
-`SEC-001..004`, `OBS-001..005`, `LOAD-001..007/009/011/012`, `CACHE-002..003/007`, and `QUAL-001/007`.
+`SEC-001A/001B/002..004`, `OBS-001..005`, `LOAD-001..007/009/011/012`, `CACHE-002..003/007`, and `QUAL-001/007`.
 
 Phase 1 lands as independent, reversible slices rather than one broad PR: security policy/session changes; instrumentation and initial baseline; media strategy; source connection; text prefix preview; bounded PROPFIND; preview deadline/negative cache; directory snapshot; metadata/body reuse. Range disk caching and viewer payload redesign are excluded.
 

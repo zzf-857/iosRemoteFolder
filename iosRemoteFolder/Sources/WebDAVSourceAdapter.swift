@@ -2,6 +2,14 @@ import Foundation
 import os.lock
 import UniformTypeIdentifiers
 
+/// One transport invariant shared by the form, persistence, and adapter
+/// boundaries: clear-text HTTP remains available only for anonymous sources.
+enum RemoteSourceTransportPolicy {
+    static func permitsCredentials(endpoint: URL, hasCredentials: Bool) -> Bool {
+        !hasCredentials || endpoint.scheme?.lowercased() == "https"
+    }
+}
+
 /// Standard WebDAV / Alist `/dav/` source adapter.
 ///
 /// Directory facts come from a namespaced `PROPFIND`. Content reads are delegated
@@ -38,6 +46,12 @@ actor WebDAVSourceAdapter: ResourceSourceAdapter {
 
         let trimmedUsername = username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let trimmedPassword = password ?? ""
+        guard RemoteSourceTransportPolicy.permitsCredentials(
+            endpoint: normalizedEndpoint,
+            hasCredentials: !trimmedUsername.isEmpty || !trimmedPassword.isEmpty
+        ) else {
+            throw ResourceSourceError.insecureCredentialTransport
+        }
         let authorizationHeader: String?
         if !trimmedUsername.isEmpty || !trimmedPassword.isEmpty {
             let credential = Data("\(trimmedUsername):\(trimmedPassword)".utf8)

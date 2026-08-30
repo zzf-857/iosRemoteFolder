@@ -58,6 +58,8 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
     case networkUnavailable
     /// 引用无效：URL 编码错误、路径穿越、缺少必要参数。
     case invalidReference
+    /// HTTP 来源试图携带用户名、密码或凭证引用；匿名 HTTP 仍可使用。
+    case insecureCredentialTransport
     /// 来源不支持请求的能力。
     case capabilityUnavailable
     /// 服务器未支持区间读取，且全量响应超出安全预算；为避免整文件进内存而中止读取。
@@ -80,6 +82,7 @@ enum ResourceSourceError: LocalizedError, Hashable, Sendable {
         case .httpStatus(let code): "服务器返回异常状态码 \(code)"
         case .networkUnavailable: "无法连接到来源，请检查网络或地址"
         case .invalidReference: "资源引用无效"
+        case .insecureCredentialTransport: "HTTP 来源不允许使用用户名或密码，请改用 HTTPS 或移除认证信息"
         case .capabilityUnavailable: "此来源不支持当前操作"
         case .responseTooLarge: "服务器未支持分段读取，响应内容超出安全上限。请改用完整下载，或联系服务端开启 Range 支持"
         case .invalidResponse: "远端响应无效或不完整，无法确认数据完整。请重试，或检查服务端配置"

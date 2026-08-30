@@ -11,14 +11,15 @@
 - [x] REV-001 Complete architecture, loading, format, quality, and benchmark-gap review.
 - [x] PLAN-001 Write the versioned optimization plan.
 - [x] PLAN-002 Create this progress tracker with stable task IDs and acceptance gates.
-- [ ] REL-001 Commit only the plan/tracker and confirm that exact commit exists on `origin/main`.
+- [x] REL-001 Commit only the plan/tracker and confirm `8db207b` exists on `origin/main`.
 - [ ] REL-002 Record the first optimization slice evidence and push its code/tests in a separate commit.
 
 ## Phase 1 - Release Blockers And Critical-Path Wins
 
 ### Security
 
-- [ ] SEC-001 Enforce production source policy: HTTPS by default; HTTP only for explicit local-network, credential-free sources; migrate/reject unsafe saved entries.
+- [x] SEC-001A Reject HTTP WebDAV/Alist username, password, and credential references in UI, persistence, and adapter layers while preserving anonymous loopback tests.
+- [ ] SEC-001B Limit anonymous HTTP to explicit local-network authorization and migrate/reject unsafe public HTTP entries.
 - [ ] SEC-002 Remove global ATS arbitrary loads and validate the narrow local-network policy in Archive.
 - [ ] SEC-003 Move remote traffic to controlled ephemeral sessions without shared cookies/cache/credential storage.
 - [ ] SEC-004 Implement and test HTTPS downgrade rejection plus cross-origin sensitive-header stripping for PROPFIND/HEAD/GET/Range.
@@ -118,17 +119,17 @@
 
 | Workstream | Priority/target | Owner role | Close-out evidence |
 |---|---|---|---|
-| SEC-001..004 | P0 / Phase 1 | Platform/security | Tests, archive result, sanitized request trace |
+| SEC-001A/001B/002..004 | P0 / Phase 1 | Platform/security | Tests, archive result, sanitized request trace |
 | OBS-001..005 | P1 / Phase 1 | Performance | Metrics fixtures, baseline report, `xcresult` |
 | LOAD-001..007/009/011/012 | P1 / Phase 1 | Sources/performance | Request ledger, focused tests, before/after metrics |
 | FMT-001..007, LOAD-008A..D | P1 / Phase 2 | Viewer/compatibility | Format fixtures, viewer/system fallback evidence |
 | CACHE-001..004/007 | P1 / Phase 1-2 | Cache/offline | Restart/corruption tests, size and IO evidence |
 | SEC-005/006, CACHE-005/006, QUAL-003/006 | P2 / Phase 2-3 | Platform/release | Device/lifecycle/archive evidence |
 
-Dependencies: `OBS-001..003 -> baseline -> performance changes -> OBS-004`; `SEC-001 -> SEC-002..004`; `OBS-002/003 -> LOAD-002/004/009/011/012`; `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`; `QUAL-002 + CACHE-001 -> CACHE-006`.
+Dependencies: `OBS-001..003 -> baseline -> performance changes -> OBS-004`; `SEC-001A -> SEC-001B -> SEC-002..004`; `OBS-002/003 -> LOAD-002/004/009/011/012`; `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`; `QUAL-002 + CACHE-001 -> CACHE-006`.
 
 ## Progress Log
 
 | Date | Commit | Completed | Verification | Notes |
 |---|---|---|---|---|
-| 2026-08-30 | pending | REV-001, PLAN-001, PLAN-002 | 180/180 baseline tests; analyze exit 0 | PDFKit isolation warnings remain; real Alist is not configured. |
+| 2026-08-30 | `8db207b` | REV-001, PLAN-001, PLAN-002, REL-001 | 180/180 baseline tests; analyze exit 0; `origin/main` verified | PDFKit isolation warnings remain; real Alist is not configured. |
