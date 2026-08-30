@@ -1,5 +1,44 @@
 import Foundation
 import Observation
+import os
+
+private enum SourcesStoreSignposts {
+    enum Outcome {
+        case success
+        case failure
+        case cancelled
+    }
+
+    private static let signposter = OSSignposter(
+        subsystem: "com.zzf857.iosRemoteFolder",
+        category: "DirectoryLoading"
+    )
+
+    static func beginDirectoryList() -> OSSignpostIntervalState {
+        signposter.beginInterval("DirectoryList")
+    }
+
+    static func endDirectoryList(
+        _ state: OSSignpostIntervalState,
+        outcome: Outcome
+    ) {
+        switch outcome {
+        case .success:
+            signposter.endInterval("DirectoryList", state, "outcome=success")
+        case .failure:
+            signposter.endInterval("DirectoryList", state, "outcome=failure")
+        case .cancelled:
+            signposter.endInterval("DirectoryList", state, "outcome=cancelled")
+        }
+    }
+
+    static func outcome(for error: any Error) -> Outcome {
+        let mapped = ResourceSourceError.mapping(error)
+        return Task.isCancelled || error is CancellationError || mapped == .cancelled
+            ? .cancelled
+            : .failure
+    }
+}
 
 /// 来源连接状态仓库：通过注入的 registry 驱动连接与重试，并向 UI 报告状态。
 ///
@@ -180,7 +219,11 @@ final class SourcesStore {
             }
             do {
                 try await registry.connect(sourceID: sourceID)
-                let resources = try await registry.listResources(sourceID: sourceID, at: initialPath)
+                let resources = try await Self.measuredDirectoryList(
+                    registry: registry,
+                    sourceID: sourceID,
+                    path: initialPath
+                )
                 try Task.checkCancellation()
                 guard self.isCurrentConnectionGeneration(sourceID, generation) else { return }
                 self.transition(sourceID, to: .ready)
@@ -297,7 +340,11 @@ final class SourcesStore {
                 self.finishBrowseTask(sourceID: sourceID, generation: generation)
             }
             do {
-                let items = try await registry.listResources(sourceID: sourceID, at: path)
+                let items = try await Self.measuredDirectoryList(
+                    registry: registry,
+                    sourceID: sourceID,
+                    path: path
+                )
                 try Task.checkCancellation()
                 guard self.isCurrentBrowseGeneration(sourceID, generation) else { return }
                 self.update(sourceID) { entry in
@@ -358,6 +405,26 @@ final class SourcesStore {
     }
 
     // MARK: - Private
+
+    private static func measuredDirectoryList(
+        registry: SourceRegistry,
+        sourceID: UUID,
+        path: ResourcePath
+    ) async throws -> [ResourceItem] {
+        let interval = SourcesStoreSignposts.beginDirectoryList()
+        do {
+            let items = try await registry.listResources(sourceID: sourceID, at: path)
+            try Task.checkCancellation()
+            SourcesStoreSignposts.endDirectoryList(interval, outcome: .success)
+            return items
+        } catch {
+            SourcesStoreSignposts.endDirectoryList(
+                interval,
+                outcome: SourcesStoreSignposts.outcome(for: error)
+            )
+            throw error
+        }
+    }
 
     private func entry(for sourceID: UUID) -> Entry? {
         entries.first { $0.id == sourceID }

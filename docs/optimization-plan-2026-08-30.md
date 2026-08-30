@@ -98,7 +98,8 @@ Cross-cutting rules:
 
 | ID | Deliverable | Acceptance |
 |---|---|---|
-| OBS-001 | Add signposts for directory, metadata, preview, body, decode, viewer-ready, media-ready, and seek | Each operation has duration, outcome, source kind, cache state, and byte count without private paths or URLs. |
+| OBS-001A | Add directory and preview signposts | Directory list, preview queue, and preview render intervals have balanced success/failure/cancelled outcomes and contain no private paths, IDs, or URLs. |
+| OBS-001B | Complete content and viewer signposts | Metadata, body, decode, viewer-ready, media-ready, and seek intervals include duration, outcome, source kind, cache state, and byte count without private paths or URLs. |
 | OBS-002 | Capture URLSession task metrics | Tests and diagnostics can report redirect count, request count, TTFB, transferred bytes, and protocol. |
 | OBS-003 | Add deterministic performance fixtures | Fixtures model TTFB, bandwidth, chunked responses, jitter, cancellation, HEAD 405, ignored Range, and mid-stream failure. |
 | OBS-004 | Establish CI and device baselines | Simulator CI enforces deterministic counts and relative regressions; a recorded reference device enforces Release-mode median/p95, RSS, disk IO, and main-thread stalls. |
@@ -165,7 +166,7 @@ Cross-cutting rules:
 Priority definitions:
 
 - P0: release or credential blocker (`SEC-001A/001B/002..004`).
-- P1: critical loading, format fallback, bounded storage, startup recovery, warnings, and truthful integration tests (`OBS-001..005`, `LOAD-001..012`, `FMT-001..007`, `CACHE-001..004/007`, `QUAL-001/002/004/005/007`).
+- P1: critical loading, format fallback, bounded storage, startup recovery, warnings, and truthful integration tests (`OBS-001A/001B/002..005`, `LOAD-001..012`, `FMT-001..007`, `CACHE-001..004/007`, `QUAL-001/002/004/005/007`).
 - P2: durable offline expansion, multi-window, accessibility breadth, and long-horizon release scale (`SEC-005/006`, `CACHE-005/006`, `QUAL-003/006`).
 
 Owner roles and target releases:
@@ -181,7 +182,7 @@ Owner roles and target releases:
 
 Mandatory dependency graph:
 
-- `OBS-001..003 -> initial baseline -> LOAD/CACHE performance changes -> OBS-004`.
+- `OBS-001A/001B/002/003 -> initial baseline -> LOAD/CACHE performance changes -> OBS-004`.
 - `SEC-001A -> SEC-001B -> SEC-002/003/004`; security implementation and tests land separately from loading changes.
 - `OBS-002/003 -> LOAD-002/004/009/011/012`; `LOAD-003 -> LOAD-010`.
 - `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`.
@@ -197,7 +198,7 @@ Mandatory dependency graph:
 
 ### Phase 1 - Release Blockers And Critical-Path Wins (0-2 weeks)
 
-`SEC-001A/001B/002..004`, `OBS-001..005`, `LOAD-001..007/009/011/012`, `CACHE-002..003/007`, and `QUAL-001/007`.
+`SEC-001A/001B/002..004`, `OBS-001A/001B/002..005`, `LOAD-001..007/009/011/012`, `CACHE-002..003/007`, and `QUAL-001/007`.
 
 Phase 1 lands as independent, reversible slices rather than one broad PR: security policy/session changes; instrumentation and initial baseline; media strategy; source connection; text prefix preview; bounded PROPFIND; preview deadline/negative cache; directory snapshot; metadata/body reuse. Range disk caching and viewer payload redesign are excluded.
 

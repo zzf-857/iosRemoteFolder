@@ -26,7 +26,8 @@
 
 ### Measurements
 
-- [ ] OBS-001 Add privacy-safe signposts for directory, metadata, preview, body, decode, viewer-ready, media-ready, and seek.
+- [x] OBS-001A Add balanced, privacy-safe signposts for directory list, preview queue, and preview render.
+- [ ] OBS-001B Add metadata, body, decode, viewer-ready, media-ready, and seek signposts with source/cache/byte dimensions.
 - [ ] OBS-002 Capture request count, redirects, TTFB, transferred bytes, protocol, and cache outcome.
 - [ ] OBS-003 Extend network fixtures with delay, bandwidth/chunks, cancellation, HEAD 405, ignored Range, and disconnects.
 - [ ] OBS-004 Store Release-mode median/p95/RSS/IO baselines and enforce absolute plus 15% regression gates.
@@ -120,13 +121,13 @@
 | Workstream | Priority/target | Owner role | Close-out evidence |
 |---|---|---|---|
 | SEC-001A/001B/002..004 | P0 / Phase 1 | Platform/security | Tests, archive result, sanitized request trace |
-| OBS-001..005 | P1 / Phase 1 | Performance | Metrics fixtures, baseline report, `xcresult` |
+| OBS-001A/001B/002..005 | P1 / Phase 1 | Performance | Metrics fixtures, baseline report, `xcresult` |
 | LOAD-001..007/009/011/012 | P1 / Phase 1 | Sources/performance | Request ledger, focused tests, before/after metrics |
 | FMT-001..007, LOAD-008A..D | P1 / Phase 2 | Viewer/compatibility | Format fixtures, viewer/system fallback evidence |
 | CACHE-001..004/007 | P1 / Phase 1-2 | Cache/offline | Restart/corruption tests, size and IO evidence |
 | SEC-005/006, CACHE-005/006, QUAL-003/006 | P2 / Phase 2-3 | Platform/release | Device/lifecycle/archive evidence |
 
-Dependencies: `OBS-001..003 -> baseline -> performance changes -> OBS-004`; `SEC-001A -> SEC-001B -> SEC-002..004`; `OBS-002/003 -> LOAD-002/004/009/011/012`; `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`; `QUAL-002 + CACHE-001 -> CACHE-006`.
+Dependencies: `OBS-001A/001B/002/003 -> baseline -> performance changes -> OBS-004`; `SEC-001A -> SEC-001B -> SEC-002..004`; `OBS-002/003 -> LOAD-002/004/009/011/012`; `FMT-001/002 -> FMT-003..007`; `CACHE-001 -> CACHE-004/006/007`; `CACHE-004 -> CACHE-005`; `QUAL-002 + CACHE-001 -> CACHE-006`.
 
 ## Progress Log
 

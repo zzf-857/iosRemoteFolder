@@ -6,6 +6,58 @@ import ImageIO
 import PDFKit
 import QuickLookThumbnailing
 import UniformTypeIdentifiers
+import os
+
+private enum ResourcePreviewSignposts {
+    enum Outcome {
+        case success
+        case failure
+        case cancelled
+    }
+
+    private static let signposter = OSSignposter(
+        subsystem: "com.zzf857.iosRemoteFolder",
+        category: "ResourcePreview"
+    )
+
+    static func beginQueue() -> OSSignpostIntervalState {
+        signposter.beginInterval("PreviewQueue")
+    }
+
+    static func endQueue(_ state: OSSignpostIntervalState, outcome: Outcome) {
+        end("PreviewQueue", state: state, outcome: outcome)
+    }
+
+    static func beginRender() -> OSSignpostIntervalState {
+        signposter.beginInterval("PreviewRender")
+    }
+
+    static func endRender(_ state: OSSignpostIntervalState, outcome: Outcome) {
+        end("PreviewRender", state: state, outcome: outcome)
+    }
+
+    static func outcome(for error: any Error) -> Outcome {
+        let mapped = ResourceSourceError.mapping(error)
+        return Task.isCancelled || error is CancellationError || mapped == .cancelled
+            ? .cancelled
+            : .failure
+    }
+
+    private static func end(
+        _ name: StaticString,
+        state: OSSignpostIntervalState,
+        outcome: Outcome
+    ) {
+        switch outcome {
+        case .success:
+            signposter.endInterval(name, state, "outcome=success")
+        case .failure:
+            signposter.endInterval(name, state, "outcome=failure")
+        case .cancelled:
+            signposter.endInterval(name, state, "outcome=cancelled")
+        }
+    }
+}
 
 struct ResourcePreviewRequest: Hashable, Sendable {
     static let currentRendererVersion = 2
@@ -908,29 +960,48 @@ actor ResourcePreviewPipeline {
             let owner = self
 
             renderTask = Task.detached(priority: .utility) {
+                let queueInterval = ResourcePreviewSignposts.beginQueue()
                 let result: Result<GeneratedPreview, ResourceSourceError>
                 do {
                     try await limiter.acquire()
-                    do {
-                        try Task.checkCancellation()
-                        let session = try await accessService.makeSession(for: request.item)
-                        guard await owner.install(session: session) else {
-                            throw ResourceSourceError.cancelled
-                        }
-                        result = .success(try await ResourcePreviewPipeline.render(
-                            request: request,
-                            session: session,
-                            installMediaLease: { lease in
-                                await owner.install(mediaLease: lease)
-                            }
-                        ))
-                        await limiter.release()
-                    } catch {
-                        await limiter.release()
-                        throw error
+                } catch {
+                    ResourcePreviewSignposts.endQueue(
+                        queueInterval,
+                        outcome: ResourcePreviewSignposts.outcome(for: error)
+                    )
+                    await owner.finish(
+                        .failure(ResourcePreviewPipeline.mapError(error))
+                    )
+                    return
+                }
+                ResourcePreviewSignposts.endQueue(queueInterval, outcome: .success)
+
+                let renderInterval = ResourcePreviewSignposts.beginRender()
+                do {
+                    try Task.checkCancellation()
+                    let session = try await accessService.makeSession(for: request.item)
+                    guard await owner.install(session: session) else {
+                        throw ResourceSourceError.cancelled
                     }
+                    result = .success(try await ResourcePreviewPipeline.render(
+                        request: request,
+                        session: session,
+                        installMediaLease: { lease in
+                            await owner.install(mediaLease: lease)
+                        }
+                    ))
                 } catch {
                     result = .failure(ResourcePreviewPipeline.mapError(error))
+                }
+                await limiter.release()
+                switch result {
+                case .success:
+                    ResourcePreviewSignposts.endRender(renderInterval, outcome: .success)
+                case .failure(let error):
+                    ResourcePreviewSignposts.endRender(
+                        renderInterval,
+                        outcome: ResourcePreviewSignposts.outcome(for: error)
+                    )
                 }
                 await owner.finish(result)
             }
