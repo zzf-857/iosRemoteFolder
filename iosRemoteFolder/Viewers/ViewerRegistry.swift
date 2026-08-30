@@ -20,6 +20,7 @@ struct ResolvedContentType: Hashable, Sendable {
             case mimeType
             case filenameExtension
             case declaredKind
+            case signature
         }
 
         enum Strength: Int, Hashable, Sendable {
@@ -46,20 +47,82 @@ struct ResolvedContentType: Hashable, Sendable {
             metadata: ResourceKind,
             filenameExtension: ResourceKind
         )
+        case signatureMismatch(
+            expected: ResourceKind,
+            signature: ResourceKind,
+            formatToken: String
+        )
+        case declaredKindOverridden(
+            declared: ResourceKind,
+            signature: ResourceKind,
+            formatToken: String
+        )
         case unresolved
+    }
+
+    enum SignatureProbe: Hashable, Sendable {
+        case required
+        case notRequired
+        case unavailable
+        case noMatch
+        case matched(ContentSignatureMatch)
+
+        var requiresInspection: Bool {
+            self == .required
+        }
+
+        var isCacheable: Bool {
+            self != .required && self != .unavailable
+        }
+
+        fileprivate var fingerprintToken: String {
+            switch self {
+            case .required:
+                "required"
+            case .notRequired:
+                "not-required"
+            case .unavailable:
+                "unavailable"
+            case .noMatch:
+                "no-match"
+            case .matched(let match):
+                [
+                    "matched",
+                    match.formatToken,
+                    match.strength.rawValue,
+                    match.kind.rawValue,
+                    match.canonicalTypeIdentifier?.lowercased() ?? "none"
+                ].joined(separator: ":")
+            }
+        }
     }
 
     let kind: ResourceKind
     let evidence: Set<Evidence>
     let confidence: Confidence
     let diagnostics: Set<Diagnostic>
+    let signatureProbe: SignatureProbe
+
+    init(
+        kind: ResourceKind,
+        evidence: Set<Evidence>,
+        confidence: Confidence,
+        diagnostics: Set<Diagnostic>,
+        signatureProbe: SignatureProbe = .notRequired
+    ) {
+        self.kind = kind
+        self.evidence = evidence
+        self.confidence = confidence
+        self.diagnostics = diagnostics
+        self.signatureProbe = signatureProbe
+    }
 
     var hasBlockingConflict: Bool {
         diagnostics.contains { diagnostic in
             switch diagnostic {
-            case .conflictingTypedMetadata, .metadataExtensionMismatch:
+            case .conflictingTypedMetadata, .metadataExtensionMismatch, .signatureMismatch:
                 true
-            case .unresolved:
+            case .declaredKindOverridden, .unresolved:
                 false
             }
         }
@@ -78,11 +141,12 @@ struct ResolvedContentType: Hashable, Sendable {
             .map(\.fingerprintToken)
             .sorted()
         return [
-            "resolved-content-v2",
+            "resolved-content-v3",
             "kind=\(kind.rawValue)",
             "blocking=\(hasBlockingConflict ? 1 : 0)",
             "diagnostics=\(diagnosticTokens.joined(separator: ","))",
-            "canonical=\(canonicalTypes.joined(separator: ","))"
+            "canonical=\(canonicalTypes.joined(separator: ","))",
+            "signature=\(signatureProbe.fingerprintToken)"
         ].joined(separator: ";")
     }
 
@@ -99,12 +163,49 @@ struct ResolvedContentType: Hashable, Sendable {
         }) {
             return "文件类型与扩展名不一致"
         }
+        if diagnostics.contains(where: { diagnostic in
+            if case .signatureMismatch = diagnostic { return true }
+            return false
+        }) {
+            return "文件签名与声明类型不一致"
+        }
         return diagnostics.contains(.unresolved)
             ? "无法从资源元数据确认内容类型"
             : nil
     }
 
     static func resolve(
+        resource: ResourceItem,
+        metadata: ResourceMetadata
+    ) -> ResolvedContentType {
+        resolveBase(resource: resource, metadata: metadata)
+            .markingSignatureRequirement()
+    }
+
+    static func resolve(
+        resource: ResourceItem,
+        metadata: ResourceMetadata,
+        signatureProbe: SignatureProbe
+    ) -> ResolvedContentType {
+        let preliminary = resolve(resource: resource, metadata: metadata)
+        guard preliminary.signatureProbe.requiresInspection else {
+            return preliminary
+        }
+        switch signatureProbe {
+        case .required:
+            return preliminary
+        case .notRequired:
+            return preliminary.withSignatureProbe(.notRequired)
+        case .unavailable:
+            return preliminary.withSignatureProbe(.unavailable)
+        case .noMatch:
+            return preliminary.withSignatureProbe(.noMatch)
+        case .matched(let match):
+            return preliminary.merging(signature: match)
+        }
+    }
+
+    private static func resolveBase(
         resource: ResourceItem,
         metadata: ResourceMetadata
     ) -> ResolvedContentType {
@@ -240,6 +341,318 @@ struct ResolvedContentType: Hashable, Sendable {
             diagnostics: [.unresolved]
         )
     }
+
+    private func markingSignatureRequirement() -> ResolvedContentType {
+        guard kind != .folder,
+              !hasBlockingConflict,
+              confidence.rawValue <= Confidence.medium.rawValue || kind == .unknown else {
+            return withSignatureProbe(.notRequired)
+        }
+        return withSignatureProbe(.required)
+    }
+
+    private func withSignatureProbe(_ probe: SignatureProbe) -> ResolvedContentType {
+        ResolvedContentType(
+            kind: kind,
+            evidence: evidence,
+            confidence: confidence,
+            diagnostics: diagnostics,
+            signatureProbe: probe
+        )
+    }
+
+    private func merging(signature match: ContentSignatureMatch) -> ResolvedContentType {
+        let signatureEvidence = Evidence(
+            source: .signature,
+            rawValue: match.formatToken,
+            kind: match.kind,
+            strength: match.evidenceStrength,
+            canonicalTypeIdentifier: match.canonicalTypeIdentifier
+        )
+        let mergedEvidence = evidence.union([signatureEvidence])
+        let concreteEvidence = evidence.filter { evidence in
+            evidence.source != .declaredKind
+                && evidence.source != .directory
+                && evidence.strength != .generic
+                && (evidence.candidateKind != nil || evidence.canonicalTypeIdentifier != nil)
+        }
+        let hasOnlyWeakDeclaredHint = concreteEvidence.isEmpty
+
+        if match.strength == .heuristic {
+            guard kind == .unknown,
+                  concreteEvidence.isEmpty,
+                  match.kind != .unknown else {
+                return replacing(
+                    evidence: mergedEvidence,
+                    signatureProbe: .matched(match)
+                )
+            }
+            return replacing(
+                kind: match.kind,
+                evidence: mergedEvidence,
+                confidence: .medium,
+                diagnostics: diagnostics.removingUnresolved,
+                signatureProbe: .matched(match)
+            )
+        }
+
+        if match.strength == .container {
+            if concreteEvidence.isEmpty, kind == .unknown {
+                return replacing(
+                    evidence: mergedEvidence,
+                    confidence: Self.strongerConfidence(confidence, .high),
+                    diagnostics: diagnostics.removingUnresolved,
+                    signatureProbe: .matched(match)
+                )
+            }
+            if concreteEvidence.isEmpty,
+               Self.container(match, isCompatibleWith: kind) {
+                return replacing(
+                    evidence: mergedEvidence,
+                    confidence: Self.strongerConfidence(confidence, .high),
+                    signatureProbe: .matched(match)
+                )
+            }
+            if Self.container(match, isCompatibleWith: concreteEvidence) {
+                return replacing(
+                    evidence: mergedEvidence,
+                    confidence: Self.strongerConfidence(confidence, .high),
+                    diagnostics: diagnostics.removingUnresolved,
+                    signatureProbe: .matched(match)
+                )
+            }
+            if hasOnlyWeakDeclaredHint {
+                var updatedDiagnostics = diagnostics.removingUnresolved
+                updatedDiagnostics.insert(.declaredKindOverridden(
+                    declared: kind,
+                    signature: .unknown,
+                    formatToken: match.formatToken
+                ))
+                return replacing(
+                    kind: .unknown,
+                    evidence: mergedEvidence,
+                    confidence: .high,
+                    diagnostics: updatedDiagnostics,
+                    signatureProbe: .matched(match)
+                )
+            }
+            return blockingSignatureMismatch(match, evidence: mergedEvidence)
+        }
+
+        guard match.kind != .unknown else {
+            return replacing(
+                evidence: mergedEvidence,
+                signatureProbe: .matched(match)
+            )
+        }
+        if concreteEvidence.contains(where: {
+            Self.exactSignature(signatureEvidence, conflictsWith: $0)
+        }) {
+            return blockingSignatureMismatch(match, evidence: mergedEvidence)
+        }
+        if kind == .unknown {
+            return replacing(
+                kind: match.kind,
+                evidence: mergedEvidence,
+                confidence: .high,
+                diagnostics: diagnostics.removingUnresolved,
+                signatureProbe: .matched(match)
+            )
+        }
+        if Self.areCompatible(kind, match.kind) {
+            return replacing(
+                kind: Self.preferredKind(kind, match.kind) ?? kind,
+                evidence: mergedEvidence,
+                confidence: .high,
+                signatureProbe: .matched(match)
+            )
+        }
+        if hasOnlyWeakDeclaredHint {
+            var updatedDiagnostics = diagnostics.removingUnresolved
+            updatedDiagnostics.insert(.declaredKindOverridden(
+                declared: kind,
+                signature: match.kind,
+                formatToken: match.formatToken
+            ))
+            return replacing(
+                kind: match.kind,
+                evidence: mergedEvidence,
+                confidence: .high,
+                diagnostics: updatedDiagnostics,
+                signatureProbe: .matched(match)
+            )
+        }
+        return blockingSignatureMismatch(match, evidence: mergedEvidence)
+    }
+
+    private func blockingSignatureMismatch(
+        _ match: ContentSignatureMatch,
+        evidence: Set<Evidence>
+    ) -> ResolvedContentType {
+        ResolvedContentType(
+            kind: .unknown,
+            evidence: evidence,
+            confidence: .none,
+            diagnostics: [.signatureMismatch(
+                expected: kind,
+                signature: match.kind,
+                formatToken: match.formatToken
+            )],
+            signatureProbe: .matched(match)
+        )
+    }
+
+    private func replacing(
+        kind: ResourceKind? = nil,
+        evidence: Set<Evidence>? = nil,
+        confidence: Confidence? = nil,
+        diagnostics: Set<Diagnostic>? = nil,
+        signatureProbe: SignatureProbe
+    ) -> ResolvedContentType {
+        ResolvedContentType(
+            kind: kind ?? self.kind,
+            evidence: evidence ?? self.evidence,
+            confidence: confidence ?? self.confidence,
+            diagnostics: diagnostics ?? self.diagnostics,
+            signatureProbe: signatureProbe
+        )
+    }
+
+    private static func strongerConfidence(
+        _ first: Confidence,
+        _ second: Confidence
+    ) -> Confidence {
+        first.rawValue >= second.rawValue ? first : second
+    }
+
+    private static func container(
+        _ match: ContentSignatureMatch,
+        isCompatibleWith kind: ResourceKind
+    ) -> Bool {
+        switch match.formatToken {
+        case "iso-bmff", "ebml", "matroska", "webm":
+            kind == .audio || kind == .video
+        case "zip":
+            false
+        default:
+            false
+        }
+    }
+
+    private static func container(
+        _ match: ContentSignatureMatch,
+        isCompatibleWith evidence: Set<Evidence>
+    ) -> Bool {
+        !evidence.isEmpty && evidence.allSatisfy {
+            container(match, isCompatibleWith: $0)
+        }
+    }
+
+    private static func container(
+        _ match: ContentSignatureMatch,
+        isCompatibleWith evidence: Evidence
+    ) -> Bool {
+        let acceptedTokens: Set<String>
+        switch match.formatToken {
+        case "zip":
+            acceptedTokens = zipContainerTokens
+        case "iso-bmff":
+            acceptedTokens = isoBaseMediaContainerTokens
+        case "webm":
+            acceptedTokens = webMContainerTokens
+        case "matroska":
+            acceptedTokens = matroskaContainerTokens
+        case "ebml":
+            acceptedTokens = webMContainerTokens.union(matroskaContainerTokens)
+        default:
+            return false
+        }
+
+        let tokens = compatibilityTokens(for: evidence)
+        if !tokens.isDisjoint(with: acceptedTokens) {
+            return true
+        }
+
+        // A filename extension or a concrete system type names a format, not
+        // merely a broad media family. If it did not match the allowlist above,
+        // treating it as compatible would miss MP3/BMFF and MP4/EBML conflicts.
+        if evidence.source == .filenameExtension
+            || evidence.canonicalTypeIdentifier != nil {
+            return false
+        }
+        return container(match, isCompatibleWith: evidence.kind)
+    }
+
+    private static func compatibilityTokens(for evidence: Evidence) -> Set<String> {
+        var tokens: Set<String> = [evidence.rawValue.lowercased()]
+        if let identifier = evidence.canonicalTypeIdentifier?.lowercased() {
+            tokens.insert(identifier)
+            if let preferredExtension = UTType(identifier)?.preferredFilenameExtension {
+                tokens.insert(preferredExtension.lowercased())
+            }
+        }
+        return tokens
+    }
+
+    private static func exactSignature(
+        _ signature: Evidence,
+        conflictsWith other: Evidence
+    ) -> Bool {
+        guard signature.kind != .unknown else { return false }
+        if let otherKind = other.candidateKind,
+           !areCompatible(signature.kind, otherKind) {
+            return true
+        }
+        if signature.kind.isTextLike, other.kind.isTextLike {
+            return false
+        }
+        guard let signatureIdentifier = signature.canonicalTypeIdentifier?.lowercased(),
+              let otherIdentifier = other.canonicalTypeIdentifier?.lowercased() else {
+            return false
+        }
+        guard signatureIdentifier != otherIdentifier else { return false }
+        if exactTypeIdentifierFamilies.contains(where: {
+            $0.contains(signatureIdentifier) && $0.contains(otherIdentifier)
+        }) {
+            return false
+        }
+        guard let signatureType = UTType(signatureIdentifier),
+              let otherType = UTType(otherIdentifier) else {
+            return true
+        }
+        return !signatureType.conforms(to: otherType)
+            && !otherType.conforms(to: signatureType)
+    }
+
+    private static let zipContainerTokens: Set<String> = [
+        "zip", "application/zip", "application/x-zip-compressed", "public.zip-archive",
+        "docx", "docm", "dotx", "dotm",
+        "xlsx", "xlsm", "xltx", "xltm",
+        "pptx", "pptm", "potx", "potm", "ppsx", "ppsm",
+        "pages", "numbers", "keynote", "epub", "jar", "war", "ear",
+        "apk", "ipa", "cbz", "kmz", "xpi",
+        "odt", "ods", "odp", "odg", "odf", "odm",
+        "ott", "ots", "otp", "otg", "oth"
+    ]
+
+    private static let isoBaseMediaContainerTokens: Set<String> = [
+        "mp4", "m4v", "mov", "m4a", "m4b", "m4p", "m4r", "3gp", "3g2",
+        "video/mp4", "audio/mp4", "video/quicktime", "audio/x-m4a",
+        "public.mpeg-4", "public.mpeg-4-audio", "com.apple.quicktime-movie"
+    ]
+
+    private static let exactTypeIdentifierFamilies: [Set<String>] = [
+        ["public.heic", "public.heif"]
+    ]
+
+    private static let webMContainerTokens: Set<String> = [
+        "webm", "video/webm", "audio/webm", "org.webmproject.webm"
+    ]
+
+    private static let matroskaContainerTokens: Set<String> = [
+        "mkv", "mka", "mk3d", "video/x-matroska", "audio/x-matroska",
+        "org.matroska.mkv", "org.matroska.mka"
+    ]
 
     private static let genericMIMETypes: Set<String> = [
         "application/binary",
@@ -457,9 +870,29 @@ private extension ResolvedContentType.Diagnostic {
             "typed-conflict:\(typeIdentifier.rawValue):\(mimeType.rawValue)"
         case .metadataExtensionMismatch(let metadata, let filenameExtension):
             "extension-conflict:\(metadata.rawValue):\(filenameExtension.rawValue)"
+        case .signatureMismatch(let expected, let signature, let formatToken):
+            "signature-conflict:\(expected.rawValue):\(signature.rawValue):\(formatToken)"
+        case .declaredKindOverridden(let declared, let signature, let formatToken):
+            "declared-overridden:\(declared.rawValue):\(signature.rawValue):\(formatToken)"
         case .unresolved:
             "unresolved"
         }
+    }
+}
+
+private extension ContentSignatureMatch {
+    var evidenceStrength: ResolvedContentType.Evidence.Strength {
+        switch strength {
+        case .heuristic: .inferred
+        case .container: .typed
+        case .exact: .authoritative
+        }
+    }
+}
+
+private extension Set where Element == ResolvedContentType.Diagnostic {
+    var removingUnresolved: Set<Element> {
+        subtracting([.unresolved])
     }
 }
 
@@ -493,6 +926,39 @@ extension ResourceItem {
 
     func resolvedContentType(using metadata: ResourceMetadata) -> ResolvedContentType {
         ResolvedContentType.resolve(resource: self, metadata: metadata)
+    }
+}
+
+enum ResolvedContentTypeProbe {
+    static func resolve(
+        resource: ResourceItem,
+        metadata: ResourceMetadata,
+        session: ResourceContentSession
+    ) async throws -> ResolvedContentType {
+        let preliminary = resource.resolvedContentType(using: metadata)
+        guard preliminary.signatureProbe.requiresInspection else {
+            return preliminary
+        }
+
+        let prefix: Data
+        do {
+            prefix = try await session.readSignaturePrefix()
+        } catch {
+            let mapped = ResourceSourceError.mapping(error)
+            guard mapped == .capabilityUnavailable else { throw mapped }
+            return ResolvedContentType.resolve(
+                resource: resource,
+                metadata: metadata,
+                signatureProbe: .unavailable
+            )
+        }
+        try Task.checkCancellation()
+        let match = ContentSignatureSniffer.sniff(prefix)
+        return ResolvedContentType.resolve(
+            resource: resource,
+            metadata: metadata,
+            signatureProbe: match.map(ResolvedContentType.SignatureProbe.matched) ?? .noMatch
+        )
     }
 }
 
@@ -535,7 +1001,10 @@ struct ViewerRegistry {
         resource: ResourceItem,
         metadata: ResourceMetadata
     ) -> ViewerResolution {
-        let contentType = resource.resolvedContentType(using: metadata)
+        resolve(contentType: resource.resolvedContentType(using: metadata))
+    }
+
+    static func resolve(contentType: ResolvedContentType) -> ViewerResolution {
         switch contentType.kind {
         case .folder:
             return unsupported("文件夹不能作为内容打开", contentType: contentType)

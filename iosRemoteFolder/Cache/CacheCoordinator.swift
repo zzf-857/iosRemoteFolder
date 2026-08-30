@@ -198,6 +198,69 @@ actor CacheCoordinator {
         }
     }
 
+    /// Reads only the leading bytes of a complete cached entry. Unlike `data`,
+    /// a file larger than the prefix budget remains a valid cache entry.
+    func prefixData(
+        for key: ResourceCacheKey,
+        expectedByteCount: Int64,
+        maximumBytes: Int64
+    ) throws -> Data? {
+        guard expectedByteCount >= 0,
+              maximumBytes > 0,
+              let readLimit = Int(exactly: maximumBytes) else {
+            throw ResourceSourceError.invalidReference
+        }
+
+        let url = fileURL(for: key)
+        let digest = digest(for: key)
+        guard manifest[digest]?.identityKey == key.identity.identityKey,
+              fileManager.fileExists(atPath: url.path) else {
+            removeFile(at: url)
+            states[key] = .online
+            return nil
+        }
+
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let fileSize = attributes[.size] as? NSNumber,
+              fileSize.int64Value == expectedByteCount else {
+            removeFile(at: url)
+            manifest.removeValue(forKey: digest)
+            try? persistManifest()
+            states[key] = .online
+            return nil
+        }
+
+        guard expectedByteCount > 0 else {
+            states[key] = .offlineAvailable
+            return Data()
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let expectedPrefixCount = Int(min(expectedByteCount, maximumBytes))
+            var data = Data()
+            data.reserveCapacity(expectedPrefixCount)
+            while data.count < expectedPrefixCount {
+                let remaining = min(readLimit, expectedPrefixCount - data.count)
+                let chunk = try handle.read(upToCount: remaining) ?? Data()
+                guard !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+            guard data.count == expectedPrefixCount else {
+                throw ResourceSourceError.invalidResponse
+            }
+            states[key] = .offlineAvailable
+            return data
+        } catch {
+            removeFile(at: url)
+            manifest.removeValue(forKey: digest)
+            try? persistManifest()
+            states[key] = .online
+            return nil
+        }
+    }
+
     /// Atomically stores a bounded content entry. Unknown revisions cannot
     /// reach this method because `ResourceCacheKey` is failable to construct.
     @discardableResult

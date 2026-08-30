@@ -28,7 +28,11 @@ final class ResourceAccessService: Sendable {
             throw ResourceSourceError.capabilityUnavailable
         }
 
-        let session = ResourceContentSession(registry: registry, item: item)
+        let session = ResourceContentSession(
+            registry: registry,
+            item: item,
+            cacheCoordinator: cacheCoordinator
+        )
         do {
             let latestMetadata = try await session.fetchMetadata()
             guard item.resolvedContentType(using: latestMetadata).kind != .folder else {

@@ -304,7 +304,12 @@ struct ResourceViewerHost: View {
             phase = .metadata
             let metadata = try await createdSession.fetchMetadata()
             phase = .content
-            let resolution = ViewerRegistry.resolve(resource: resource, metadata: metadata)
+            let contentType = try await ResolvedContentTypeProbe.resolve(
+                resource: resource,
+                metadata: metadata,
+                session: createdSession
+            )
+            let resolution = ViewerRegistry.resolve(contentType: contentType)
             let payload: ViewerContentPayload?
             switch resolution.preparation {
             case .none:

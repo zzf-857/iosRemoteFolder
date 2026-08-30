@@ -2108,6 +2108,261 @@ struct ResourceAccessServiceTests {
         }
     }
 
+    @Test("签名前缀固定为 4 KiB，并发与重复调用只读取一次")
+    func signaturePrefixIsBoundedCoalescedAndMemoized() async throws {
+        let source = makeSource()
+        let content = Data(repeating: 0x41, count: 8 * 1024)
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: true
+            ),
+            content: content,
+            delay: .milliseconds(100)
+        )
+        let session = try await makeService(source: source, adapter: adapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead]))
+
+        let first = Task { try await session.readSignaturePrefix() }
+        let second = Task { try await session.readSignaturePrefix() }
+        let firstData = try await first.value
+        let secondData = try await second.value
+
+        #expect(firstData == Data(content.prefix(4 * 1024)))
+        #expect(secondData == firstData)
+        #expect(adapter.metadataCalls == 1)
+        #expect(adapter.readCalls == 1)
+        #expect(adapter.readRanges == [
+            ResourceByteRange(lowerBound: 0, upperBound: 4 * 1024 - 1)
+        ])
+
+        #expect(try await session.readSignaturePrefix() == firstData)
+        #expect(adapter.readCalls == 1)
+        await session.close()
+    }
+
+    @Test("单个前缀等待者取消不影响共享读取")
+    func signaturePrefixCancellationIsWaiterScoped() async throws {
+        let source = makeSource()
+        let content = Data(repeating: 0x42, count: 8 * 1024)
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(
+                byteSize: Int64(content.count),
+                acceptsRanges: true
+            ),
+            content: content,
+            delay: .milliseconds(150)
+        )
+        let session = try await makeService(source: source, adapter: adapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read, .rangeRead]))
+
+        let cancelled = Task { try await session.readSignaturePrefix() }
+        let survivor = Task { try await session.readSignaturePrefix() }
+        try await waitUntil { adapter.readCalls == 1 }
+        cancelled.cancel()
+
+        await #expect(throws: ResourceSourceError.cancelled) {
+            _ = try await cancelled.value
+        }
+        #expect(try await survivor.value == Data(content.prefix(4 * 1024)))
+        #expect(adapter.readCalls == 1)
+        await session.close()
+    }
+
+    @Test("小文件签名读取复用完整正文，不安全前缀路径保持零读取")
+    func signaturePrefixReusesSmallBodyAndRejectsUnsafeFallbacks() async throws {
+        let source = makeSource()
+        let smallContent = Data("small signature body".utf8)
+        let smallAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: Int64(smallContent.count)),
+            content: smallContent
+        )
+        let smallSession = try await makeService(source: source, adapter: smallAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        #expect(try await smallSession.readSignaturePrefix() == smallContent)
+        #expect(try await smallSession.readData(maximumBytes: 1024) == smallContent)
+        #expect(smallAdapter.readCalls == 1)
+        await smallSession.close()
+
+        let reverseAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: Int64(smallContent.count)),
+            content: smallContent,
+            delay: .milliseconds(100)
+        )
+        let reverseSession = try await makeService(source: source, adapter: reverseAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        let fullTask = Task { try await reverseSession.readData(maximumBytes: 1024) }
+        let prefixTask = Task { try await reverseSession.readSignaturePrefix() }
+        #expect(try await fullTask.value == smallContent)
+        #expect(try await prefixTask.value == smallContent)
+        #expect(try await reverseSession.readSignaturePrefix() == smallContent)
+        #expect(reverseAdapter.readCalls == 1)
+        await reverseSession.close()
+
+        let largeAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: 8 * 1024, acceptsRanges: false),
+            content: Data(repeating: 0x43, count: 8 * 1024)
+        )
+        let largeSession = try await makeService(source: source, adapter: largeAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            _ = try await largeSession.readSignaturePrefix()
+        }
+        #expect(largeAdapter.readCalls == 0)
+        await largeSession.close()
+
+        let unknownAdapter = ContentStubAdapter(
+            source: source,
+            metadata: ResourceMetadata(byteSize: nil, acceptsRanges: false),
+            content: Data("unknown".utf8)
+        )
+        let unknownSession = try await makeService(source: source, adapter: unknownAdapter)
+            .makeSession(for: makeItem(sourceID: source.id, capabilities: [.read]))
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            _ = try await unknownSession.readSignaturePrefix()
+        }
+        #expect(unknownAdapter.readCalls == 0)
+        await unknownSession.close()
+    }
+
+    @Test("在线签名探测优先复用同 revision 完整缓存且零正文网络")
+    func onlineSignatureProbeUsesValidatedCachedPrefix() async throws {
+        let source = makeSource()
+        let basePNG = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        var largePNG = basePNG
+        largePNG.append(Data(repeating: 0, count: 5_000))
+
+        for content in [basePNG, largePNG] {
+            let revision = ResourceRevision.etag("cached-signature-\(content.count)")
+            let metadata = ResourceMetadata(
+                byteSize: Int64(content.count),
+                mimeType: "application/octet-stream",
+                typeIdentifier: "public.data",
+                acceptsRanges: false,
+                revision: revision
+            )
+            let item = ResourceItem(
+                sourceID: source.id,
+                logicalPath: ResourcePath(rawValue: "/cached-signature-\(content.count)")!,
+                name: "cached-signature-\(content.count)",
+                kind: .unknown,
+                metadata: metadata,
+                capabilities: [.read],
+                accent: .blue
+            )
+            let adapter = ContentStubAdapter(
+                source: source,
+                metadata: metadata,
+                content: content
+            )
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("iosRemoteFolder-online-signature-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let cache = CacheCoordinator(rootURL: root)
+            let key = try #require(ResourceCacheKey(
+                identity: item.id,
+                revision: revision,
+                variant: .content
+            ))
+            #expect(try await cache.store(
+                content,
+                for: key,
+                maximumBytes: Int64(content.count)
+            ))
+            let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+            let service = ResourceAccessService(
+                registry: registry,
+                cacheCoordinator: cache
+            )
+            let session = try await service.makeSession(for: item)
+
+            let resolved = try await ResolvedContentTypeProbe.resolve(
+                resource: item,
+                metadata: metadata,
+                session: session
+            )
+            #expect(resolved.kind == .image)
+            #expect(!resolved.hasBlockingConflict)
+            #expect(adapter.metadataCalls == 1)
+            #expect(adapter.readCalls == 0)
+            #expect(await cache.state(for: key) == .offlineAvailable)
+            await session.close()
+        }
+    }
+
+    @Test("在线签名探测淘汰大小不匹配缓存并回退单次 Range")
+    func onlineSignatureProbeRejectsMismatchedCachedBody() async throws {
+        let source = makeSource()
+        let basePNG = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        var content = basePNG
+        content.append(Data(repeating: 0, count: 5_000))
+        let revision = ResourceRevision.etag("cached-signature-mismatch")
+        let metadata = ResourceMetadata(
+            byteSize: Int64(content.count),
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            acceptsRanges: true,
+            revision: revision
+        )
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: ResourcePath(rawValue: "/cached-signature-mismatch")!,
+            name: "cached-signature-mismatch",
+            kind: .unknown,
+            metadata: metadata,
+            capabilities: [.read, .rangeRead],
+            accent: .blue
+        )
+        let adapter = ContentStubAdapter(
+            source: source,
+            metadata: metadata,
+            content: content
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-online-signature-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = CacheCoordinator(rootURL: root)
+        let key = try #require(ResourceCacheKey(
+            identity: item.id,
+            revision: revision,
+            variant: .content
+        ))
+        #expect(try await cache.store(
+            Data(content.dropLast()),
+            for: key,
+            maximumBytes: Int64(content.count)
+        ))
+        let registry = try SourceRegistry(sources: [source], adapters: [adapter])
+        let service = ResourceAccessService(
+            registry: registry,
+            cacheCoordinator: cache
+        )
+        let session = try await service.makeSession(for: item)
+
+        let resolved = try await ResolvedContentTypeProbe.resolve(
+            resource: item,
+            metadata: metadata,
+            session: session
+        )
+        #expect(resolved.kind == .image)
+        #expect(adapter.metadataCalls == 1)
+        #expect(adapter.readCalls == 1)
+        #expect(adapter.readRanges == [
+            ResourceByteRange(lowerBound: 0, upperBound: 4_095)
+        ])
+        #expect(await cache.state(for: key) == .online)
+        await session.close()
+    }
+
     private func makeService(
         source: ResourceSource,
         adapter: any ResourceSourceAdapter
@@ -3241,6 +3496,60 @@ struct CacheCoordinatorTests {
         let session = try await service.makeOfflineSession(for: item)
         #expect(try await session.fetchMetadata() == metadata)
         #expect(try await session.readData(maximumBytes: 1024) == Data("hello".utf8))
+        await session.close()
+    }
+
+    @Test("离线大文件前缀读取不会删除完整缓存")
+    func readsLargeCachedPrefixWithoutEviction() async throws {
+        let source = ResourceSource(
+            id: UUID(),
+            name: "离线签名来源",
+            kind: .http,
+            endpoint: "https://offline.example",
+            status: .disconnected,
+            itemCountDescription: ""
+        )
+        let content = Data(repeating: 0x5A, count: 8 * 1024)
+        let metadata = ResourceMetadata(
+            byteSize: Int64(content.count),
+            mimeType: "application/octet-stream",
+            revision: .etag("offline-prefix-v1")
+        )
+        let item = ResourceItem(
+            sourceID: source.id,
+            logicalPath: ResourcePath(rawValue: "/offline.bin")!,
+            name: "offline.bin",
+            kind: .unknown,
+            metadata: metadata,
+            capabilities: [],
+            accent: .blue
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iosRemoteFolder-offline-prefix-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cache = CacheCoordinator(rootURL: root)
+        let key = try #require(ResourceCacheKey(
+            identity: item.id,
+            revision: metadata.revision,
+            variant: .content
+        ))
+        #expect(try await cache.store(content, for: key, maximumBytes: Int64(content.count)))
+
+        let registry = try SourceRegistry(sources: [source], adapters: [])
+        let service = ResourceAccessService(
+            registry: registry,
+            cacheCoordinator: cache
+        )
+        let session = try await service.makeOfflineSession(for: item)
+        #expect(
+            try await session.readSignaturePrefix()
+                == Data(content.prefix(Int(ResourceContentSession.signaturePrefixByteLimit)))
+        )
+        #expect(
+            try await session.readData(maximumBytes: Int64(content.count)) == content
+        )
+        #expect(await cache.state(for: key) == .offlineAvailable)
         await session.close()
     }
 

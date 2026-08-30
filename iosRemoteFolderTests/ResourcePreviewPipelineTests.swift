@@ -268,6 +268,234 @@ struct ResourcePreviewPipelineTests {
         #expect(dottedDeclaredFolder.confidence == .low)
     }
 
+    @Test("签名确认弱证据、纠正 declared hint 并阻断强冲突")
+    func resolvesSignatureEvidenceWithSafeConflictRules() throws {
+        let pdfMatch = ContentSignatureMatch(
+            formatToken: "pdf",
+            kind: .pdf,
+            canonicalTypeIdentifier: "com.adobe.pdf",
+            strength: .exact
+        )
+        let genericItem = try makeResolvedItem(
+            path: "/资源/download",
+            kind: .unknown,
+            metadata: ResourceMetadata(
+                mimeType: "application/octet-stream",
+                typeIdentifier: "public.data"
+            )
+        )
+        #expect(genericItem.resolvedContentType.signatureProbe == .required)
+        let signaturePDF = ResolvedContentType.resolve(
+            resource: genericItem,
+            metadata: genericItem.metadata,
+            signatureProbe: .matched(pdfMatch)
+        )
+        #expect(signaturePDF.kind == .pdf)
+        #expect(signaturePDF.confidence == .high)
+        #expect(!signaturePDF.hasBlockingConflict)
+        #expect(signaturePDF.signatureProbe == .matched(pdfMatch))
+
+        let weakDeclaredImage = try makeResolvedItem(
+            path: "/资源/no-extension",
+            kind: .image,
+            metadata: ResourceMetadata()
+        )
+        let corrected = ResolvedContentType.resolve(
+            resource: weakDeclaredImage,
+            metadata: weakDeclaredImage.metadata,
+            signatureProbe: .matched(pdfMatch)
+        )
+        #expect(corrected.kind == .pdf)
+        #expect(!corrected.hasBlockingConflict)
+        #expect(corrected.diagnostics.contains { diagnostic in
+            if case .declaredKindOverridden(
+                declared: .image,
+                signature: .pdf,
+                formatToken: "pdf"
+            ) = diagnostic {
+                return true
+            }
+            return false
+        })
+
+        let strongExtension = try makeResolvedItem(
+            path: "/资源/cover.jpg",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        let blocked = ResolvedContentType.resolve(
+            resource: strongExtension,
+            metadata: strongExtension.metadata,
+            signatureProbe: .matched(pdfMatch)
+        )
+        #expect(blocked.kind == .unknown)
+        #expect(blocked.hasBlockingConflict)
+        #expect(blocked.fallbackDescription == "文件签名与声明类型不一致")
+
+        let pngMatch = ContentSignatureMatch(
+            formatToken: "png",
+            kind: .image,
+            canonicalTypeIdentifier: "public.png",
+            strength: .exact
+        )
+        let sameKindImageConflict = ResolvedContentType.resolve(
+            resource: strongExtension,
+            metadata: strongExtension.metadata,
+            signatureProbe: .matched(pngMatch)
+        )
+        #expect(sameKindImageConflict.kind == .unknown)
+        #expect(sameKindImageConflict.hasBlockingConflict)
+
+        let mp3Item = try makeResolvedItem(
+            path: "/资源/audio.mp3",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        let wavMatch = ContentSignatureMatch(
+            formatToken: "wav",
+            kind: .audio,
+            canonicalTypeIdentifier: "com.microsoft.waveform-audio",
+            strength: .exact
+        )
+        #expect(ResolvedContentType.resolve(
+            resource: mp3Item,
+            metadata: mp3Item.metadata,
+            signatureProbe: .matched(wavMatch)
+        ).hasBlockingConflict)
+
+        let heicItem = try makeResolvedItem(
+            path: "/资源/photo.heic",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        let heifMatch = ContentSignatureMatch(
+            formatToken: "heif",
+            kind: .image,
+            canonicalTypeIdentifier: "public.heif",
+            strength: .exact
+        )
+        #expect(!ResolvedContentType.resolve(
+            resource: heicItem,
+            metadata: heicItem.metadata,
+            signatureProbe: .matched(heifMatch)
+        ).hasBlockingConflict)
+
+        let textHeuristic = ContentSignatureMatch(
+            formatToken: "utf8-text",
+            kind: .text,
+            canonicalTypeIdentifier: "public.plain-text",
+            strength: .heuristic
+        )
+        let heuristicResult = ResolvedContentType.resolve(
+            resource: strongExtension,
+            metadata: strongExtension.metadata,
+            signatureProbe: .matched(textHeuristic)
+        )
+        #expect(heuristicResult.kind == .image)
+        #expect(!heuristicResult.hasBlockingConflict)
+
+        let officeItem = try makeResolvedItem(
+            path: "/资源/report.docx",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        let zipMatch = ContentSignatureMatch(
+            formatToken: "zip",
+            kind: .unknown,
+            canonicalTypeIdentifier: "public.zip-archive",
+            strength: .container
+        )
+        let officeContainer = ResolvedContentType.resolve(
+            resource: officeItem,
+            metadata: officeItem.metadata,
+            signatureProbe: .matched(zipMatch)
+        )
+        #expect(officeContainer.kind == .unknown)
+        #expect(officeContainer.confidence == .high)
+        #expect(!officeContainer.hasBlockingConflict)
+
+        let isoBMFFMatch = ContentSignatureMatch(
+            formatToken: "iso-bmff",
+            kind: .unknown,
+            canonicalTypeIdentifier: nil,
+            strength: .container
+        )
+        #expect(ResolvedContentType.resolve(
+            resource: mp3Item,
+            metadata: mp3Item.metadata,
+            signatureProbe: .matched(isoBMFFMatch)
+        ).hasBlockingConflict)
+        let m4aItem = try makeResolvedItem(
+            path: "/资源/audio.m4a",
+            kind: .unknown,
+            metadata: ResourceMetadata(mimeType: "application/octet-stream")
+        )
+        #expect(!ResolvedContentType.resolve(
+            resource: m4aItem,
+            metadata: m4aItem.metadata,
+            signatureProbe: .matched(isoBMFFMatch)
+        ).hasBlockingConflict)
+        for extensionName in ["m4b", "m4p", "m4r"] {
+            let item = try makeResolvedItem(
+                path: "/资源/audio.\(extensionName)",
+                kind: .unknown,
+                metadata: ResourceMetadata(mimeType: "application/octet-stream")
+            )
+            #expect(!ResolvedContentType.resolve(
+                resource: item,
+                metadata: item.metadata,
+                signatureProbe: .matched(isoBMFFMatch)
+            ).hasBlockingConflict)
+        }
+        for extensionName in ["odt", "ods", "odp"] {
+            let item = try makeResolvedItem(
+                path: "/资源/document.\(extensionName)",
+                kind: .unknown,
+                metadata: ResourceMetadata(mimeType: "application/octet-stream")
+            )
+            #expect(!ResolvedContentType.resolve(
+                resource: item,
+                metadata: item.metadata,
+                signatureProbe: .matched(zipMatch)
+            ).hasBlockingConflict)
+        }
+
+        let extensionlessZIP = ResolvedContentType.resolve(
+            resource: genericItem,
+            metadata: genericItem.metadata,
+            signatureProbe: .matched(zipMatch)
+        )
+        #expect(
+            ResourcePreviewPipeline.quickLookFilename(
+                for: genericItem.name,
+                contentType: extensionlessZIP
+            )?.hasSuffix(".zip") == true
+        )
+
+        let noMatch = ResolvedContentType.resolve(
+            resource: genericItem,
+            metadata: genericItem.metadata,
+            signatureProbe: .noMatch
+        )
+        let unavailable = ResolvedContentType.resolve(
+            resource: genericItem,
+            metadata: genericItem.metadata,
+            signatureProbe: .unavailable
+        )
+        #expect(noMatch.stableFingerprint != unavailable.stableFingerprint)
+        #expect(noMatch.stableFingerprint != genericItem.resolvedContentType.stableFingerprint)
+
+        let trustedTyped = try makeResolvedItem(
+            path: "/资源/manual.pdf",
+            kind: .pdf,
+            metadata: ResourceMetadata(
+                mimeType: "application/pdf",
+                typeIdentifier: "com.adobe.pdf"
+            )
+        )
+        #expect(trustedTyped.resolvedContentType.signatureProbe == .notRequired)
+    }
+
     @Test("强 typed 冲突安全降级且目录事实优先")
     func rejectsStrongConflictAndPrioritizesDirectoryFact() async throws {
         let conflictItem = try makeResolvedItem(
@@ -384,6 +612,135 @@ struct ResourcePreviewPipelineTests {
         let snapshot = await fixture.adapter.snapshot()
         #expect(snapshot.metadataCalls == 1)
         #expect(snapshot.readCalls == 1)
+    }
+
+    @Test("generic MIME 无扩展 PNG/PDF 由签名选择 renderer 并复用 revision 别名")
+    func signatureSelectsRendererAndPersistsKnownRevisionAlias() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        let cacheDirectory = try makeCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+
+        let pngFixture = makeFixture(
+            kind: .unknown,
+            path: "/预览/extensionless-image",
+            revision: .etag("signature-png-v1"),
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            content: pngData,
+            readsReleased: true,
+            cacheDirectory: cacheDirectory
+        )
+        let pngRequest = try makeRequest(item: pngFixture.item)
+        #expect(pngRequest.contentType.signatureProbe == .required)
+
+        for _ in 0..<2 {
+            guard case .encodedImage = try await pngFixture.pipeline.preview(for: pngRequest) else {
+                Issue.record("PNG 签名应选择图片 renderer")
+                return
+            }
+        }
+        var pngSnapshot = await pngFixture.adapter.snapshot()
+        #expect(pngSnapshot.metadataCalls == 1)
+        #expect(pngSnapshot.readCalls == 1)
+
+        let restoredPipeline = ResourcePreviewPipeline(
+            accessService: pngFixture.accessService,
+            cacheDirectory: cacheDirectory
+        )
+        guard case .encodedImage = try await restoredPipeline.preview(for: pngRequest) else {
+            Issue.record("签名解析后的持久 revision 别名应返回图片")
+            return
+        }
+        try FileManager.default.removeItem(at: cacheDirectory)
+        guard case .encodedImage = try await restoredPipeline.preview(for: pngRequest) else {
+            Issue.record("磁盘 alias 命中后应提升为已验证的内存命中")
+            return
+        }
+        pngSnapshot = await pngFixture.adapter.snapshot()
+        #expect(pngSnapshot.metadataCalls == 1)
+        #expect(pngSnapshot.readCalls == 1)
+
+        let pdfData = try await sampleContent(
+            sourceID: SampleData.personalSourceID,
+            path: "/知识库/设计/设计系统与组件规范.pdf"
+        )
+        let pdfFixture = makeFixture(
+            kind: .unknown,
+            path: "/预览/extensionless-document",
+            revision: .etag("signature-pdf-v1"),
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            content: pdfData,
+            readsReleased: true
+        )
+        guard case .encodedImage = try await pdfFixture.pipeline.preview(
+            for: makeRequest(item: pdfFixture.item)
+        ) else {
+            Issue.record("PDF 签名应选择 PDF renderer")
+            return
+        }
+        let pdfSnapshot = await pdfFixture.adapter.snapshot()
+        #expect(pdfSnapshot.metadataCalls == 1)
+        #expect(pdfSnapshot.readCalls == 1)
+    }
+
+    @Test("同类不同格式冲突仅读取 4 KiB 签名前缀")
+    func sameKindSignatureConflictStopsBeforeFullBody() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        var content = pngData
+        content.append(Data(repeating: 0, count: 5_000))
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/预览/disguised.jpg",
+            revision: .etag("signature-conflict-v1"),
+            acceptsRanges: true,
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            content: content,
+            readsReleased: true
+        )
+
+        await #expect(throws: ResourceSourceError.capabilityUnavailable) {
+            try await fixture.pipeline.preview(for: makeRequest(item: fixture.item))
+        }
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 1)
+        #expect(snapshot.readCalls == 1)
+        #expect(snapshot.readRanges == [ResourceByteRange(lowerBound: 0, upperBound: 4_095)])
+    }
+
+    @Test("签名前缀不可用时不缓存 artifact 或建立类型别名")
+    func unavailableSignatureProbeDoesNotCacheAlias() async throws {
+        let pngData = try #require(Data(
+            base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        var content = pngData
+        content.append(Data(repeating: 0, count: 5_000))
+        let fixture = makeFixture(
+            kind: .unknown,
+            path: "/预览/unavailable.png",
+            revision: .etag("signature-unavailable-v1"),
+            mimeType: "application/octet-stream",
+            typeIdentifier: "public.data",
+            content: content,
+            readsReleased: true
+        )
+        let request = try makeRequest(item: fixture.item)
+
+        for _ in 0..<2 {
+            guard case .encodedImage = try await fixture.pipeline.preview(for: request) else {
+                Issue.record("无法探测签名时仍应按扩展名渲染有效图片")
+                return
+            }
+        }
+        let snapshot = await fixture.adapter.snapshot()
+        #expect(snapshot.metadataCalls == 2)
+        #expect(snapshot.readCalls == 2)
+        #expect(snapshot.readRanges == [nil, nil])
     }
 
     @Test("初始强类型冲突在缓存查找前零探测拒绝")
@@ -1260,7 +1617,7 @@ struct ResourcePreviewPipelineTests {
         #expect(oversizedSnapshot.readCalls == 0)
     }
 
-    @Test("未知类型缺少大小、超预算或无合法扩展名时不会读取正文")
+    @Test("未知类型缺少大小或超预算时零正文，非法扩展仅探测有界签名")
     func rejectsUnsafeQuickLookMaterializationBeforeRead() async throws {
         let missingSize = makeFixture(
             kind: .unknown,
@@ -1294,6 +1651,7 @@ struct ResourcePreviewPipelineTests {
             kind: .unknown,
             path: "/测试.文档",
             revision: .unknown,
+            content: Data(repeating: 0x01, count: 64),
             readsReleased: true
         )
         await #expect(throws: ResourceSourceError.capabilityUnavailable) {
@@ -1303,7 +1661,8 @@ struct ResourcePreviewPipelineTests {
         }
         let invalidExtensionSnapshot = await invalidExtension.adapter.snapshot()
         #expect(invalidExtensionSnapshot.metadataCalls == 1)
-        #expect(invalidExtensionSnapshot.readCalls == 0)
+        #expect(invalidExtensionSnapshot.readCalls == 1)
+        #expect(invalidExtensionSnapshot.readRanges == [nil])
     }
 
     @Test("有界未知文件至多读取一次且 Quick Look 终态清理物化目录")

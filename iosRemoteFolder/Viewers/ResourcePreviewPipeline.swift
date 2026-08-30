@@ -60,7 +60,7 @@ private enum ResourcePreviewSignposts {
 }
 
 struct ResourcePreviewRequest: Hashable, Sendable {
-    static let currentRendererVersion = 3
+    static let currentRendererVersion = 4
     private static let pointPrecision: CGFloat = 100
     private static let minimumPointDimension: CGFloat = 1
     private static let maximumPointDimension: CGFloat = 512
@@ -260,6 +260,7 @@ actor ResourcePreviewPipeline {
     private struct MemoryEntry: Sendable {
         let artifact: ResourcePreviewArtifact
         let cost: Int
+        let verifiedByResolvedAlias: Bool
         var accessOrder: UInt64
     }
 
@@ -306,6 +307,11 @@ actor ResourcePreviewPipeline {
                 scopeDigest: scopeDigest
             )
         }
+    }
+
+    private struct DiskArtifactHit: Sendable {
+        let artifact: ResourcePreviewArtifact
+        let verifiedByResolvedAlias: Bool
     }
 
     private struct GeneratedPreview: Sendable {
@@ -410,15 +416,26 @@ actor ResourcePreviewPipeline {
             throw ResourceSourceError.capabilityUnavailable
         }
         let requestedKey = CacheKey(request: request)
+        let allowDirectArtifact = !request.contentType.signatureProbe.requiresInspection
 
-        if let cached = memoryArtifactResolvingAlias(for: requestedKey) {
+        if let cached = memoryArtifactResolvingAlias(
+            for: requestedKey,
+            allowDirectArtifact: allowDirectArtifact
+        ) {
             guard !Task.isCancelled else { throw ResourceSourceError.cancelled }
             return cached
         }
-        if let cached = diskArtifact(for: requestedKey) {
+        if let cached = diskArtifact(
+            for: requestedKey,
+            allowDirectArtifact: allowDirectArtifact
+        ) {
             guard !Task.isCancelled else { throw ResourceSourceError.cancelled }
-            insertMemory(cached, for: requestedKey)
-            return cached
+            insertMemory(
+                cached.artifact,
+                for: requestedKey,
+                verifiedByResolvedAlias: cached.verifiedByResolvedAlias
+            )
+            return cached.artifact
         }
 
         let waiterID = UUID()
@@ -557,29 +574,31 @@ actor ResourcePreviewPipeline {
                 revision: generated.revision,
                 contentType: generated.contentType
             )
-            insertMemory(generated.artifact, for: resolvedKey)
-            let canAliasResolvedType = request.item.metadata.revision.isKnown
-                && request.item.metadata.revision == generated.revision
-                && requestedKey != resolvedKey
-            if canAliasResolvedType {
-                insertMemoryAlias(from: requestedKey, to: resolvedKey)
-            }
-            if request.item.metadata.revision.isUnknown {
-                // Preserve the unknown-revision memory alias, but never attach a
-                // fresh renderer result to the stale request's type resolution.
-                let unknownRevisionKey = CacheKey(
-                    request: request,
-                    revision: request.item.metadata.revision,
-                    contentType: generated.contentType
-                )
-                if unknownRevisionKey != resolvedKey {
-                    insertMemory(generated.artifact, for: unknownRevisionKey)
-                }
-            }
-            if request.item.metadata.revision.isKnown {
-                storeDisk(generated.artifact, for: resolvedKey)
+            if generated.contentType.signatureProbe.isCacheable {
+                insertMemory(generated.artifact, for: resolvedKey)
+                let canAliasResolvedType = request.item.metadata.revision.isKnown
+                    && request.item.metadata.revision == generated.revision
+                    && requestedKey != resolvedKey
                 if canAliasResolvedType {
-                    storeDiskAlias(from: requestedKey, to: resolvedKey)
+                    insertMemoryAlias(from: requestedKey, to: resolvedKey)
+                }
+                if request.item.metadata.revision.isUnknown {
+                    // Preserve the unknown-revision memory alias, but never attach a
+                    // fresh renderer result to the stale request's type resolution.
+                    let unknownRevisionKey = CacheKey(
+                        request: request,
+                        revision: request.item.metadata.revision,
+                        contentType: generated.contentType
+                    )
+                    if unknownRevisionKey != resolvedKey {
+                        insertMemory(generated.artifact, for: unknownRevisionKey)
+                    }
+                }
+                if request.item.metadata.revision.isKnown {
+                    storeDisk(generated.artifact, for: resolvedKey)
+                    if canAliasResolvedType {
+                        storeDiskAlias(from: requestedKey, to: resolvedKey)
+                    }
                 }
             }
             current.waiters.values.forEach { $0.continuation.resume(returning: generated.artifact) }
@@ -641,7 +660,8 @@ actor ResourcePreviewPipeline {
     }
 
     private func memoryArtifactResolvingAlias(
-        for key: CacheKey
+        for key: CacheKey,
+        allowDirectArtifact: Bool
     ) -> ResourcePreviewArtifact? {
         if var alias = memoryAliases[key] {
             if let artifact = memoryArtifact(for: alias.target) {
@@ -651,6 +671,10 @@ actor ResourcePreviewPipeline {
                 return artifact
             }
             memoryAliases.removeValue(forKey: key)
+        }
+        guard allowDirectArtifact
+                || memoryCache[key]?.verifiedByResolvedAlias == true else {
+            return nil
         }
         return memoryArtifact(for: key)
     }
@@ -663,7 +687,11 @@ actor ResourcePreviewPipeline {
         return entry.artifact
     }
 
-    private func insertMemory(_ artifact: ResourcePreviewArtifact, for key: CacheKey) {
+    private func insertMemory(
+        _ artifact: ResourcePreviewArtifact,
+        for key: CacheKey,
+        verifiedByResolvedAlias: Bool = false
+    ) {
         if let old = memoryCache.removeValue(forKey: key) {
             memoryCost = max(0, memoryCost - old.cost)
         }
@@ -672,6 +700,7 @@ actor ResourcePreviewPipeline {
         memoryCache[key] = MemoryEntry(
             artifact: artifact,
             cost: cost,
+            verifiedByResolvedAlias: verifiedByResolvedAlias,
             accessOrder: accessCounter
         )
         memoryCost = memoryCost.addingClamped(cost)
@@ -698,7 +727,10 @@ actor ResourcePreviewPipeline {
         }
     }
 
-    private func diskArtifact(for key: CacheKey) -> ResourcePreviewArtifact? {
+    private func diskArtifact(
+        for key: CacheKey,
+        allowDirectArtifact: Bool
+    ) -> DiskArtifactHit? {
         guard let token = key.persistenceToken,
               let scopeToken = key.aliasScopeToken else {
             return nil
@@ -715,10 +747,14 @@ actor ResourcePreviewPipeline {
         ) else {
             return nil
         }
-        if let artifact = record.artifact,
+        if allowDirectArtifact,
+           let artifact = record.artifact,
            record.aliasTargetDigest == nil,
            record.scopeDigest.map({ $0 == scopeDigest }) ?? true {
-            return artifact
+            return DiskArtifactHit(
+                artifact: artifact,
+                verifiedByResolvedAlias: false
+            )
         }
         guard record.artifact == nil,
               let targetDigest = record.aliasTargetDigest,
@@ -739,7 +775,10 @@ actor ResourcePreviewPipeline {
             try? persistManifestImmediately()
             return nil
         }
-        return artifact
+        return DiskArtifactHit(
+            artifact: artifact,
+            verifiedByResolvedAlias: true
+        )
     }
 
     private func diskRecord(
@@ -1013,7 +1052,11 @@ actor ResourcePreviewPipeline {
     ) async throws -> GeneratedPreview {
         try Task.checkCancellation()
         let metadata = try await session.fetchMetadata()
-        let contentType = request.item.resolvedContentType(using: metadata)
+        let contentType = try await ResolvedContentTypeProbe.resolve(
+            resource: request.item,
+            metadata: metadata,
+            session: session
+        )
         guard !contentType.hasBlockingConflict else {
             throw ResourceSourceError.capabilityUnavailable
         }
@@ -1044,6 +1087,7 @@ actor ResourcePreviewPipeline {
             artifact = try await renderQuickLookThumbnail(
                 session: session,
                 metadata: metadata,
+                contentType: contentType,
                 request: request
             )
         case .video, .audio:
@@ -1129,6 +1173,7 @@ actor ResourcePreviewPipeline {
     private static func renderQuickLookThumbnail(
         session: ResourceContentSession,
         metadata: ResourceMetadata,
+        contentType: ResolvedContentType,
         request: ResourcePreviewRequest
     ) async throws -> ResourcePreviewArtifact {
         guard let byteSize = metadata.byteSize,
@@ -1136,7 +1181,10 @@ actor ResourcePreviewPipeline {
               byteSize <= quickLookByteBudget else {
             throw ResourceSourceError.responseTooLarge
         }
-        guard let filename = quickLookFilename(for: request.item.name) else {
+        guard let filename = quickLookFilename(
+            for: request.item.name,
+            contentType: contentType
+        ) else {
             throw ResourceSourceError.capabilityUnavailable
         }
         try Task.checkCancellation()
@@ -1168,19 +1216,17 @@ actor ResourcePreviewPipeline {
         }
     }
 
-    private static func quickLookFilename(for resourceName: String) -> String? {
-        let rawExtension = URL(fileURLWithPath: resourceName).pathExtension
-        let sanitized = rawExtension.utf8.filter { byte in
-            switch byte {
-            case 48...57, 65...90, 97...122:
-                true
-            default:
-                false
-            }
-        }
-        let boundedExtension = String(decoding: sanitized.prefix(10), as: UTF8.self)
-        guard !boundedExtension.isEmpty else { return nil }
-        return "resource.\(boundedExtension)"
+    static func quickLookFilename(
+        for resourceName: String,
+        contentType: ResolvedContentType
+    ) -> String? {
+        let filename = ResourceFileMaterializer.safeFilename(
+            for: resourceName,
+            suggestedTypeIdentifier: contentType.preferredSystemTypeIdentifier
+        )
+        let pathExtension = URL(fileURLWithPath: filename).pathExtension
+        guard !pathExtension.isEmpty else { return nil }
+        return filename
     }
 
     private static func generateQuickLookThumbnail(

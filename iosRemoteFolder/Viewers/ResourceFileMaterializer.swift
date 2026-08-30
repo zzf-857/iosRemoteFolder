@@ -424,6 +424,8 @@ extension ResolvedContentType {
                     priority = 1
                 case .filenameExtension:
                     priority = 2
+                case .signature:
+                    priority = 3
                 case .directory, .declaredKind:
                     return nil
                 }
